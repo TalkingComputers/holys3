@@ -1,5 +1,5 @@
 use holys3_core::{Corpus, DocId};
-use holys3_sigv4::{sign_get, Credentials};
+use holys3_sigv4::{sign_get, sign_request, Credentials};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
@@ -57,6 +57,7 @@ pub fn parse_list_v2(xml: &str) -> anyhow::Result<(Vec<ObjectMeta>, Option<Strin
     Ok((objs, next))
 }
 
+#[derive(Clone)]
 pub struct S3Client {
     pub region: String,
     pub creds: Credentials,
@@ -128,6 +129,51 @@ impl S3Client {
         }
         let resp = req.send().await?.error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
+    }
+
+    pub async fn get_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        len: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let end = start
+            .checked_add(len)
+            .and_then(|v| v.checked_sub(1))
+            .ok_or_else(|| anyhow::anyhow!("invalid empty S3 range"))?;
+        self.get(bucket, key, Some((start, end))).await
+    }
+
+    pub async fn put(&self, bucket: &str, key: &str, body: &[u8]) -> anyhow::Result<()> {
+        let host = self.host(bucket);
+        let path = format!("/{key}");
+        let (amz, date) = Self::now();
+        let signed = sign_request(
+            "PUT",
+            &self.creds,
+            &self.region,
+            &host,
+            &path,
+            "",
+            &[],
+            &amz,
+            &date,
+            "UNSIGNED-PAYLOAD",
+        );
+        let mut req = self
+            .http
+            .put(format!("https://{host}{path}"))
+            .header("host", &host)
+            .header("x-amz-date", &signed.x_amz_date)
+            .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
+            .header("authorization", &signed.authorization)
+            .body(body.to_vec());
+        if let Some(tok) = &self.creds.session_token {
+            req = req.header("x-amz-security-token", tok);
+        }
+        req.send().await?.error_for_status()?;
+        Ok(())
     }
 
     pub async fn list(&self, bucket: &str, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {

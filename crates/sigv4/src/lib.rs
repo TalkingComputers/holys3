@@ -60,7 +60,8 @@ pub fn sign_get(
     amz_date: &str,
     date: &str,
 ) -> SignedHeaders {
-    sign_get_with_payload_hash(
+    sign_request(
+        "GET",
         creds,
         region,
         host,
@@ -75,6 +76,33 @@ pub fn sign_get(
 
 #[allow(clippy::too_many_arguments)]
 pub fn sign_get_with_payload_hash(
+    creds: &Credentials,
+    region: &str,
+    host: &str,
+    canonical_path: &str,
+    canonical_query: &str,
+    extra_signed: &[(&str, &str)],
+    amz_date: &str,
+    date: &str,
+    payload_hash: &str,
+) -> SignedHeaders {
+    sign_request(
+        "GET",
+        creds,
+        region,
+        host,
+        canonical_path,
+        canonical_query,
+        extra_signed,
+        amz_date,
+        date,
+        payload_hash,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sign_request(
+    method: &str,
     creds: &Credentials,
     region: &str,
     host: &str,
@@ -109,7 +137,7 @@ pub fn sign_get_with_payload_hash(
         .collect::<String>();
 
     let canonical_request = format!(
-        "GET\n{}\n{}\n{}\n{}\n{}",
+        "{method}\n{}\n{}\n{}\n{}\n{}",
         uri_encode(canonical_path, true),
         canonical_query,
         canonical_headers,
@@ -256,6 +284,33 @@ mod tests {
             sig,
             "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
+    }
+
+    #[test]
+    fn put_signature_has_expected_shape() {
+        let creds = Credentials {
+            access_key: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            session_token: None,
+        };
+        let signed = sign_request(
+            "PUT",
+            &creds,
+            "us-east-1",
+            "examplebucket.s3.amazonaws.com",
+            "/test.txt",
+            "",
+            &[],
+            "20130524T000000Z",
+            "20130524",
+            "UNSIGNED-PAYLOAD",
+        );
+        assert!(signed
+            .authorization
+            .contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
+        let sig = signed.authorization.rsplit("Signature=").next().unwrap();
+        assert_eq!(sig.len(), 64);
+        assert!(sig.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }
 
