@@ -143,6 +143,63 @@ pub fn sign_get_with_payload_hash(
     }
 }
 
+/// Resolve credentials: env vars first, then a named profile in ~/.aws/credentials.
+/// (IMDSv2 is added in a later step; not covered by this unit test.)
+pub fn from_env() -> Option<Credentials> {
+    let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok()?;
+    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok()?;
+    Some(Credentials {
+        access_key,
+        secret_key,
+        session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+    })
+}
+
+/// Parse `[profile]` ... access_key/secret/token from an ini-style credentials file body.
+pub fn from_credentials_file(body: &str, profile: &str) -> Option<Credentials> {
+    let mut in_section = false;
+    let (mut ak, mut sk, mut tok) = (None, None, None);
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = &line[1..line.len() - 1] == profile;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "aws_access_key_id" => ak = Some(v.trim().to_string()),
+                "aws_secret_access_key" => sk = Some(v.trim().to_string()),
+                "aws_session_token" => tok = Some(v.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    Some(Credentials {
+        access_key: ak?,
+        secret_key: sk?,
+        session_token: tok,
+    })
+}
+
+/// Public entry: env, then default profile in ~/.aws/credentials.
+pub fn resolve(profile: &str) -> anyhow::Result<Credentials> {
+    if let Some(c) = from_env() {
+        return Ok(c);
+    }
+    let path = dirs_home()?.join(".aws/credentials");
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("no env creds and cannot read {}: {e}", path.display()))?;
+    from_credentials_file(&body, profile)
+        .ok_or_else(|| anyhow::anyhow!("profile `{profile}` not found in {}", path.display()))
+}
+
+fn dirs_home() -> anyhow::Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(std::env::var("HOME")?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +256,21 @@ mod tests {
             sig,
             "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
+    }
+}
+
+#[cfg(test)]
+mod cred_tests {
+    use super::*;
+
+    #[test]
+    fn parse_profile() {
+        let body = "[default]\naws_access_key_id = AK1\naws_secret_access_key = SK1\n\n[prod]\naws_access_key_id=AK2\naws_secret_access_key=SK2\naws_session_token=TOK2\n";
+        let d = from_credentials_file(body, "default").unwrap();
+        assert_eq!(d.access_key, "AK1");
+        assert!(d.session_token.is_none());
+        let p = from_credentials_file(body, "prod").unwrap();
+        assert_eq!(p.access_key, "AK2");
+        assert_eq!(p.session_token.as_deref(), Some("TOK2"));
     }
 }
