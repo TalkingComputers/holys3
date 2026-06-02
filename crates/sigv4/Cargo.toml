@@ -1,0 +1,10 @@
+[package]
+name = "holys3-sigv4"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
