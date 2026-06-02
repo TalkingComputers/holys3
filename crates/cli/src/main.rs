@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use holys3_core::{matches_in, Corpus};
-use holys3_index::{Index, LocalCorpus};
+use holys3_index::{build_to_dir, IndexReader, LocalCorpus};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -21,7 +21,7 @@ enum Cmd {
         bucket: Option<String>,
         #[arg(long, default_value = "")]
         prefix: String,
-        #[arg(long, default_value = "holys3.idx")]
+        #[arg(long, default_value = "holys3.idxdir")]
         out: PathBuf,
     },
     /// Search a pattern using a prebuilt index.
@@ -29,32 +29,31 @@ enum Cmd {
         pattern: String,
         #[arg(long)]
         local_dir: Option<PathBuf>,
-        #[arg(long, default_value = "holys3.idx")]
+        #[arg(long, default_value = "holys3.idxdir")]
         index: PathBuf,
         #[arg(long)]
         files_only: bool,
     },
     /// Report distinct grams + term-dict bytes (resolves spec section 5 A/B).
     Stats {
-        #[arg(long, default_value = "holys3.idx")]
+        #[arg(long, default_value = "holys3.idxdir")]
         index: PathBuf,
     },
 }
 
 fn build_local(dir: &Path, out: &Path) -> Result<()> {
     let corpus = LocalCorpus::new(dir)?;
-    let idx = Index::build(&corpus)?;
-    idx.save(out)?;
+    build_to_dir(&corpus, out)?;
     eprintln!("indexed {} docs -> {}", corpus.docs().len(), out.display());
     Ok(())
 }
 
 fn search_local(pattern: &str, dir: &Path, index: &Path, files_only: bool) -> Result<()> {
     let corpus = LocalCorpus::new(dir)?;
-    let idx = Index::load(index)?;
+    let reader = IndexReader::open(index)?;
     let q = holys3_query::plan(pattern)?;
     let re = regex::bytes::Regex::new(pattern)?;
-    for id in idx.candidates(&q) {
+    for id in reader.candidates(&q) {
         let bytes = corpus.fetch(id)?;
         let key = &corpus.docs()[id as usize].1;
         if files_only {
@@ -93,11 +92,11 @@ fn main() -> Result<()> {
             anyhow::bail!("provide --local-dir (S3 search is a Stage 1 follow-up)")
         }
         Cmd::Stats { index } => {
-            let idx = Index::load(&index)?;
-            let s = idx.stats();
+            let reader = IndexReader::open(&index)?;
+            let s = reader.stats();
             println!("distinct_grams={}", s.distinct_grams);
-            println!("termdict_bytes_estimate={}", s.termdict_bytes_estimate);
-            println!("total_postings={}", s.total_postings);
+            println!("terms_fst_bytes={}", s.terms_fst_bytes);
+            println!("postings_bytes={}", s.postings_bytes);
             Ok(())
         }
     }
