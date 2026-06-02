@@ -1,6 +1,6 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use holys3_core::{matches_in, Corpus};
+use clap::{Parser, Subcommand, ValueEnum};
+use holys3_core::{matches_in, Corpus, Strategy};
 use holys3_index::{build_to_dir, IndexReader, LocalCorpus};
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,8 @@ enum Cmd {
         prefix: String,
         #[arg(long, default_value = "holys3.idxdir")]
         out: PathBuf,
+        #[arg(long, value_enum, default_value = "sparse")]
+        strategy: StrategyArg,
     },
     /// Search a pattern using a prebuilt index.
     Search {
@@ -33,6 +35,8 @@ enum Cmd {
         index: PathBuf,
         #[arg(long)]
         files_only: bool,
+        #[arg(long)]
+        stats: bool,
     },
     /// Report distinct grams + term-dict bytes (resolves spec section 5 A/B).
     Stats {
@@ -41,19 +45,49 @@ enum Cmd {
     },
 }
 
-fn build_local(dir: &Path, out: &Path) -> Result<()> {
+#[derive(Clone, Copy, ValueEnum)]
+enum StrategyArg {
+    Trigram,
+    Sparse,
+}
+
+impl From<StrategyArg> for Strategy {
+    fn from(value: StrategyArg) -> Strategy {
+        match value {
+            StrategyArg::Trigram => Strategy::Trigram,
+            StrategyArg::Sparse => Strategy::Sparse,
+        }
+    }
+}
+
+fn build_local(dir: &Path, out: &Path, strategy: Strategy) -> Result<()> {
     let corpus = LocalCorpus::new(dir)?;
-    build_to_dir(&corpus, out)?;
+    build_to_dir(&corpus, out, strategy)?;
     eprintln!("indexed {} docs -> {}", corpus.docs().len(), out.display());
     Ok(())
 }
 
-fn search_local(pattern: &str, dir: &Path, index: &Path, files_only: bool) -> Result<()> {
+fn search_local(
+    pattern: &str,
+    dir: &Path,
+    index: &Path,
+    files_only: bool,
+    stats: bool,
+) -> Result<()> {
     let corpus = LocalCorpus::new(dir)?;
     let reader = IndexReader::open(index)?;
-    let q = holys3_query::plan(pattern)?;
+    let q = holys3_query::plan(pattern, reader.strategy())?;
     let re = regex::bytes::Regex::new(pattern)?;
-    for id in reader.candidates(&q) {
+    let candidates = reader.candidates(&q);
+    if stats {
+        eprintln!(
+            "candidates={} total={} strategy={:?}",
+            candidates.len(),
+            reader.docs().len(),
+            reader.strategy()
+        );
+    }
+    for id in candidates {
         let bytes = corpus.fetch(id)?;
         let key = &corpus.docs()[id as usize].1;
         if files_only {
@@ -74,8 +108,9 @@ fn main() -> Result<()> {
         Cmd::Index {
             local_dir: Some(dir),
             out,
+            strategy,
             ..
-        } => build_local(&dir, &out),
+        } => build_local(&dir, &out, strategy.into()),
         Cmd::Index {
             bucket: Some(_), ..
         } => {
@@ -87,7 +122,8 @@ fn main() -> Result<()> {
             local_dir: Some(dir),
             index,
             files_only,
-        } => search_local(&pattern, &dir, &index, files_only),
+            stats,
+        } => search_local(&pattern, &dir, &index, files_only, stats),
         Cmd::Search { .. } => {
             anyhow::bail!("provide --local-dir (S3 search is a Stage 1 follow-up)")
         }
