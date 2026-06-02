@@ -7,3 +7,4 @@ version.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 regex.workspace = true
+rapidhash = "4.4.1"
