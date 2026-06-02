@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 pub type DocId = u32;
 
@@ -164,6 +165,47 @@ pub trait Corpus {
     fn fetch(&self, id: DocId) -> Result<Vec<u8>>;
 }
 
+pub trait BlobStore {
+    fn put(&self, name: &str, bytes: &[u8]) -> Result<()>;
+    fn get(&self, name: &str) -> Result<Vec<u8>>;
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>>;
+}
+
+pub struct LocalBlobStore {
+    root: PathBuf,
+}
+
+impl LocalBlobStore {
+    pub fn new(root: impl Into<PathBuf>) -> LocalBlobStore {
+        LocalBlobStore { root: root.into() }
+    }
+}
+
+impl BlobStore for LocalBlobStore {
+    fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.root.join(name);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    fn get(&self, name: &str) -> Result<Vec<u8>> {
+        Ok(std::fs::read(self.root.join(name))?)
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = std::fs::File::open(self.root.join(name))?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; usize::try_from(len)?];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
 /// One verified match: which doc, 1-based line, 1-based column (byte), the line text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
@@ -214,6 +256,7 @@ pub fn scan_matching_docs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn trigrams_basic() {
@@ -247,6 +290,21 @@ mod tests {
             .into_iter()
             .collect();
         assert!(q.is_subset(&all));
+    }
+
+    #[test]
+    fn local_blob_store_round_trips_ranges() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "holys3-core-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let store = LocalBlobStore::new(&root);
+        store.put("builds/a/postings.bin", b"abcdef")?;
+        assert_eq!(store.get("builds/a/postings.bin")?, b"abcdef");
+        assert_eq!(store.get_range("builds/a/postings.bin", 2, 3)?, b"cde");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }
 
