@@ -1,4 +1,4 @@
-use holys3_core::{Corpus, DocId};
+use holys3_core::{BlobStore, Corpus, DocId};
 use holys3_sigv4::{sign_get, sign_request, Credentials};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +227,83 @@ impl S3Client {
     }
 }
 
+pub struct S3BlobStore {
+    client: S3Client,
+    bucket: String,
+    prefix: String,
+    rt: tokio::runtime::Handle,
+}
+
+impl S3BlobStore {
+    pub fn new(
+        client: S3Client,
+        bucket: String,
+        prefix: String,
+        rt: tokio::runtime::Handle,
+    ) -> S3BlobStore {
+        S3BlobStore {
+            client,
+            bucket,
+            prefix,
+            rt,
+        }
+    }
+
+    fn build_key(&self, name: &str) -> String {
+        build_index_key(&self.prefix, name)
+    }
+}
+
+impl BlobStore for S3BlobStore {
+    fn put(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(self.client.put(&self.bucket, &self.build_key(name), bytes))
+        })
+    }
+
+    fn get(&self, name: &str) -> anyhow::Result<Vec<u8>> {
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(self.client.get(&self.bucket, &self.build_key(name), None))
+        })
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+        tokio::task::block_in_place(|| {
+            self.rt.block_on(
+                self.client
+                    .get_range(&self.bucket, &self.build_key(name), start, len),
+            )
+        })
+    }
+}
+
+pub fn build_index_key(prefix: &str, name: &str) -> String {
+    format!(
+        "{}/{}",
+        build_index_namespace(prefix),
+        name.trim_start_matches('/')
+    )
+}
+
+pub fn build_index_namespace(prefix: &str) -> String {
+    let prefix = prefix
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if prefix.is_empty() {
+        ".holys3".into()
+    } else {
+        format!("{prefix}/.holys3")
+    }
+}
+
+pub fn is_index_key(prefix: &str, key: &str) -> bool {
+    key.starts_with(&format!("{}/", build_index_namespace(prefix)))
+}
+
 /// Corpus over an S3 prefix. Loads object list eagerly; fetches bytes on demand.
 pub struct S3Corpus {
     client: S3Client,
@@ -312,5 +389,16 @@ mod tests {
             ]
         );
         assert_eq!(next.as_deref(), Some("TOK"));
+    }
+
+    #[test]
+    fn index_keys_are_normalized() {
+        assert_eq!(build_index_key("", "CURRENT"), ".holys3/CURRENT");
+        assert_eq!(
+            build_index_key("/root//path/", "/builds/1/footer.bin"),
+            "root/path/.holys3/builds/1/footer.bin"
+        );
+        assert!(is_index_key("root/path", "root/path/.holys3/CURRENT"));
+        assert!(!is_index_key("root/path", "root/path/file.txt"));
     }
 }
