@@ -1,9 +1,16 @@
 //! Shared types for holys3.
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub type DocId = u32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Strategy {
+    Trigram,
+    Sparse,
+}
 
 /// Pack a 3-byte window into a u32 trigram key: b0<<16 | b1<<8 | b2.
 /// Returns sorted, deduplicated trigrams. Fewer than 3 bytes => empty.
@@ -12,6 +19,14 @@ pub fn trigrams(bytes: &[u8]) -> Vec<u32> {
         .windows(3)
         .map(|w| (w[0] as u32) << 16 | (w[1] as u32) << 8 | w[2] as u32)
         .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Every overlapping 3-byte window as raw bytes (sorted, deduped). <3 bytes => empty.
+pub fn trigram_grams_bytes(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut v: Vec<Vec<u8>> = data.windows(3).map(|w| w.to_vec()).collect();
     v.sort_unstable();
     v.dedup();
     v
@@ -104,6 +119,22 @@ pub fn sparse_grams_covering_bytes(data: &[u8]) -> Vec<Vec<u8>> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Index-time grams for a strategy.
+pub fn grams_index(data: &[u8], s: Strategy) -> Vec<Vec<u8>> {
+    match s {
+        Strategy::Trigram => trigram_grams_bytes(data),
+        Strategy::Sparse => sparse_grams_all_bytes(data),
+    }
+}
+
+/// Query-time grams for a strategy (trigram has no separate covering form).
+pub fn grams_query(data: &[u8], s: Strategy) -> Vec<Vec<u8>> {
+    match s {
+        Strategy::Trigram => trigram_grams_bytes(data),
+        Strategy::Sparse => sparse_grams_covering_bytes(data),
+    }
 }
 
 /// build_all — every sparse n-gram: substring data[i..=j+1] whose boundary
@@ -202,6 +233,20 @@ mod tests {
     fn trigrams_short_is_empty() {
         assert!(trigrams(b"ab").is_empty());
         assert!(trigrams(b"").is_empty());
+    }
+
+    #[test]
+    fn trigram_query_subset_of_index() {
+        use std::collections::HashSet;
+        let pattern = b"CONSTANT";
+        let content = b"let CONSTANT = 1;";
+        let all: HashSet<Vec<u8>> = grams_index(content, Strategy::Trigram)
+            .into_iter()
+            .collect();
+        let q: HashSet<Vec<u8>> = grams_query(pattern, Strategy::Trigram)
+            .into_iter()
+            .collect();
+        assert!(q.is_subset(&all));
     }
 }
 
