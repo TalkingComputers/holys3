@@ -1,3 +1,4 @@
+use holys3_core::{Corpus, DocId};
 use holys3_sigv4::{sign_get, Credentials};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +178,48 @@ impl S3Client {
             }
         }
         Ok(all)
+    }
+}
+
+/// Corpus over an S3 prefix. Loads object list eagerly; fetches bytes on demand.
+pub struct S3Corpus {
+    client: S3Client,
+    bucket: String,
+    objects: Vec<ObjectMeta>,
+    docs: Vec<(DocId, String)>,
+    rt: tokio::runtime::Handle,
+}
+
+impl S3Corpus {
+    pub fn new(
+        client: S3Client,
+        bucket: String,
+        objects: Vec<ObjectMeta>,
+        rt: tokio::runtime::Handle,
+    ) -> S3Corpus {
+        let docs = objects
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (i as DocId, o.key.clone()))
+            .collect();
+        S3Corpus {
+            client,
+            bucket,
+            objects,
+            docs,
+            rt,
+        }
+    }
+}
+
+impl Corpus for S3Corpus {
+    fn docs(&self) -> &[(DocId, String)] {
+        &self.docs
+    }
+
+    fn fetch(&self, id: DocId) -> anyhow::Result<Vec<u8>> {
+        let key = self.objects[id as usize].key.clone();
+        tokio::task::block_in_place(|| self.rt.block_on(self.client.get(&self.bucket, &key, None)))
     }
 }
 
