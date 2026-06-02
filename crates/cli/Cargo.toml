@@ -17,3 +17,6 @@ anyhow.workspace = true
 clap.workspace = true
 regex.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

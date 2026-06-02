@@ -456,6 +456,7 @@ dependencies = [
  "holys3-s3",
  "holys3-sigv4",
  "regex",
+ "tempfile",
  "tokio",
 ]
 
