@@ -1,5 +1,4 @@
-use holys3_core::extract_sparse_ngrams_covering;
-use std::collections::HashSet;
+use holys3_core::sparse_grams_covering_bytes;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
@@ -7,17 +6,15 @@ pub enum Query {
     None,
     And(Vec<Query>),
     Or(Vec<Query>),
-    Gram(u64),
+    Gram(Vec<u8>),
 }
 
-/// AND of the covering sparse-gram hashes of a literal; `All` if it yields none
-/// (literal under 2 bytes => no grams => cannot constrain).
 fn lit_query(lit: &[u8]) -> Query {
-    let grams = extract_sparse_ngrams_covering(lit);
+    let grams = sparse_grams_covering_bytes(lit);
     if grams.is_empty() {
         Query::All
     } else {
-        Query::And(grams.into_iter().map(|(h, _)| Query::Gram(h)).collect())
+        Query::And(grams.into_iter().map(Query::Gram).collect())
     }
 }
 
@@ -35,16 +32,6 @@ pub fn plan(pattern: &str) -> anyhow::Result<Query> {
                 Ok(Query::Or(branches))
             }
         }
-    }
-}
-
-pub fn matches_grams(q: &Query, doc: &HashSet<u64>) -> bool {
-    match q {
-        Query::All => true,
-        Query::None => false,
-        Query::Gram(h) => doc.contains(h),
-        Query::And(subs) => subs.iter().all(|s| matches_grams(s, doc)),
-        Query::Or(subs) => subs.iter().any(|s| matches_grams(s, doc)),
     }
 }
 
