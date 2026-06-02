@@ -75,7 +75,9 @@ holys3-cli       index / search / plan entrypoints, cost guardrail, output forma
 
 ## 5. Index storage (in S3 + hot footer)
 
-### Term-dictionary storage — OPEN, decided empirically in Stage 1
+### Term-dictionary storage — RESOLVED (Stage 1 measurement): Option B (FST blueprint, dict in S3)
+
+> Decided 2026-06-02 from a real measurement (`docs/superpowers/notes/2026-06-01-termdict-measurement.md`): indexing a 67 MB corpus gave 243,823 trigrams / 3.72 MiB term-dict; extrapolated to a 10 GiB bucket the trigram dict is ~571 MiB and the **sparse dict ~1.1 GB** — too large for a cheap "download-once, cache locally" full dict. Stages 2–3 therefore use **Option B**: an FST term dict kept in S3 with a small (~MB) blueprint in the footer, fetched by ranged GET. Original analysis retained below.
 
 The footer cannot hold the **full** sparse-n-gram lookup table at scale: ~20 B/entry × tens of millions of distinct sparse grams for a multi-GB bucket ⇒ hundreds of MB–GB, not the ~10 MB a "tiny footer, one GET" implies. The full-table-resident and small-stateless-footer goals conflict. **Stage 1 builds the index on a representative bucket and measures distinct-gram count and term-dict bytes**, then picks:
 
