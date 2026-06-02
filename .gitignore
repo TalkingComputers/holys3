@@ -1,0 +1,5 @@
+/target
+# stray local tooling artifacts (not part of holys3)
+agentdb.rvf
+agentdb.rvf.lock
+ruvector.db

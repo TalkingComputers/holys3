@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/core"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+regex = "1"
+regex-syntax = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1", features = ["full"] }
+quick-xml = "0.36"
+clap = { version = "4", features = ["derive"] }
