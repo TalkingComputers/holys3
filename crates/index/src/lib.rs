@@ -1,5 +1,5 @@
 use anyhow::Result;
-use holys3_core::{sparse_grams_all_bytes, Corpus, DocId};
+use holys3_core::{grams_index, Corpus, DocId, Strategy};
 use holys3_query::Query;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,15 +8,16 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     docs: Vec<(DocId, String)>,
+    strategy: Strategy,
 }
 
 /// Write terms.fst + postings.bin + manifest.bin into `dir`.
-pub fn build_to_dir(corpus: &dyn Corpus, dir: &Path) -> Result<()> {
+pub fn build_to_dir(corpus: &dyn Corpus, dir: &Path, strategy: Strategy) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut postings: BTreeMap<Vec<u8>, Vec<DocId>> = BTreeMap::new();
     for &(id, _) in corpus.docs() {
         let bytes = corpus.fetch(id)?;
-        for gram in sparse_grams_all_bytes(&bytes) {
+        for gram in grams_index(&bytes, strategy) {
             postings.entry(gram).or_default().push(id);
         }
     }
@@ -38,6 +39,7 @@ pub fn build_to_dir(corpus: &dyn Corpus, dir: &Path) -> Result<()> {
     std::fs::write(dir.join("postings.bin"), &postings_buf)?;
     let manifest = Manifest {
         docs: corpus.docs().to_vec(),
+        strategy,
     };
     std::fs::write(dir.join("manifest.bin"), postcard::to_allocvec(&manifest)?)?;
     Ok(())
@@ -47,6 +49,7 @@ pub struct IndexReader {
     map: fst::Map<memmap2::Mmap>,
     postings: memmap2::Mmap,
     docs: Vec<(DocId, String)>,
+    strategy: Strategy,
 }
 
 impl IndexReader {
@@ -66,11 +69,16 @@ impl IndexReader {
             map,
             postings,
             docs: manifest.docs,
+            strategy: manifest.strategy,
         })
     }
 
     pub fn docs(&self) -> &[(DocId, String)] {
         &self.docs
+    }
+
+    pub fn strategy(&self) -> Strategy {
+        self.strategy
     }
 
     fn all_docs(&self) -> BTreeSet<DocId> {
@@ -171,7 +179,7 @@ pub fn search_matching_docs(
     corpus: &dyn Corpus,
     pattern: &str,
 ) -> Result<BTreeSet<DocId>> {
-    let q = holys3_query::plan(pattern)?;
+    let q = holys3_query::plan(pattern, reader.strategy())?;
     let re = regex::bytes::Regex::new(pattern)?;
     let mut hits = BTreeSet::new();
     for id in reader.candidates(&q) {
@@ -197,9 +205,9 @@ mod tests {
         }
     }
 
-    fn build_tmp(c: &MemCorpus) -> (tempfile::TempDir, IndexReader) {
+    fn build_tmp(c: &MemCorpus, strategy: Strategy) -> (tempfile::TempDir, IndexReader) {
         let dir = tempfile::tempdir().unwrap();
-        build_to_dir(c, dir.path()).unwrap();
+        build_to_dir(c, dir.path(), strategy).unwrap();
         let r = IndexReader::open(dir.path()).unwrap();
         (dir, r)
     }
@@ -210,16 +218,20 @@ mod tests {
             vec![(0, "x".into()), (1, "y".into())],
             vec![b"world".to_vec(), b"word".to_vec()],
         );
-        let (_d, r) = build_tmp(&c);
-        let cands = r.candidates(&holys3_query::plan("world").unwrap());
-        assert!(cands.contains(&0));
-        assert!(cands.is_subset(&BTreeSet::from([0, 1])));
+        for strategy in [Strategy::Trigram, Strategy::Sparse] {
+            let (_d, r) = build_tmp(&c, strategy);
+            let cands = r.candidates(&holys3_query::plan("world", r.strategy()).unwrap());
+            assert!(cands.contains(&0));
+            assert!(cands.is_subset(&BTreeSet::from([0, 1])));
+        }
     }
 
     #[test]
     fn all_returns_every_doc() {
         let c = MemCorpus(vec![(0, "x".into())], vec![b"abcdef".to_vec()]);
-        let (_d, r) = build_tmp(&c);
-        assert_eq!(r.candidates(&Query::All), BTreeSet::from([0]));
+        for strategy in [Strategy::Trigram, Strategy::Sparse] {
+            let (_d, r) = build_tmp(&c, strategy);
+            assert_eq!(r.candidates(&Query::All), BTreeSet::from([0]));
+        }
     }
 }

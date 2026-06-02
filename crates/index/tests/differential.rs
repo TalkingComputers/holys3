@@ -32,9 +32,6 @@ fn corpus() -> MemCorpus {
 #[test]
 fn index_equals_scan_for_many_patterns() {
     let c = corpus();
-    let dir = tempfile::tempdir().unwrap();
-    build_to_dir(&c, dir.path()).unwrap();
-    let reader = IndexReader::open(dir.path()).unwrap();
     let patterns = [
         "world",
         "handleClick",
@@ -46,10 +43,21 @@ fn index_equals_scan_for_many_patterns() {
         "ab",
         "second line",
     ];
-    for p in patterns {
-        let indexed: BTreeSet<DocId> = search_matching_docs(&reader, &c, p).unwrap();
-        let re = regex::bytes::Regex::new(p).unwrap();
-        let oracle = scan_matching_docs(&c, &re).unwrap();
-        assert_eq!(indexed, oracle, "pattern `{p}`: index != scan");
+    for strategy in [
+        holys3_core::Strategy::Trigram,
+        holys3_core::Strategy::Sparse,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        build_to_dir(&c, dir.path(), strategy).unwrap();
+        let reader = IndexReader::open(dir.path()).unwrap();
+        for p in patterns {
+            let indexed: BTreeSet<DocId> = search_matching_docs(&reader, &c, p).unwrap();
+            let re = regex::bytes::Regex::new(p).unwrap();
+            let oracle = scan_matching_docs(&c, &re).unwrap();
+            assert_eq!(
+                indexed, oracle,
+                "strategy {strategy:?} pattern `{p}`: index != scan"
+            );
+        }
     }
 }
