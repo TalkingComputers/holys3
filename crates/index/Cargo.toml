@@ -1,0 +1,11 @@
+[package]
+name = "holys3-index"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+holys3-core = { path = "../core" }
+holys3-query = { path = "../query" }
+anyhow.workspace = true
+serde.workspace = true
+postcard.workspace = true
