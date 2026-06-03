@@ -13,6 +13,51 @@ pub struct Credentials {
     pub session_token: Option<String>,
 }
 
+pub trait CredentialProvider: Send + Sync {
+    fn provide(&self) -> anyhow::Result<Credentials>;
+}
+
+pub struct EnvProvider;
+
+impl CredentialProvider for EnvProvider {
+    fn provide(&self) -> anyhow::Result<Credentials> {
+        from_env().ok_or_else(|| anyhow::anyhow!("env creds not found"))
+    }
+}
+
+pub struct ProfileProvider {
+    pub profile: String,
+}
+
+impl CredentialProvider for ProfileProvider {
+    fn provide(&self) -> anyhow::Result<Credentials> {
+        let path = dirs_home()?.join(".aws/credentials");
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("no env creds and cannot read {}: {e}", path.display()))?;
+        from_credentials_file(&body, &self.profile).ok_or_else(|| {
+            anyhow::anyhow!("profile `{}` not found in {}", self.profile, path.display())
+        })
+    }
+}
+
+pub struct ChainProvider(pub Vec<Box<dyn CredentialProvider>>);
+
+impl CredentialProvider for ChainProvider {
+    fn provide(&self) -> anyhow::Result<Credentials> {
+        let mut error = None;
+        for provider in &self.0 {
+            match provider.provide() {
+                Ok(credentials) => return Ok(credentials),
+                Err(err) => error = Some(err),
+            }
+        }
+        let Some(err) = error else {
+            anyhow::bail!("no credential providers configured");
+        };
+        Err(err)
+    }
+}
+
 /// One header to attach to the outgoing request.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SignedHeaders {
@@ -217,14 +262,13 @@ pub fn from_credentials_file(body: &str, profile: &str) -> Option<Credentials> {
 
 /// Public entry: env, then default profile in ~/.aws/credentials.
 pub fn resolve(profile: &str) -> anyhow::Result<Credentials> {
-    if let Some(c) = from_env() {
-        return Ok(c);
-    }
-    let path = dirs_home()?.join(".aws/credentials");
-    let body = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("no env creds and cannot read {}: {e}", path.display()))?;
-    from_credentials_file(&body, profile)
-        .ok_or_else(|| anyhow::anyhow!("profile `{profile}` not found in {}", path.display()))
+    ChainProvider(vec![
+        Box::new(EnvProvider),
+        Box::new(ProfileProvider {
+            profile: profile.to_owned(),
+        }),
+    ])
+    .provide()
 }
 
 fn dirs_home() -> anyhow::Result<std::path::PathBuf> {
