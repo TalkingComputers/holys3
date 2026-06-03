@@ -1,3 +1,6 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+//! S3 client, blob store, and corpus implementations.
+
 use holys3_core::{BlobStore, Corpus, DocId};
 use holys3_sigv4::{sign_get, sign_request, Credentials};
 
@@ -181,10 +184,7 @@ impl S3Client {
         let mut all = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            let mut params = vec![
-                ("list-type", "2".to_owned()),
-                ("prefix", prefix.to_owned()),
-            ];
+            let mut params = vec![("list-type", "2".to_owned()), ("prefix", prefix.to_owned())];
             if let Some(t) = &token {
                 params.push(("continuation-token", t.clone()));
             }

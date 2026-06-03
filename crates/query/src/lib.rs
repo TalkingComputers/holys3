@@ -1,3 +1,6 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+//! Regex query planning for holys3 indexes.
+
 use holys3_core::{grams_query, Strategy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,4 +1,5 @@
-//! Shared types for holys3.
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+//! Shared types, gram extraction, storage traits, and scan verification.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

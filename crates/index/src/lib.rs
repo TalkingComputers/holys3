@@ -1,3 +1,6 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+//! Index construction and local or store-backed index readers.
+
 use anyhow::{Context, Result};
 use holys3_core::{grams_index, hash_ngram, BlobStore, Corpus, DocId, Strategy};
 use holys3_query::Query;
