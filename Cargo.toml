@@ -6,6 +6,14 @@ members = ["crates/core", "crates/query", "crates/index", "crates/sigv4", "crate
 edition = "2021"
 version = "0.1.0"
 rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Indexed regex search for local files and private S3 buckets"
+repository = "https://github.com/holys3/holys3"
+homepage = "https://github.com/holys3/holys3"
+documentation = "https://docs.rs/holys3"
+authors = ["holys3 contributors"]
+keywords = ["s3", "grep", "regex", "search", "trigram"]
+categories = ["command-line-utilities", "text-processing", "filesystem"]
 
 [workspace.dependencies]
 anyhow = "1"

@@ -3,6 +3,15 @@ name = "holys3"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+description = "Indexed regex search for local files and private S3 buckets"
+keywords = ["s3", "grep", "regex", "search", "trigram"]
+categories = ["command-line-utilities", "text-processing", "filesystem"]
+readme = "../../README.md"
 
 [[bin]]
 name = "holys3"
