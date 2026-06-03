@@ -88,7 +88,7 @@ pub fn build_to_store(
         doc_count: u32::try_from(manifest.docs.len())?,
         terms_fst_len: u64::try_from(fst_bytes.len())?,
         postings_len: u64::try_from(postings_buf.len())?,
-        build_id: build_id.to_string(),
+        build_id: build_id.to_owned(),
     };
     store.put(&format!("{base}/terms.fst"), &fst_bytes)?;
     store.put(&format!("{base}/postings.bin"), &postings_buf)?;

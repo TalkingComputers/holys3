@@ -119,7 +119,7 @@ pub fn sign_request(
         ("x-amz-date".into(), amz_date.into()),
     ];
     for (k, v) in extra_signed {
-        headers.push(((*k).to_string(), (*v).to_string()));
+        headers.push(((*k).to_owned(), (*v).to_owned()));
     }
     if let Some(tok) = &creds.session_token {
         headers.push(("x-amz-security-token".into(), tok.clone()));
@@ -172,7 +172,7 @@ pub fn sign_request(
 }
 
 /// Resolve credentials: env vars first, then a named profile in ~/.aws/credentials.
-/// (IMDSv2 is added in a later step; not covered by this unit test.)
+/// (`IMDSv2` is added in a later step; not covered by this unit test.)
 pub fn from_env() -> Option<Credentials> {
     let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok()?;
     let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok()?;
@@ -183,7 +183,7 @@ pub fn from_env() -> Option<Credentials> {
     })
 }
 
-/// Parse `[profile]` ... access_key/secret/token from an ini-style credentials file body.
+/// Parse `[profile]` ... `access_key/secret/token` from an ini-style credentials file body.
 pub fn from_credentials_file(body: &str, profile: &str) -> Option<Credentials> {
     let mut in_section = false;
     let (mut ak, mut sk, mut tok) = (None, None, None);
@@ -198,9 +198,9 @@ pub fn from_credentials_file(body: &str, profile: &str) -> Option<Credentials> {
         }
         if let Some((k, v)) = line.split_once('=') {
             match k.trim() {
-                "aws_access_key_id" => ak = Some(v.trim().to_string()),
-                "aws_secret_access_key" => sk = Some(v.trim().to_string()),
-                "aws_session_token" => tok = Some(v.trim().to_string()),
+                "aws_access_key_id" => ak = Some(v.trim().to_owned()),
+                "aws_secret_access_key" => sk = Some(v.trim().to_owned()),
+                "aws_session_token" => tok = Some(v.trim().to_owned()),
                 _ => {}
             }
         }

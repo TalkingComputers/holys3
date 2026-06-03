@@ -8,7 +8,7 @@ pub struct ObjectMeta {
     pub size: u64,
 }
 
-/// Parse one ListObjectsV2 XML page: returns (objects, next_continuation_token).
+/// Parse one `ListObjectsV2` XML page: returns (`objects`, `next_continuation_token`).
 pub fn parse_list_v2(xml: &str) -> anyhow::Result<(Vec<ObjectMeta>, Option<String>)> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
@@ -33,7 +33,7 @@ pub fn parse_list_v2(xml: &str) -> anyhow::Result<(Vec<ObjectMeta>, Option<Strin
                 let txt = t.unescape()?.into_owned();
                 match cur.as_str() {
                     "Key" if in_contents => key = txt,
-                    "ETag" if in_contents => etag = txt.trim_matches('"').to_string(),
+                    "ETag" if in_contents => etag = txt.trim_matches('"').to_owned(),
                     "Size" if in_contents => size = txt.parse().unwrap_or(0),
                     "NextContinuationToken" => next = Some(txt),
                     _ => {}
@@ -77,7 +77,7 @@ impl S3Client {
         format!("{bucket}.s3.{}.amazonaws.com", self.region)
     }
 
-    /// timestamp helper: returns (amz_date "YYYYMMDDTHHMMSSZ", date "YYYYMMDD").
+    /// Timestamp helper: returns (`amz_date`, `date`).
     fn now() -> (String, String) {
         let dt = time::OffsetDateTime::now_utc();
         let amz = dt
@@ -182,8 +182,8 @@ impl S3Client {
         let mut token: Option<String> = None;
         loop {
             let mut params = vec![
-                ("list-type", "2".to_string()),
-                ("prefix", prefix.to_string()),
+                ("list-type", "2".to_owned()),
+                ("prefix", prefix.to_owned()),
             ];
             if let Some(t) = &token {
                 params.push(("continuation-token", t.clone()));

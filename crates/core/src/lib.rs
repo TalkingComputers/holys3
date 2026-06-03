@@ -45,7 +45,7 @@ pub fn pair_weight(a: u8, b: u8) -> u32 {
     rapidhash::v3::rapidhash_v3(&[a, b]) as u32
 }
 
-/// build_all as raw gram byte strings (sorted, deduped). Index-time.
+/// `build_all` as raw gram byte strings (sorted, deduped). Index-time.
 pub fn sparse_grams_all_bytes(data: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     if data.len() < 2 {
@@ -76,7 +76,7 @@ pub fn sparse_grams_all_bytes(data: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// build_covering as raw gram byte strings (sorted, deduped). Query-time.
+/// `build_covering` as raw gram byte strings (sorted, deduped). Query-time.
 pub fn sparse_grams_covering_bytes(data: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     if data.len() < 2 {
@@ -138,9 +138,9 @@ pub fn grams_query(data: &[u8], s: Strategy) -> Vec<Vec<u8>> {
     }
 }
 
-/// build_all — every sparse n-gram: substring data[i..=j+1] whose boundary
+/// `build_all` - every sparse n-gram: substring `data[i..=j+1]` whose boundary
 /// pair-weights at positions i and j both strictly exceed every interior
-/// pair-weight. Index-time. Returns sorted, deduped (hash, gram_len).
+/// pair-weight. Index-time. Returns sorted, deduped (`hash`, `gram_len`).
 pub fn extract_sparse_ngrams_all(data: &[u8]) -> Vec<(u64, usize)> {
     sparse_grams_all_bytes(data)
         .iter()
@@ -148,8 +148,8 @@ pub fn extract_sparse_ngrams_all(data: &[u8]) -> Vec<(u64, usize)> {
         .collect()
 }
 
-/// build_covering — minimal covering set via monotone-stack partitioning.
-/// Query-time. covering(L) ⊆ all(F) whenever L is a substring of F.
+/// `build_covering` - minimal covering set via monotone-stack partitioning.
+/// Query-time. `covering(L)` is a subset of `all(F)` whenever `L` is a substring of `F`.
 pub fn extract_sparse_ngrams_covering(data: &[u8]) -> Vec<(u64, usize)> {
     sparse_grams_covering_bytes(data)
         .iter()

@@ -28,3 +28,17 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio = { version = "1", features = ["full"] }
 quick-xml = "0.36"
 clap = { version = "4", features = ["derive"] }
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+doc_markdown = "warn"
+semicolon_if_nothing_returned = "warn"
+str_to_string = "warn"
+todo = "warn"
+inefficient_to_string = "warn"
