@@ -24,3 +24,7 @@ time = { version = "0.3", features = ["formatting"] }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
