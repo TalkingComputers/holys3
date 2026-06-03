@@ -1,5 +1,5 @@
 use holys3_core::{Corpus, DocId, Strategy};
-use holys3_index::{build_to_store, compute_build_id, search_via_store, StoreIndexReader};
+use holys3_index::{build_to_store, compute_build_id, search, StoreIndexReader};
 use holys3_s3::{is_index_key, S3BlobStore, S3Client, S3Corpus};
 use holys3_sigv4::resolve;
 
@@ -47,7 +47,7 @@ fn assert_hit(
     pattern: &str,
     expected_key: &str,
 ) -> anyhow::Result<()> {
-    let hits = search_via_store(reader, corpus, pattern)?;
+    let hits = search(reader, corpus, pattern)?;
     let keys = hits
         .iter()
         .map(|id| key_for_doc(reader, *id))
