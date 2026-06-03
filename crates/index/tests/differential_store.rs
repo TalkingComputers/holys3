@@ -1,5 +1,5 @@
 use holys3_core::{scan_matching_docs, Corpus, DocId, LocalBlobStore, Strategy};
-use holys3_index::{build_to_store, compute_build_id, search_via_store, StoreIndexReader};
+use holys3_index::{build_to_store, compute_build_id, search, StoreIndexReader};
 use std::collections::BTreeSet;
 
 struct MemCorpus(Vec<(DocId, String)>, Vec<Vec<u8>>);
@@ -61,7 +61,7 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
             cache_dir.path(),
         )?;
         for p in patterns {
-            let indexed: BTreeSet<DocId> = search_via_store(&reader, &c, p)?;
+            let indexed: BTreeSet<DocId> = search(&reader, &c, p)?;
             let re = regex::bytes::Regex::new(p)?;
             let oracle = scan_matching_docs(&c, &re)?;
             assert_eq!(

@@ -23,6 +23,20 @@ struct Footer {
     build_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexStats {
+    pub distinct_grams: u64,
+    pub terms_fst_bytes: u64,
+    pub postings_bytes: u64,
+}
+
+pub trait IndexReader {
+    fn docs(&self) -> &[(DocId, String)];
+    fn strategy(&self) -> Strategy;
+    fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>>;
+    fn stats(&self) -> IndexStats;
+}
+
 fn build_index_bytes(
     corpus: &dyn Corpus,
     strategy: Strategy,
@@ -107,15 +121,15 @@ pub fn build_to_store(
     Ok(())
 }
 
-pub struct IndexReader {
+pub struct MmapIndexReader {
     map: fst::Map<memmap2::Mmap>,
     postings: memmap2::Mmap,
     docs: Vec<(DocId, String)>,
     strategy: Strategy,
 }
 
-impl IndexReader {
-    pub fn open(dir: &Path) -> Result<IndexReader> {
+impl MmapIndexReader {
+    pub fn open(dir: &Path) -> Result<MmapIndexReader> {
         let fst_file = std::fs::File::open(dir.join("terms.fst"))?;
         let map = fst::Map::new(unsafe {
             // Build dirs are immutable while readers are open.
@@ -127,7 +141,7 @@ impl IndexReader {
             memmap2::Mmap::map(&post_file)?
         };
         let manifest: Manifest = postcard::from_bytes(&std::fs::read(dir.join("manifest.bin"))?)?;
-        Ok(IndexReader {
+        Ok(MmapIndexReader {
             map,
             postings,
             docs: manifest.docs,
@@ -161,7 +175,7 @@ impl IndexReader {
         set
     }
 
-    pub fn candidates(&self, q: &Query) -> BTreeSet<DocId> {
+    fn candidate_set(&self, q: &Query) -> BTreeSet<DocId> {
         match q {
             Query::All => self.all_docs(),
             Query::None => BTreeSet::new(),
@@ -170,22 +184,44 @@ impl IndexReader {
                 None => BTreeSet::new(),
             },
             Query::And(subs) => {
-                let mut it = subs.iter().map(|s| self.candidates(s));
+                let mut it = subs.iter().map(|s| self.candidate_set(s));
                 match it.next() {
                     None => self.all_docs(),
                     Some(first) => it.fold(first, |a, s| a.intersection(&s).copied().collect()),
                 }
             }
-            Query::Or(subs) => subs.iter().flat_map(|s| self.candidates(s)).collect(),
+            Query::Or(subs) => subs.iter().flat_map(|s| self.candidate_set(s)).collect(),
         }
     }
 
-    pub fn stats(&self) -> Stats {
-        Stats {
-            distinct_grams: self.map.len(),
-            terms_fst_bytes: self.map.as_fst().as_bytes().len(),
-            postings_bytes: self.postings.len(),
+    pub fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
+        Ok(self.candidate_set(q))
+    }
+
+    pub fn stats(&self) -> IndexStats {
+        IndexStats {
+            distinct_grams: self.map.len() as u64,
+            terms_fst_bytes: self.map.as_fst().as_bytes().len() as u64,
+            postings_bytes: self.postings.len() as u64,
         }
+    }
+}
+
+impl IndexReader for MmapIndexReader {
+    fn docs(&self) -> &[(DocId, String)] {
+        &self.docs
+    }
+
+    fn strategy(&self) -> Strategy {
+        self.strategy
+    }
+
+    fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
+        Ok(self.candidate_set(q))
+    }
+
+    fn stats(&self) -> IndexStats {
+        MmapIndexReader::stats(self)
     }
 }
 
@@ -313,12 +349,30 @@ impl StoreIndexReader {
         }
     }
 
-    pub fn stats(&self) -> StoreStats {
-        StoreStats {
-            distinct_grams: self.map.len(),
+    pub fn stats(&self) -> IndexStats {
+        IndexStats {
+            distinct_grams: self.map.len() as u64,
             terms_fst_bytes: self.terms_fst_len,
             postings_bytes: self.postings_len,
         }
+    }
+}
+
+impl IndexReader for StoreIndexReader {
+    fn docs(&self) -> &[(DocId, String)] {
+        &self.docs
+    }
+
+    fn strategy(&self) -> Strategy {
+        self.strategy
+    }
+
+    fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
+        StoreIndexReader::candidates(self, q)
+    }
+
+    fn stats(&self) -> IndexStats {
+        StoreIndexReader::stats(self)
     }
 }
 
@@ -332,20 +386,6 @@ fn read_cached_blob(store: &dyn BlobStore, cache_path: &Path, store_name: &str) 
     }
     std::fs::write(cache_path, &bytes)?;
     Ok(bytes)
-}
-
-#[derive(Debug)]
-pub struct Stats {
-    pub distinct_grams: usize,
-    pub terms_fst_bytes: usize,
-    pub postings_bytes: usize,
-}
-
-#[derive(Debug)]
-pub struct StoreStats {
-    pub distinct_grams: usize,
-    pub terms_fst_bytes: u64,
-    pub postings_bytes: u64,
 }
 
 pub struct LocalCorpus {
@@ -387,25 +427,8 @@ impl Corpus for LocalCorpus {
     }
 }
 
-/// Full indexed search via the on-disk reader: plan -> candidates -> verify.
-pub fn search_matching_docs(
-    reader: &IndexReader,
-    corpus: &dyn Corpus,
-    pattern: &str,
-) -> Result<BTreeSet<DocId>> {
-    let q = holys3_query::plan(pattern, reader.strategy())?;
-    let re = regex::bytes::Regex::new(pattern)?;
-    let mut hits = BTreeSet::new();
-    for id in reader.candidates(&q) {
-        if re.is_match(&corpus.fetch(id)?) {
-            hits.insert(id);
-        }
-    }
-    Ok(hits)
-}
-
-pub fn search_via_store(
-    reader: &StoreIndexReader,
+pub fn search(
+    reader: &dyn IndexReader,
     corpus: &dyn Corpus,
     pattern: &str,
 ) -> Result<BTreeSet<DocId>> {
@@ -435,10 +458,10 @@ mod tests {
         }
     }
 
-    fn build_tmp(c: &MemCorpus, strategy: Strategy) -> (tempfile::TempDir, IndexReader) {
+    fn build_tmp(c: &MemCorpus, strategy: Strategy) -> (tempfile::TempDir, MmapIndexReader) {
         let dir = tempfile::tempdir().unwrap();
         build_to_dir(c, dir.path(), strategy).unwrap();
-        let r = IndexReader::open(dir.path()).unwrap();
+        let r = MmapIndexReader::open(dir.path()).unwrap();
         (dir, r)
     }
 
@@ -450,7 +473,9 @@ mod tests {
         );
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
             let (_d, r) = build_tmp(&c, strategy);
-            let cands = r.candidates(&holys3_query::plan("world", r.strategy()).unwrap());
+            let cands = r
+                .candidates(&holys3_query::plan("world", r.strategy()).unwrap())
+                .unwrap();
             assert!(cands.contains(&0));
             assert!(cands.is_subset(&BTreeSet::from([0, 1])));
         }
@@ -461,7 +486,7 @@ mod tests {
         let c = MemCorpus(vec![(0, "x".into())], vec![b"abcdef".to_vec()]);
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
             let (_d, r) = build_tmp(&c, strategy);
-            assert_eq!(r.candidates(&Query::All), BTreeSet::from([0]));
+            assert_eq!(r.candidates(&Query::All).unwrap(), BTreeSet::from([0]));
         }
     }
 }

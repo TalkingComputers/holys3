@@ -1,5 +1,5 @@
 use holys3_core::{scan_matching_docs, Corpus, DocId};
-use holys3_index::{build_to_dir, search_matching_docs, IndexReader};
+use holys3_index::{build_to_dir, search, MmapIndexReader};
 use std::collections::BTreeSet;
 
 struct MemCorpus(Vec<(DocId, String)>, Vec<Vec<u8>>);
@@ -47,11 +47,12 @@ fn index_equals_scan_for_many_patterns() {
         holys3_core::Strategy::Trigram,
         holys3_core::Strategy::Sparse,
     ] {
+        eprintln!("differential strategy={strategy:?}");
         let dir = tempfile::tempdir().unwrap();
         build_to_dir(&c, dir.path(), strategy).unwrap();
-        let reader = IndexReader::open(dir.path()).unwrap();
+        let reader = MmapIndexReader::open(dir.path()).unwrap();
         for p in patterns {
-            let indexed: BTreeSet<DocId> = search_matching_docs(&reader, &c, p).unwrap();
+            let indexed: BTreeSet<DocId> = search(&reader, &c, p).unwrap();
             let re = regex::bytes::Regex::new(p).unwrap();
             let oracle = scan_matching_docs(&c, &re).unwrap();
             assert_eq!(
