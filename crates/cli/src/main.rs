@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use holys3_core::{matches_in, Corpus, Strategy};
 use holys3_index::{
-    build_to_dir, build_to_store, compute_build_id, IndexReader, LocalCorpus, StoreIndexReader,
+    build_to_dir, build_to_store, compute_build_id, search, LocalCorpus, MmapIndexReader,
+    StoreIndexReader,
 };
 use holys3_s3::{build_index_namespace, is_index_key, ObjectMeta, S3BlobStore, S3Client, S3Corpus};
 use holys3_sigv4::resolve;
@@ -117,11 +118,10 @@ fn search_local(
     stats: bool,
 ) -> Result<()> {
     let corpus = LocalCorpus::new(dir)?;
-    let reader = IndexReader::open(index)?;
-    let q = holys3_query::plan(pattern, reader.strategy())?;
-    let re = regex::bytes::Regex::new(pattern)?;
-    let candidates = reader.candidates(&q);
+    let reader = MmapIndexReader::open(index)?;
     if stats {
+        let q = holys3_query::plan(pattern, reader.strategy())?;
+        let candidates = reader.candidates(&q)?;
         eprintln!(
             "candidates={} total={} strategy={:?}",
             candidates.len(),
@@ -129,20 +129,12 @@ fn search_local(
             reader.strategy()
         );
     }
-    for id in candidates {
-        let bytes = corpus.fetch(id)?;
-        let key = &corpus.docs()[id as usize].1;
-        if files_only {
-            if re.is_match(&bytes) {
-                println!("{key}");
-            }
-        } else {
-            for m in matches_in(id, &bytes, &re) {
-                println!("{key}:{}:{}:{}", m.line, m.col, m.text);
-            }
-        }
-    }
-    Ok(())
+    print_hits(
+        &corpus,
+        search(&reader, &corpus, pattern)?,
+        pattern,
+        files_only,
+    )
 }
 
 fn build_prefix(prefix: &str) -> String {
@@ -195,10 +187,9 @@ fn search_s3(
     let store = S3BlobStore::new(client.clone(), bucket.clone(), prefix.clone(), rt.clone());
     let cache_dir = build_cache_dir(&bucket, &prefix)?;
     let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
-    let q = holys3_query::plan(pattern, reader.strategy())?;
-    let re = regex::bytes::Regex::new(pattern)?;
-    let candidates = reader.candidates(&q)?;
     if stats {
+        let q = holys3_query::plan(pattern, reader.strategy())?;
+        let candidates = reader.candidates(&q)?;
         let index_stats = reader.stats();
         eprintln!(
             "candidates={} total={} strategy={:?} distinct_grams={} terms_fst_bytes={} postings_bytes={}",
@@ -211,17 +202,32 @@ fn search_s3(
         );
     }
     let corpus = S3Corpus::from_docs(client, bucket, reader.docs().to_vec(), rt);
-    for id in candidates {
+    print_hits(
+        &corpus,
+        search(&reader, &corpus, pattern)?,
+        pattern,
+        files_only,
+    )
+}
+
+fn print_hits(
+    corpus: &dyn Corpus,
+    hits: std::collections::BTreeSet<holys3_core::DocId>,
+    pattern: &str,
+    files_only: bool,
+) -> Result<()> {
+    if files_only {
+        for id in hits {
+            println!("{}", corpus.docs()[id as usize].1);
+        }
+        return Ok(());
+    }
+    let re = regex::bytes::Regex::new(pattern)?;
+    for id in hits {
         let bytes = corpus.fetch(id)?;
         let key = &corpus.docs()[id as usize].1;
-        if files_only {
-            if re.is_match(&bytes) {
-                println!("{key}");
-            }
-        } else {
-            for matched in matches_in(id, &bytes, &re) {
-                println!("{key}:{}:{}:{}", matched.line, matched.col, matched.text);
-            }
+        for matched in matches_in(id, &bytes, &re) {
+            println!("{key}:{}:{}:{}", matched.line, matched.col, matched.text);
         }
     }
     Ok(())
@@ -263,7 +269,7 @@ async fn main() -> Result<()> {
         } => search_s3(&pattern, bucket, prefix, region, files_only, stats),
         Cmd::Search { .. } => anyhow::bail!("provide --local-dir or --bucket"),
         Cmd::Stats { index } => {
-            let reader = IndexReader::open(&index)?;
+            let reader = MmapIndexReader::open(&index)?;
             let s = reader.stats();
             println!("distinct_grams={}", s.distinct_grams);
             println!("terms_fst_bytes={}", s.terms_fst_bytes);
