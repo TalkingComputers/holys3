@@ -115,7 +115,7 @@ async fn build_s3(
     let cfg = build_fetch_config(concurrency);
     let region = read_region(region)?;
     let creds = resolve("default")?;
-    let client = S3Client::new(region, creds);
+    let client = S3Client::new(region, creds, None, false);
     let objects = select_user_objects(client.list(&bucket, &prefix).await?, &prefix);
     let object_ids = objects
         .iter()
@@ -208,7 +208,7 @@ fn search_s3(
     let cfg = build_fetch_config(concurrency);
     let region = read_region(region)?;
     let creds = resolve("default")?;
-    let client = S3Client::new(region, creds);
+    let client = S3Client::new(region, creds, None, false);
     let rt = tokio::runtime::Handle::current();
     let store = S3BlobStore::new(
         client.clone(),

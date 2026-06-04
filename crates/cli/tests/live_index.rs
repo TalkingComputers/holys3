@@ -14,7 +14,7 @@ async fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
     };
     let region = std::env::var("AWS_REGION")?;
     let creds = resolve("default")?;
-    let client = S3Client::new(region, creds);
+    let client = S3Client::new(region, creds, None, false);
     let objects = client
         .list(&bucket, "")
         .await?

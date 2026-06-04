@@ -72,15 +72,24 @@ pub fn parse_list_v2(xml: &str) -> anyhow::Result<(Vec<ObjectMeta>, Option<Strin
 pub struct S3Client {
     pub region: String,
     pub creds: Credentials,
+    pub endpoint: Option<String>,
+    pub path_style: bool,
     http: reqwest::Client,
     retry_http: reqwest::Client,
 }
 
 impl S3Client {
-    pub fn new(region: String, creds: Credentials) -> S3Client {
+    pub fn new(
+        region: String,
+        creds: Credentials,
+        endpoint: Option<String>,
+        path_style: bool,
+    ) -> S3Client {
         S3Client {
             region,
             creds,
+            endpoint,
+            path_style,
             http: reqwest::Client::new(),
             retry_http: reqwest::Client::new(),
         }
@@ -90,6 +99,8 @@ impl S3Client {
         Ok(S3Client {
             region: self.region.clone(),
             creds: self.creds.clone(),
+            endpoint: self.endpoint.clone(),
+            path_style: self.path_style,
             http: reqwest::Client::builder()
                 .pool_max_idle_per_host(cfg.cap)
                 .pool_idle_timeout(Duration::from_secs(60))
@@ -109,8 +120,60 @@ impl S3Client {
         })
     }
 
-    fn host(&self, bucket: &str) -> String {
-        format!("{bucket}.s3.{}.amazonaws.com", self.region)
+    fn endpoint_host(endpoint: &str) -> anyhow::Result<String> {
+        let url = reqwest::Url::parse(endpoint)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("S3 endpoint missing host: {endpoint}"))?;
+        match url.port() {
+            Some(port) => Ok(format!("{host}:{port}")),
+            None => Ok(host.to_owned()),
+        }
+    }
+
+    fn host(&self, bucket: &str) -> anyhow::Result<String> {
+        match &self.endpoint {
+            Some(endpoint) => Self::endpoint_host(endpoint),
+            None => Ok(format!("{bucket}.s3.{}.amazonaws.com", self.region)),
+        }
+    }
+
+    fn object_path(&self, bucket: &str, key: &str) -> anyhow::Result<String> {
+        match &self.endpoint {
+            Some(_) => {
+                anyhow::ensure!(
+                    self.path_style,
+                    "custom S3 endpoint requires path-style addressing"
+                );
+                Ok(format!("/{bucket}/{key}"))
+            }
+            None => Ok(format!("/{key}")),
+        }
+    }
+
+    fn list_path(&self, bucket: &str) -> anyhow::Result<String> {
+        match &self.endpoint {
+            Some(_) => {
+                anyhow::ensure!(
+                    self.path_style,
+                    "custom S3 endpoint requires path-style addressing"
+                );
+                Ok(format!("/{bucket}/"))
+            }
+            None => Ok("/".to_owned()),
+        }
+    }
+
+    fn request_url(&self, host: &str, path: &str, query: &str) -> String {
+        let base = match &self.endpoint {
+            Some(endpoint) => endpoint.trim_end_matches('/').to_owned(),
+            None => format!("https://{host}"),
+        };
+        if query.is_empty() {
+            format!("{base}{path}")
+        } else {
+            format!("{base}{path}?{query}")
+        }
     }
 
     /// Timestamp helper: returns (`amz_date`, `date`).
@@ -133,8 +196,8 @@ impl S3Client {
         key: &str,
         range: Option<(u64, u64)>,
     ) -> anyhow::Result<reqwest::Response> {
-        let host = self.host(bucket);
-        let path = format!("/{key}");
+        let host = self.host(bucket)?;
+        let path = self.object_path(bucket, key)?;
         let (amz, date) = Self::now();
         let range_hdr = range.map(|(a, b)| format!("bytes={a}-{b}"));
         let extra: Vec<(&str, &str)> = match &range_hdr {
@@ -152,7 +215,7 @@ impl S3Client {
             &date,
         );
         let mut req = http
-            .get(format!("https://{host}{path}"))
+            .get(self.request_url(&host, &path, ""))
             .header("host", &host)
             .header("x-amz-date", &signed.x_amz_date)
             .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
@@ -194,8 +257,8 @@ impl S3Client {
     }
 
     pub async fn put(&self, bucket: &str, key: &str, body: &[u8]) -> anyhow::Result<()> {
-        let host = self.host(bucket);
-        let path = format!("/{key}");
+        let host = self.host(bucket)?;
+        let path = self.object_path(bucket, key)?;
         let (amz, date) = Self::now();
         let signed = sign_request(
             "PUT",
@@ -211,7 +274,7 @@ impl S3Client {
         );
         let mut req = self
             .http
-            .put(format!("https://{host}{path}"))
+            .put(self.request_url(&host, &path, ""))
             .header("host", &host)
             .header("x-amz-date", &signed.x_amz_date)
             .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
@@ -225,7 +288,8 @@ impl S3Client {
     }
 
     pub async fn list(&self, bucket: &str, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
-        let host = self.host(bucket);
+        let host = self.host(bucket)?;
+        let path = self.list_path(bucket)?;
         let mut all = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -250,7 +314,7 @@ impl S3Client {
                 &self.creds,
                 &self.region,
                 &host,
-                "/",
+                &path,
                 &canonical_query,
                 &[],
                 &amz,
@@ -258,7 +322,7 @@ impl S3Client {
             );
             let mut req = self
                 .http
-                .get(format!("https://{host}/?{canonical_query}"))
+                .get(self.request_url(&host, &path, &canonical_query))
                 .header("host", &host)
                 .header("x-amz-date", &signed.x_amz_date)
                 .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
