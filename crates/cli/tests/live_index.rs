@@ -1,5 +1,5 @@
 use holys3_core::{Corpus, DocId, Strategy};
-use holys3_index::{build_to_store, compute_build_id, search, StoreIndexReader};
+use holys3_index::{build_to_store, compute_build_id, search, IndexReader, StoreIndexReader};
 use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus};
 use holys3_sigv4::resolve;
 
