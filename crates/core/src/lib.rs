@@ -14,18 +14,6 @@ pub enum Strategy {
     Sparse,
 }
 
-/// Pack a 3-byte window into a u32 trigram key: b0<<16 | b1<<8 | b2.
-/// Returns sorted, deduplicated trigrams. Fewer than 3 bytes => empty.
-pub fn trigrams(bytes: &[u8]) -> Vec<u32> {
-    let mut v: Vec<u32> = bytes
-        .windows(3)
-        .map(|w| (w[0] as u32) << 16 | (w[1] as u32) << 8 | w[2] as u32)
-        .collect();
-    v.sort_unstable();
-    v.dedup();
-    v
-}
-
 /// Every overlapping 3-byte window as raw bytes (sorted, deduped). <3 bytes => empty.
 pub fn trigram_grams_bytes(data: &[u8]) -> Vec<Vec<u8>> {
     let mut v: Vec<Vec<u8>> = data.windows(3).map(|w| w.to_vec()).collect();
@@ -139,23 +127,33 @@ pub fn grams_query(data: &[u8], s: Strategy) -> Vec<Vec<u8>> {
     }
 }
 
-/// `build_all` - every sparse n-gram: substring `data[i..=j+1]` whose boundary
-/// pair-weights at positions i and j both strictly exceed every interior
-/// pair-weight. Index-time. Returns sorted, deduped (`hash`, `gram_len`).
-pub fn extract_sparse_ngrams_all(data: &[u8]) -> Vec<(u64, usize)> {
-    sparse_grams_all_bytes(data)
-        .iter()
-        .map(|g| (hash_ngram(g), g.len()))
-        .collect()
-}
+#[cfg(test)]
+mod invariant_grams {
+    use super::{hash_ngram, sparse_grams_all_bytes, sparse_grams_covering_bytes};
 
-/// `build_covering` - minimal covering set via monotone-stack partitioning.
-/// Query-time. `covering(L)` is a subset of `all(F)` whenever `L` is a substring of `F`.
-pub fn extract_sparse_ngrams_covering(data: &[u8]) -> Vec<(u64, usize)> {
-    sparse_grams_covering_bytes(data)
-        .iter()
-        .map(|g| (hash_ngram(g), g.len()))
-        .collect()
+    pub(super) fn trigrams(bytes: &[u8]) -> Vec<u32> {
+        let mut v: Vec<u32> = bytes
+            .windows(3)
+            .map(|w| (w[0] as u32) << 16 | (w[1] as u32) << 8 | w[2] as u32)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    pub(super) fn extract_sparse_ngrams_all(data: &[u8]) -> Vec<(u64, usize)> {
+        sparse_grams_all_bytes(data)
+            .iter()
+            .map(|g| (hash_ngram(g), g.len()))
+            .collect()
+    }
+
+    pub(super) fn extract_sparse_ngrams_covering(data: &[u8]) -> Vec<(u64, usize)> {
+        sparse_grams_covering_bytes(data)
+            .iter()
+            .map(|g| (hash_ngram(g), g.len()))
+            .collect()
+    }
 }
 
 /// A source of documents. Implemented by a local dir (tests) and S3 (prod).
@@ -256,6 +254,7 @@ pub fn scan_matching_docs(
 
 #[cfg(test)]
 mod tests {
+    use super::invariant_grams::trigrams;
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -311,6 +310,7 @@ mod tests {
 
 #[cfg(test)]
 mod sparse_tests {
+    use super::invariant_grams::{extract_sparse_ngrams_all, extract_sparse_ngrams_covering};
     use super::*;
     use std::collections::HashSet;
 
