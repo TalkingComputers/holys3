@@ -230,14 +230,6 @@ impl MmapIndexReader {
     fn read_block(&self, offset: u64) -> Result<BTreeSet<DocId>> {
         decode_postings_block(&self.postings, offset)
     }
-
-    pub fn stats(&self) -> IndexStats {
-        IndexStats {
-            distinct_grams: self.map.len() as u64,
-            terms_fst_bytes: self.map.as_fst().as_bytes().len() as u64,
-            postings_bytes: self.postings.len() as u64,
-        }
-    }
 }
 
 impl IndexReader for MmapIndexReader {
@@ -257,7 +249,11 @@ impl IndexReader for MmapIndexReader {
     }
 
     fn stats(&self) -> IndexStats {
-        MmapIndexReader::stats(self)
+        IndexStats {
+            distinct_grams: self.map.len() as u64,
+            terms_fst_bytes: self.map.as_fst().as_bytes().len() as u64,
+            postings_bytes: self.postings.len() as u64,
+        }
     }
 }
 
@@ -338,13 +334,6 @@ impl StoreIndexReader {
             .get_range(&self.store_postings_name, offset, block_len)?;
         decode_postings_block(&block, 0)
     }
-    pub fn stats(&self) -> IndexStats {
-        IndexStats {
-            distinct_grams: self.map.len() as u64,
-            terms_fst_bytes: self.terms_fst_len,
-            postings_bytes: self.postings_len,
-        }
-    }
 }
 
 impl IndexReader for StoreIndexReader {
@@ -364,7 +353,11 @@ impl IndexReader for StoreIndexReader {
     }
 
     fn stats(&self) -> IndexStats {
-        StoreIndexReader::stats(self)
+        IndexStats {
+            distinct_grams: self.map.len() as u64,
+            terms_fst_bytes: self.terms_fst_len,
+            postings_bytes: self.postings_len,
+        }
     }
 }
 
