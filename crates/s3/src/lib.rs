@@ -509,7 +509,7 @@ impl Corpus for S3Corpus {
         tokio::task::block_in_place(|| self.rt.block_on(self.client.get(&self.bucket, &key, None)))
     }
 
-    fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, anyhow::Result<Vec<u8>>)>> {
+    fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, Vec<u8>)>> {
         let keys = ids
             .iter()
             .map(|&id| (id, self.docs[id as usize].1.clone()))
@@ -537,7 +537,11 @@ impl Corpus for S3Corpus {
                 .buffer_unordered(cfg.buffer)
                 .collect::<Vec<_>>()
                 .await;
-                Ok(results)
+                let mut fetched = Vec::with_capacity(results.len());
+                for (id, result) in results {
+                    fetched.push((id, result?));
+                }
+                Ok(fetched)
             })
         })
     }
