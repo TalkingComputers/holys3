@@ -1,0 +1,185 @@
+name: benchmarks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - README.md
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  micro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Criterion benches
+        run: cargo bench --locked -p holys3-index -- --save-baseline pr
+      - name: Collect Criterion medians
+        run: |
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("target/criterion")
+          benchmarks = {}
+          for path in root.rglob("estimates.json"):
+              if path.parent.name != "new":
+                  continue
+              name = path.parent.parent.relative_to(root).as_posix()
+              data = json.loads(path.read_text())
+              benchmarks[name] = data["median"]["point_estimate"]
+          Path("benches/current.json").write_text(json.dumps({"unit": "ns", "benchmarks": dict(sorted(benchmarks.items()))}, indent=2) + "\n")
+          PY
+      - name: Compare micro baseline
+        run: |
+          python3 <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          threshold = 10.0
+          baseline = json.loads(Path("benches/baseline.json").read_text())
+          current = json.loads(Path("benches/current.json").read_text())
+          base = baseline["benchmarks"]
+          rows = ["| benchmark | baseline ns | current ns | delta |", "|---|---:|---:|---:|"]
+          failed = False
+          for name, value in current["benchmarks"].items():
+              if name not in base:
+                  rows.append(f"| {name} | new | {value:.0f} | new |")
+                  continue
+              old = base[name]
+              delta = ((value - old) / old) * 100.0
+              rows.append(f"| {name} | {old:.0f} | {value:.0f} | {delta:+.1f}% |")
+              failed = failed or delta > threshold
+          Path("bench-micro.md").write_text("\n".join(rows) + "\n")
+          if failed:
+              sys.exit(1)
+          PY
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: bench-micro
+          path: |
+            bench-micro.md
+            benches/current.json
+
+  e2e:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO service
+        run: |
+          docker run -d --name holys3-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio server /data --address :9000
+      - name: Create bucket
+        run: |
+          for i in $(seq 1 60); do
+            docker run --rm --network host quay.io/minio/mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && break
+            sleep 1
+          done
+          docker run --rm --network host quay.io/minio/mc mb --ignore-existing local/holys3-bench
+      - name: Build xbench
+        run: cargo build --locked -p holys3-bench
+      - name: Run xbench
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          HOLYS3_BENCH_BUCKET: holys3-bench
+          HOLYS3_BENCH_REGION: us-east-1
+          HOLYS3_BENCH_ENDPOINT: http://127.0.0.1:9000
+        run: |
+          cargo run --locked -p holys3-bench -- seed --seed 1 --objects 100 --size 4096
+          cargo run --locked -p holys3-bench -- upload --target s3
+          cargo run --locked -p holys3-bench -- run --scenarios crates/xbench/scenarios/queries.toml --iterations 3 --warmup 1 --concurrency 64
+          cargo run --locked -p holys3-bench -- render --input crates/xbench/runs/latest.json > bench-e2e.md
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: bench-e2e
+          path: |
+            bench-e2e.md
+            crates/xbench/runs/latest.json
+          if-no-files-found: ignore
+
+  pr-comment:
+    if: github.event_name == 'pull_request' && always()
+    needs:
+      - micro
+      - e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Build PR comment
+        run: |
+          {
+            echo '## holys3 benchmarks'
+            echo
+            echo '### micro'
+            if [ -f artifacts/bench-micro.md ]; then cat artifacts/bench-micro.md; else echo 'micro did not produce a table'; fi
+            echo
+            echo '### e2e S3'
+            if [ -f artifacts/bench-e2e.md ]; then cat artifacts/bench-e2e.md; else echo 'e2e did not produce a table'; fi
+          } > bench-comment.md
+      - uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: holys3-benchmarks
+          path: bench-comment.md
+
+  publish-main:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - micro
+      - e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Update benchmark files
+        run: |
+          cp artifacts/current.json benches/baseline.json
+          python3 <<'PY'
+          from pathlib import Path
+
+          readme = Path("README.md")
+          table_path = Path("artifacts/bench-e2e.md")
+          table = table_path.read_text() if table_path.exists() else "| scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+          start = "<!-- BENCH:START -->"
+          end = "<!-- BENCH:END -->"
+          body = readme.read_text()
+          before, rest = body.split(start, 1)
+          _, after = rest.split(end, 1)
+          readme.write_text(before + start + "\n" + table + end + after)
+          PY
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: Update benchmark results [skip ci]
+          file_pattern: README.md benches/baseline.json
