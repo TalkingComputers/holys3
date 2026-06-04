@@ -7,7 +7,7 @@ use anyhow::Context;
 use fetch::{fetch_one_hedged, AimdLimiter, RetryBudget};
 use futures::stream::{self, StreamExt};
 use holys3_core::{BlobStore, Corpus, DocId};
-use holys3_sigv4::{encode_query_component, sign_get, sign_request, Credentials};
+use holys3_sigv4::{encode_query_component, sign_get, sign_request, Credentials, SignedHeaders};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -27,6 +27,34 @@ pub fn build_fetch_config(concurrency: usize) -> FetchConfig {
         start: default.start.min(concurrency),
         cap: concurrency,
         ..default
+    }
+}
+
+fn build_http(pool_max_idle: usize) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(pool_max_idle)
+        .pool_idle_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .http2_adaptive_window(true)
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(20))
+        .build()
+}
+
+fn apply_signed(
+    req: reqwest::RequestBuilder,
+    signed: &SignedHeaders,
+    host: &str,
+    session_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let req = req
+        .header("host", host)
+        .header("x-amz-date", &signed.x_amz_date)
+        .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
+        .header("authorization", &signed.authorization);
+    match session_token {
+        Some(token) => req.header("x-amz-security-token", token),
+        None => req,
     }
 }
 
@@ -136,22 +164,8 @@ impl S3Client {
             creds: self.creds.clone(),
             endpoint: self.endpoint.clone(),
             path_style: self.path_style,
-            http: reqwest::Client::builder()
-                .pool_max_idle_per_host(cfg.cap)
-                .pool_idle_timeout(Duration::from_secs(60))
-                .tcp_keepalive(Duration::from_secs(30))
-                .http2_adaptive_window(true)
-                .connect_timeout(Duration::from_secs(3))
-                .timeout(Duration::from_secs(20))
-                .build()?,
-            retry_http: reqwest::Client::builder()
-                .pool_max_idle_per_host(0)
-                .pool_idle_timeout(Duration::from_secs(60))
-                .tcp_keepalive(Duration::from_secs(30))
-                .http2_adaptive_window(true)
-                .connect_timeout(Duration::from_secs(3))
-                .timeout(Duration::from_secs(20))
-                .build()?,
+            http: build_http(cfg.cap)?,
+            retry_http: build_http(0)?,
         })
     }
 
@@ -247,17 +261,14 @@ impl S3Client {
             &amz,
             &date,
         );
-        let mut req = http
-            .get(self.request_url(&host, &path, ""))
-            .header("host", &host)
-            .header("x-amz-date", &signed.x_amz_date)
-            .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
-            .header("authorization", &signed.authorization);
+        let mut req = apply_signed(
+            http.get(self.request_url(&host, &path, "")),
+            &signed,
+            &host,
+            self.creds.session_token.as_deref(),
+        );
         if let Some(r) = &range_hdr {
             req = req.header("range", r);
-        }
-        if let Some(tok) = &self.creds.session_token {
-            req = req.header("x-amz-security-token", tok);
         }
         Ok(req.send().await?)
     }
@@ -305,17 +316,13 @@ impl S3Client {
             &date,
             "UNSIGNED-PAYLOAD",
         );
-        let mut req = self
-            .http
-            .put(self.request_url(&host, &path, ""))
-            .header("host", &host)
-            .header("x-amz-date", &signed.x_amz_date)
-            .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
-            .header("authorization", &signed.authorization)
-            .body(body.to_vec());
-        if let Some(tok) = &self.creds.session_token {
-            req = req.header("x-amz-security-token", tok);
-        }
+        let req = apply_signed(
+            self.http.put(self.request_url(&host, &path, "")),
+            &signed,
+            &host,
+            self.creds.session_token.as_deref(),
+        )
+        .body(body.to_vec());
         req.send().await?.error_for_status()?;
         Ok(())
     }
@@ -353,16 +360,13 @@ impl S3Client {
                 &amz,
                 &date,
             );
-            let mut req = self
-                .http
-                .get(self.request_url(&host, &path, &canonical_query))
-                .header("host", &host)
-                .header("x-amz-date", &signed.x_amz_date)
-                .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
-                .header("authorization", &signed.authorization);
-            if let Some(tok) = &self.creds.session_token {
-                req = req.header("x-amz-security-token", tok);
-            }
+            let req = apply_signed(
+                self.http
+                    .get(self.request_url(&host, &path, &canonical_query)),
+                &signed,
+                &host,
+                self.creds.session_token.as_deref(),
+            );
             let body = req.send().await?.error_for_status()?.text().await?;
             let (objs, next) = parse_list_v2(&body)?;
             all.extend(objs);
