@@ -97,6 +97,16 @@ pub(crate) struct RetryBudget {
     cap: usize,
 }
 
+pub(crate) struct RetryToken<'a> {
+    budget: &'a RetryBudget,
+}
+
+impl Drop for RetryToken<'_> {
+    fn drop(&mut self) {
+        self.budget.refund();
+    }
+}
+
 impl RetryBudget {
     pub(crate) fn new(tokens: usize) -> RetryBudget {
         RetryBudget {
@@ -105,7 +115,7 @@ impl RetryBudget {
         }
     }
 
-    pub(crate) fn try_take(&self) -> bool {
+    pub(crate) fn try_take(&self) -> Option<RetryToken<'_>> {
         let mut current = self.tokens.load(Ordering::Relaxed);
         while current > 0 {
             match self.tokens.compare_exchange(
@@ -114,14 +124,14 @@ impl RetryBudget {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => return Some(RetryToken { budget: self }),
                 Err(observed) => current = observed,
             }
         }
-        false
+        None
     }
 
-    pub(crate) fn refund(&self) {
+    fn refund(&self) {
         let mut current = self.tokens.load(Ordering::Relaxed);
         while current < self.cap {
             match self.tokens.compare_exchange(
@@ -151,24 +161,23 @@ pub(crate) async fn get_with_retry(
     cfg: &FetchConfig,
 ) -> Result<Vec<u8>> {
     let mut attempt = 0;
+    let mut retry_token = None;
     loop {
-        let has_retry_token = attempt > 0;
         let http = if attempt == 0 {
             &client.http
         } else {
             &client.retry_http
         };
         let result = get_once(client, http, bucket, key, limiter).await;
-        if has_retry_token {
-            budget.refund();
-        }
+        drop(retry_token.take());
         match result? {
             GetAttempt::Bytes(bytes) => return Ok(bytes),
             GetAttempt::SlowDown => {
                 if attempt >= cfg.max_retries {
                     anyhow::bail!("S3 GET s3://{bucket}/{key} returned HTTP 503");
                 }
-                if !budget.try_take() {
+                retry_token = budget.try_take();
+                if retry_token.is_none() {
                     anyhow::bail!("S3 GET s3://{bucket}/{key} exhausted retry budget");
                 }
                 let exponential = cfg
@@ -218,18 +227,53 @@ pub(crate) async fn fetch_one_hedged(
         biased;
         result = &mut primary => result,
         () = tokio::time::sleep(cfg.hedge_after) => {
-            if !budget.try_take() {
+            let Some(hedge_token) = budget.try_take() else {
                 return primary.await;
-            }
-            let hedge = get_with_retry(client, bucket, key, limiter, budget, cfg);
+            };
+            let hedge = async {
+                let hedge_token_guard = hedge_token;
+                let result = get_with_retry(client, bucket, key, limiter, budget, cfg).await;
+                drop(hedge_token_guard);
+                result
+            };
             tokio::pin!(hedge);
-            let result = tokio::select! {
+            tokio::select! {
                 biased;
                 result = &mut primary => result,
                 result = &mut hedge => result,
-            };
-            budget.refund();
-            result
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_token_drop_refunds_capacity() {
+        let budget = RetryBudget::new(3);
+        let token = budget.try_take().unwrap();
+
+        assert_eq!(budget.tokens.load(Ordering::Relaxed), 2);
+
+        drop(token);
+
+        assert_eq!(budget.tokens.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn retry_token_drop_restores_exhausted_capacity() {
+        let budget = RetryBudget::new(2);
+        let first = budget.try_take().unwrap();
+        let second = budget.try_take().unwrap();
+
+        assert!(budget.try_take().is_none());
+        assert_eq!(budget.tokens.load(Ordering::Relaxed), 0);
+
+        drop(first);
+        drop(second);
+
+        assert_eq!(budget.tokens.load(Ordering::Relaxed), 2);
     }
 }
