@@ -70,7 +70,9 @@ pub fn parse_list_v2(xml: &str) -> anyhow::Result<(Vec<ObjectMeta>, Option<Strin
                 match cur.as_str() {
                     "Key" if in_contents => key = txt,
                     "ETag" if in_contents => etag = txt.trim_matches('"').to_owned(),
-                    "Size" if in_contents => size = txt.parse().unwrap_or(0),
+                    "Size" if in_contents => {
+                        size = txt.parse().context("invalid Size in ListObjectsV2")?;
+                    }
                     "NextContinuationToken" => next = Some(txt),
                     _ => {}
                 }
@@ -570,6 +572,13 @@ mod tests {
             ]
         );
         assert_eq!(next.as_deref(), Some("TOK"));
+    }
+
+    #[test]
+    fn parse_list_v2_rejects_invalid_size() {
+        let xml = r#"<ListBucketResult><Contents><Key>a.txt</Key><Size>nope</Size><ETag>"abc"</ETag></Contents></ListBucketResult>"#;
+        let err = parse_list_v2(xml).unwrap_err();
+        assert!(err.to_string().contains("invalid Size in ListObjectsV2"));
     }
 
     #[test]
