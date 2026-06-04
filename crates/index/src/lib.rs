@@ -85,8 +85,7 @@ fn build_index_bytes(
     }
     let mut postings_buf: Vec<u8> = Vec::new();
     let mut builder = fst::MapBuilder::new(Vec::new())?;
-    for (gram, ids) in &postings {
-        let mut ids = ids.clone();
+    for (gram, mut ids) in postings {
         ids.sort_unstable();
         ids.dedup();
         let offset = postings_buf.len() as u64;
