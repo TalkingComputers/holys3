@@ -169,8 +169,7 @@ fn select_user_objects(objects: Vec<ObjectMeta>, prefix: &str) -> Vec<ObjectMeta
 }
 
 fn build_cache_dir(bucket: &str, prefix: &str) -> Result<PathBuf> {
-    let mut path = PathBuf::from(std::env::var("HOME")?);
-    path.push(".cache");
+    let mut path = read_cache_home(std::env::var("XDG_CACHE_HOME"), std::env::var("HOME"))?;
     path.push("holys3");
     path.push(bucket);
     let prefix = prefix.replace('/', "__");
@@ -178,6 +177,17 @@ fn build_cache_dir(bucket: &str, prefix: &str) -> Result<PathBuf> {
         path.push(prefix);
     }
     Ok(path)
+}
+
+fn read_cache_home(
+    xdg_cache_home: std::result::Result<String, std::env::VarError>,
+    home: std::result::Result<String, std::env::VarError>,
+) -> Result<PathBuf> {
+    match xdg_cache_home {
+        Ok(path) => Ok(PathBuf::from(path)),
+        Err(std::env::VarError::NotPresent) => Ok(PathBuf::from(home?).join(".cache")),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn search_s3(
@@ -296,5 +306,20 @@ async fn main() -> Result<()> {
             println!("postings_bytes={}", s.postings_bytes);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env::VarError;
+
+    #[test]
+    fn read_cache_home_uses_xdg_cache_home() {
+        let path = read_cache_home(Err(VarError::NotPresent), Ok("/home/me".to_owned())).unwrap();
+        assert_eq!(path, PathBuf::from("/home/me/.cache"));
+
+        let path = read_cache_home(Ok("/cache".to_owned()), Err(VarError::NotPresent)).unwrap();
+        assert_eq!(path, PathBuf::from("/cache"));
     }
 }
