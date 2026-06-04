@@ -46,6 +46,10 @@ pub trait IndexReader {
     fn stats(&self) -> IndexStats;
 }
 
+pub(crate) fn all_docs(docs: &[(DocId, String)]) -> BTreeSet<DocId> {
+    docs.iter().map(|&(id, _)| id).collect()
+}
+
 #[doc(hidden)]
 pub fn eval_query(
     q: &Query,
@@ -223,18 +227,6 @@ impl MmapIndexReader {
         })
     }
 
-    pub fn docs(&self) -> &[(DocId, String)] {
-        &self.docs
-    }
-
-    pub fn strategy(&self) -> Strategy {
-        self.strategy
-    }
-
-    fn all_docs(&self) -> BTreeSet<DocId> {
-        self.docs.iter().map(|&(id, _)| id).collect()
-    }
-
     fn read_block(&self, offset: u64) -> Result<BTreeSet<DocId>> {
         decode_postings_block(&self.postings, offset)
     }
@@ -258,7 +250,7 @@ impl IndexReader for MmapIndexReader {
     }
 
     fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
-        let all_docs = self.all_docs();
+        let all_docs = all_docs(&self.docs);
         eval_query(q, &all_docs, &|gram| self.map.get(gram), &|offset| {
             self.read_block(offset)
         })
@@ -332,18 +324,6 @@ impl StoreIndexReader {
         })
     }
 
-    pub fn docs(&self) -> &[(DocId, String)] {
-        &self.docs
-    }
-
-    pub fn strategy(&self) -> Strategy {
-        self.strategy
-    }
-
-    fn all_docs(&self) -> BTreeSet<DocId> {
-        self.docs.iter().map(|&(id, _)| id).collect()
-    }
-
     fn read_block(&self, offset: u64) -> Result<BTreeSet<DocId>> {
         let count_bytes = self.store.get_range(&self.store_postings_name, offset, 4)?;
         let count = u32::from_le_bytes(count_bytes.as_slice().try_into()?);
@@ -377,7 +357,7 @@ impl IndexReader for StoreIndexReader {
     }
 
     fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
-        let all_docs = self.all_docs();
+        let all_docs = all_docs(&self.docs);
         eval_query(q, &all_docs, &|gram| self.map.get(gram), &|offset| {
             self.read_block(offset)
         })
@@ -494,6 +474,14 @@ mod tests {
         build_to_dir(c, dir.path(), strategy).unwrap();
         let r = MmapIndexReader::open(dir.path()).unwrap();
         (dir, r)
+    }
+
+    #[test]
+    fn all_docs_collects_doc_ids() {
+        assert_eq!(
+            all_docs(&[(2, "b".into()), (1, "a".into())]),
+            BTreeSet::from([1, 2])
+        );
     }
 
     #[test]
