@@ -67,7 +67,7 @@ pub struct SignedHeaders {
 }
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut m = HmacSha256::new_from_slice(key).unwrap();
+    let mut m = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     m.update(data);
     m.finalize().into_bytes().to_vec()
 }

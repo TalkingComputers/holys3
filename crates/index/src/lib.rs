@@ -158,8 +158,8 @@ pub fn build_to_dir(corpus: &dyn Corpus, dir: &Path, strategy: Strategy) -> Resu
 }
 
 pub fn compute_build_id(objects: &[(String, String)]) -> String {
-    let mut objects = objects.to_vec();
-    objects.sort();
+    let mut objects = objects.iter().collect::<Vec<_>>();
+    objects.sort_unstable();
     let mut bytes = Vec::new();
     for (key, etag) in objects {
         bytes.extend_from_slice(key.as_bytes());
