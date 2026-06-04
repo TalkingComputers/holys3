@@ -120,7 +120,7 @@ fn build_index_bytes(
     let docs = corpus
         .fetch_many(&ids)?
         .into_par_iter()
-        .map(|(id, bytes)| Ok((id, grams_index(&bytes?, strategy))))
+        .map(|(id, bytes)| Ok((id, grams_index(&bytes, strategy))))
         .collect::<Result<Vec<_>>>()?;
     for (id, grams) in docs {
         for gram in grams {
@@ -447,7 +447,6 @@ pub fn search_with_regex_stats(
     let mut hits = BTreeSet::new();
     let mut bytes_fetched = 0usize;
     for (id, bytes) in corpus.fetch_many(&ids)? {
-        let bytes = bytes?;
         bytes_fetched = bytes_fetched
             .checked_add(bytes.len())
             .context("bytes fetched overflow")?;

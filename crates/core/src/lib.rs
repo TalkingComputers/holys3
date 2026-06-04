@@ -1,7 +1,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! Shared types, gram extraction, storage traits, and scan verification.
 
-use anyhow::Result;
+use anyhow::Result as AnyhowResult;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -161,18 +161,18 @@ pub trait Corpus {
     /// All document ids with their keys (object key / file path).
     fn docs(&self) -> &[(DocId, String)];
     /// Fetch the full bytes of one document.
-    fn fetch(&self, id: DocId) -> Result<Vec<u8>>;
+    fn fetch(&self, id: DocId) -> AnyhowResult<Vec<u8>>;
     /// Fetch many docs concurrently. Result order is NOT guaranteed; each item carries its `DocId`.
-    /// Per-item Result so one bad object doesn't abort a large batch. Default = sequential.
-    fn fetch_many(&self, ids: &[DocId]) -> Result<Vec<(DocId, Result<Vec<u8>>)>> {
-        Ok(ids.iter().map(|&id| (id, self.fetch(id))).collect())
+    /// Fail-fast: the first fetch error aborts the batch. Default = sequential.
+    fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, Vec<u8>)>> {
+        ids.iter().map(|&id| Ok((id, self.fetch(id)?))).collect()
     }
 }
 
 pub trait BlobStore {
-    fn put(&self, name: &str, bytes: &[u8]) -> Result<()>;
-    fn get(&self, name: &str) -> Result<Vec<u8>>;
-    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>>;
+    fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()>;
+    fn get(&self, name: &str) -> AnyhowResult<Vec<u8>>;
+    fn get_range(&self, name: &str, start: u64, len: u64) -> AnyhowResult<Vec<u8>>;
 }
 
 #[cfg(any(test, feature = "testutil"))]
@@ -214,7 +214,7 @@ impl LocalBlobStore {
 }
 
 impl BlobStore for LocalBlobStore {
-    fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+    fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()> {
         let path = self.root.join(name);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -223,11 +223,11 @@ impl BlobStore for LocalBlobStore {
         Ok(())
     }
 
-    fn get(&self, name: &str) -> Result<Vec<u8>> {
+    fn get(&self, name: &str) -> AnyhowResult<Vec<u8>> {
         Ok(std::fs::read(self.root.join(name))?)
     }
 
-    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+    fn get_range(&self, name: &str, start: u64, len: u64) -> AnyhowResult<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
 
         let mut file = std::fs::File::open(self.root.join(name))?;
@@ -274,7 +274,7 @@ pub fn matches_in(doc: DocId, bytes: &[u8], re: &regex::bytes::Regex) -> Vec<Mat
 pub fn scan_matching_docs(
     corpus: &dyn Corpus,
     re: &regex::bytes::Regex,
-) -> Result<BTreeSet<DocId>> {
+) -> AnyhowResult<BTreeSet<DocId>> {
     let mut hits = BTreeSet::new();
     for &(id, _) in corpus.docs() {
         let bytes = corpus.fetch(id)?;
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn local_blob_store_round_trips_ranges() -> Result<()> {
+    fn local_blob_store_round_trips_ranges() -> AnyhowResult<()> {
         let root = std::env::temp_dir().join(format!(
             "holys3-core-{}-{}",
             std::process::id(),
@@ -471,5 +471,30 @@ mod corpus_tests {
                 text: "bar baz".into()
             }]
         );
+    }
+
+    #[test]
+    fn fetch_many_aborts_on_first_error() {
+        struct BrokenCorpus {
+            docs: Vec<(DocId, String)>,
+        }
+
+        impl Corpus for BrokenCorpus {
+            fn docs(&self) -> &[(DocId, String)] {
+                &self.docs
+            }
+
+            fn fetch(&self, id: DocId) -> AnyhowResult<Vec<u8>> {
+                if id == 1 {
+                    anyhow::bail!("broken");
+                }
+                Ok(b"ok".to_vec())
+            }
+        }
+
+        let corpus = BrokenCorpus {
+            docs: vec![(0, "a".into()), (1, "b".into())],
+        };
+        assert!(corpus.fetch_many(&[0, 1]).is_err());
     }
 }
