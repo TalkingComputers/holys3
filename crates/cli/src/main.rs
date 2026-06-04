@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use holys3_core::{Corpus, Match, Strategy};
 use holys3_index::{
-    build_to_dir, build_to_store, compute_build_id, search_matches, search_with_stats, IndexReader,
-    LocalCorpus, MmapIndexReader, StoreIndexReader,
+    build_to_dir, build_to_store, compute_build_id, search_matches, IndexReader, LocalCorpus,
+    MmapIndexReader, StoreIndexReader,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, is_index_key, normalize_prefix, region_from_env,
@@ -140,28 +140,34 @@ fn search_local(
 ) -> Result<()> {
     let corpus = LocalCorpus::new(dir)?;
     let reader = MmapIndexReader::open(index)?;
-    if files_only {
-        let search_stats = search_with_stats(&reader, &corpus, pattern)?;
-        if stats {
-            eprintln!(
-                "candidates={} total={} strategy={:?}",
-                search_stats.candidates,
-                search_stats.total_docs,
-                reader.strategy()
-            );
-        }
-        return print_hits(&corpus, search_stats.hits);
-    }
-    let (matches, search_stats) = search_matches(&reader, &corpus, pattern)?;
+    emit_results(&reader, &corpus, pattern, files_only, stats)
+}
+
+fn emit_results(
+    reader: &dyn IndexReader,
+    corpus: &dyn Corpus,
+    pattern: &str,
+    files_only: bool,
+    stats: bool,
+) -> Result<()> {
+    let (matches, search_stats) = search_matches(reader, corpus, pattern)?;
     if stats {
+        let index_stats = reader.stats();
         eprintln!(
-            "candidates={} total={} strategy={:?}",
+            "candidates={} total={} strategy={:?} distinct_grams={} terms_fst_bytes={} postings_bytes={}",
             search_stats.candidates,
             search_stats.total_docs,
-            reader.strategy()
+            reader.strategy(),
+            index_stats.distinct_grams,
+            index_stats.terms_fst_bytes,
+            index_stats.postings_bytes
         );
     }
-    print_matches(&corpus, matches)
+    if files_only {
+        print_hits(corpus, search_stats.hits)
+    } else {
+        print_matches(corpus, matches)
+    }
 }
 
 fn read_region(region: Option<String>) -> Result<String> {
@@ -224,36 +230,7 @@ fn search_s3(
     let cache_dir = build_cache_dir(&bucket, &prefix)?;
     let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
     let corpus = S3Corpus::from_docs(client, bucket, reader.docs().to_vec(), rt, cfg)?;
-    if files_only {
-        let search_stats = search_with_stats(&reader, &corpus, pattern)?;
-        if stats {
-            let index_stats = reader.stats();
-            eprintln!(
-                "candidates={} total={} strategy={:?} distinct_grams={} terms_fst_bytes={} postings_bytes={}",
-                search_stats.candidates,
-                search_stats.total_docs,
-                reader.strategy(),
-                index_stats.distinct_grams,
-                index_stats.terms_fst_bytes,
-                index_stats.postings_bytes
-            );
-        }
-        return print_hits(&corpus, search_stats.hits);
-    }
-    let (matches, search_stats) = search_matches(&reader, &corpus, pattern)?;
-    if stats {
-        let index_stats = reader.stats();
-        eprintln!(
-            "candidates={} total={} strategy={:?} distinct_grams={} terms_fst_bytes={} postings_bytes={}",
-            search_stats.candidates,
-            search_stats.total_docs,
-            reader.strategy(),
-            index_stats.distinct_grams,
-            index_stats.terms_fst_bytes,
-            index_stats.postings_bytes
-        );
-    }
-    print_matches(&corpus, matches)
+    emit_results(&reader, &corpus, pattern, files_only, stats)
 }
 
 fn print_hits(
