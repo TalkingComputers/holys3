@@ -1,0 +1,35 @@
+[package]
+name = "holys3-bench"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+description = "Benchmark harness for holys3"
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[[bin]]
+name = "holys3-bench"
+path = "src/main.rs"
+
+[dependencies]
+holys3-core = { path = "../core" }
+holys3-index = { path = "../index" }
+holys3-query = { path = "../query" }
+holys3-s3 = { path = "../s3" }
+holys3-sigv4 = { path = "../sigv4" }
+anyhow.workspace = true
+clap.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

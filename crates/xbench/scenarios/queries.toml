@@ -1,0 +1,23 @@
+[[scenarios]]
+name = "short_literal"
+pattern = "needle"
+
+[[scenarios]]
+name = "long_literal"
+pattern = "longliteralbenchmarktoken"
+
+[[scenarios]]
+name = "alternation"
+pattern = "alpha|beta"
+
+[[scenarios]]
+name = "anchored"
+pattern = "^ANCHOR_START"
+
+[[scenarios]]
+name = "no_match"
+pattern = "UNMATCHABLE_TOKEN"
+
+[[scenarios]]
+name = "QAll"
+pattern = ".*"
