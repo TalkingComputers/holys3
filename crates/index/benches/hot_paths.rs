@@ -64,16 +64,16 @@ fn postings_fixture() -> (BTreeMap<Vec<u8>, u64>, Vec<u8>, BTreeSet<DocId>) {
 
 fn bench_grams(c: &mut Criterion) {
     c.bench_function("grams_index_trigram", |b| {
-        b.iter(|| grams_index(black_box(SAMPLE), Strategy::Trigram))
+        b.iter(|| grams_index(black_box(SAMPLE), Strategy::Trigram));
     });
     c.bench_function("grams_index_sparse", |b| {
-        b.iter(|| grams_index(black_box(SAMPLE), Strategy::Sparse))
+        b.iter(|| grams_index(black_box(SAMPLE), Strategy::Sparse));
     });
     c.bench_function("grams_query_trigram", |b| {
-        b.iter(|| grams_query(black_box(b"customer_id=abc123"), Strategy::Trigram))
+        b.iter(|| grams_query(black_box(b"customer_id=abc123"), Strategy::Trigram));
     });
     c.bench_function("grams_query_sparse", |b| {
-        b.iter(|| grams_query(black_box(b"customer_id=abc123"), Strategy::Sparse))
+        b.iter(|| grams_query(black_box(b"customer_id=abc123"), Strategy::Sparse));
     });
 }
 
@@ -86,7 +86,7 @@ fn bench_plan(c: &mut Criterion) {
         ".*",
     ] {
         c.bench_function(&format!("plan/{pattern}"), |b| {
-            b.iter(|| plan(black_box(pattern), Strategy::Sparse).expect("benchmark setup failed"))
+            b.iter(|| plan(black_box(pattern), Strategy::Sparse).expect("benchmark setup failed"));
         });
     }
 }
@@ -105,7 +105,7 @@ fn bench_eval_query(c: &mut Criterion) {
                 &|gram| postings.get(gram).copied(),
                 &|offset| decode_postings_block(&bytes, offset),
             )
-            .expect("benchmark setup failed")
+            .expect("benchmark setup failed");
         })
     });
 }
@@ -120,7 +120,7 @@ fn bench_index_reader(c: &mut Criterion) {
         b.iter(|| {
             mmap_reader
                 .candidates(black_box(&q))
-                .expect("benchmark setup failed")
+                .expect("benchmark setup failed");
         })
     });
 
@@ -139,7 +139,7 @@ fn bench_index_reader(c: &mut Criterion) {
         b.iter(|| {
             store_reader
                 .candidates(black_box(&q))
-                .expect("benchmark setup failed")
+                .expect("benchmark setup failed");
         })
     });
 }
@@ -148,7 +148,7 @@ fn bench_postings_decode(c: &mut Criterion) {
     let (_postings, bytes, _all) = postings_fixture();
     c.bench_function("postings_block_decode", |b| {
         b.iter(|| {
-            decode_postings_block(black_box(&bytes), black_box(0)).expect("benchmark setup failed")
+            decode_postings_block(black_box(&bytes), black_box(0)).expect("benchmark setup failed");
         })
     });
 }
