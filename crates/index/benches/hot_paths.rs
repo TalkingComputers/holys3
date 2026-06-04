@@ -106,7 +106,7 @@ fn bench_eval_query(c: &mut Criterion) {
                 &|offset| decode_postings_block(&bytes, offset),
             )
             .expect("benchmark setup failed");
-        })
+        });
     });
 }
 
@@ -121,7 +121,7 @@ fn bench_index_reader(c: &mut Criterion) {
             mmap_reader
                 .candidates(black_box(&q))
                 .expect("benchmark setup failed");
-        })
+        });
     });
 
     let store_dir = tempfile::tempdir().expect("benchmark setup failed");
@@ -140,7 +140,7 @@ fn bench_index_reader(c: &mut Criterion) {
             store_reader
                 .candidates(black_box(&q))
                 .expect("benchmark setup failed");
-        })
+        });
     });
 }
 
@@ -149,7 +149,7 @@ fn bench_postings_decode(c: &mut Criterion) {
     c.bench_function("postings_block_decode", |b| {
         b.iter(|| {
             decode_postings_block(black_box(&bytes), black_box(0)).expect("benchmark setup failed");
-        })
+        });
     });
 }
 
