@@ -63,12 +63,7 @@ pub fn region_from_env() -> anyhow::Result<String> {
 pub fn s3_client_from_env(region: &str, endpoint: Option<String>) -> anyhow::Result<S3Client> {
     let creds = holys3_sigv4::resolve("default")?;
     let path_style = endpoint.is_some();
-    Ok(S3Client::new(
-        region.to_owned(),
-        creds,
-        endpoint,
-        path_style,
-    ))
+    S3Client::new(region.to_owned(), creds, endpoint, path_style)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,15 +140,15 @@ impl S3Client {
         creds: Credentials,
         endpoint: Option<String>,
         path_style: bool,
-    ) -> S3Client {
-        S3Client {
+    ) -> anyhow::Result<S3Client> {
+        Ok(S3Client {
             region,
             creds,
             endpoint,
             path_style,
-            http: reqwest::Client::new(),
-            retry_http: reqwest::Client::new(),
-        }
+            http: build_http(FetchConfig::default().cap)?,
+            retry_http: build_http(0)?,
+        })
     }
 
     pub fn with_fetch_config(&self, cfg: &FetchConfig) -> anyhow::Result<S3Client> {
