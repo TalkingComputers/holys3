@@ -1,0 +1,101 @@
+{
+  "seed": 42,
+  "objects": 200,
+  "object_size": 4096,
+  "total_bytes": 819200,
+  "iterations": 5,
+  "warmup": 2,
+  "concurrency": 64,
+  "backend": {
+    "kind": "s3",
+    "bucket": "holys3-test-381235349110-ue2",
+    "region": "us-east-2",
+    "endpoint": null
+  },
+  "scenarios": [
+    {
+      "name": "short_literal",
+      "pattern": "needle",
+      "expected_hits": 100,
+      "hits": 100,
+      "candidates": 100,
+      "total_docs": 200,
+      "prune_ratio": 0.5,
+      "bytes_fetched": 409600,
+      "p50_ms": 814.02625,
+      "p95_ms": 903.930667,
+      "p99_ms": 903.930667,
+      "sequential_p50_ms": 7592.548
+    },
+    {
+      "name": "long_literal",
+      "pattern": "longliteralbenchmarktoken",
+      "expected_hits": 67,
+      "hits": 67,
+      "candidates": 67,
+      "total_docs": 200,
+      "prune_ratio": 0.335,
+      "bytes_fetched": 274432,
+      "p50_ms": 3537.4474170000003,
+      "p95_ms": 4003.9254169999995,
+      "p99_ms": 4003.9254169999995,
+      "sequential_p50_ms": 7926.796416
+    },
+    {
+      "name": "alternation",
+      "pattern": "alpha|beta",
+      "expected_hits": 63,
+      "hits": 63,
+      "candidates": 63,
+      "total_docs": 200,
+      "prune_ratio": 0.315,
+      "bytes_fetched": 258048,
+      "p50_ms": 1044.755041,
+      "p95_ms": 1855.635291,
+      "p99_ms": 1855.635291,
+      "sequential_p50_ms": 5370.657083
+    },
+    {
+      "name": "anchored",
+      "pattern": "^ANCHOR_START",
+      "expected_hits": 19,
+      "hits": 19,
+      "candidates": 19,
+      "total_docs": 200,
+      "prune_ratio": 0.095,
+      "bytes_fetched": 77824,
+      "p50_ms": 1709.878166,
+      "p95_ms": 1912.182292,
+      "p99_ms": 1912.182292,
+      "sequential_p50_ms": 3007.6800000000003
+    },
+    {
+      "name": "no_match",
+      "pattern": "UNMATCHABLE_TOKEN",
+      "expected_hits": 0,
+      "hits": 0,
+      "candidates": 0,
+      "total_docs": 200,
+      "prune_ratio": 0.0,
+      "bytes_fetched": 0,
+      "p50_ms": 0.018916,
+      "p95_ms": 0.022917,
+      "p99_ms": 0.022917,
+      "sequential_p50_ms": 0.018458
+    },
+    {
+      "name": "QAll",
+      "pattern": ".*",
+      "expected_hits": 200,
+      "hits": 200,
+      "candidates": 200,
+      "total_docs": 200,
+      "prune_ratio": 1.0,
+      "bytes_fetched": 819200,
+      "p50_ms": 328.287875,
+      "p95_ms": 328.94941700000004,
+      "p99_ms": 328.94941700000004,
+      "sequential_p50_ms": 14290.202583999999
+    }
+  ]
+}

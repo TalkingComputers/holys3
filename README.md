@@ -114,17 +114,23 @@ The index narrows candidates. The verifier decides matches.
 ## Benchmarks
 
 <!-- BENCH:START -->
-| scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| short_literal | pending | pending | pending | pending | pending | pending | pending | pending |
-| long_literal | pending | pending | pending | pending | pending | pending | pending | pending |
-| alternation | pending | pending | pending | pending | pending | pending | pending | pending |
-| anchored | pending | pending | pending | pending | pending | pending | pending | pending |
-| no_match | pending | pending | pending | pending | pending | pending | pending | pending |
-| QAll | pending | pending | pending | pending | pending | pending | pending | pending |
+
+End-to-end search latency over 200 synthetic 4 KiB objects (800 KiB total), indexed search at concurrency 64 vs a sequential (`--concurrency 1`) baseline:
+
+| scenario      | pattern                     | hits | candidates/total | p50 ms | p95 ms | seq p50 ms |               speedup |
+| ------------- | --------------------------- | ---: | ---------------: | -----: | -----: | ---------: | --------------------: |
+| no_match      | `UNMATCHABLE_TOKEN`         |    0 |            0/200 |    0.0 |    0.0 |        0.0 | index fetches nothing |
+| QAll          | `.*`                        |  200 |          200/200 |    328 |    329 |      14290 |                 43.5x |
+| short_literal | `needle`                    |  100 |          100/200 |    814 |    904 |       7593 |                  9.3x |
+| alternation   | `alpha\|beta`               |   63 |           63/200 |   1045 |   1856 |       5371 |                  5.1x |
+| long_literal  | `longliteralbenchmarktoken` |   67 |           67/200 |   3537 |   4004 |       7927 |                  2.2x |
+| anchored      | `^ANCHOR_START`             |   19 |           19/200 |   1710 |   1912 |       3008 |                  1.8x |
+
+Two effects compound: the trigram index **prunes** the candidate set (a non-matching query fetches **zero** objects), and concurrent ranged fetch **fans out** the survivors (`.*` over all 200 objects is 43.5x faster than sequential).
+
 <!-- BENCH:END -->
 
-Methodology: one machine, one region, fixed synthetic corpus, fixed seed, object count and object size recorded in `crates/xbench/runs/*.json`, holys3 SHA from `git rev-parse HEAD`, exact command recorded by the runner; reproduce with `make bench`.
+Methodology: numbers above are from a laptop to `us-east-2` over the public internet (per-object round-trip dominates; in-region EC2 is far lower), 200x4 KiB synthetic objects, fixed seed 42, 5 iterations + 2 warmup; `long_literal`'s 3.5 s reflects real-network tail variance at low iteration counts. One machine, one region; full run JSON in `crates/xbench/runs/*.json`. Reproduce with `make bench-s3` (your bucket) or `make bench-minio` (local, deterministic). Microbenchmarks (`make bench-micro`): trigram extraction ~330 us, query plan ~0.7 us, postings decode ~44 ns.
 
 ## Security
 
