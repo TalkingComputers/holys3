@@ -17,6 +17,8 @@ publish = false
 holys3-core = { path = "../core" }
 holys3-sigv4 = { path = "../sigv4" }
 anyhow.workspace = true
+futures = "0.3.32"
+rand = "0.10.1"
 reqwest.workspace = true
 tokio.workspace = true
 quick-xml.workspace = true
