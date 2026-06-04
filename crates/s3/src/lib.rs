@@ -507,8 +507,13 @@ impl Corpus for S3Corpus {
     }
 
     fn fetch(&self, id: DocId) -> anyhow::Result<Vec<u8>> {
-        let key = self.docs[id as usize].1.clone();
-        tokio::task::block_in_place(|| self.rt.block_on(self.client.get(&self.bucket, &key, None)))
+        let mut docs = self.fetch_many(&[id])?;
+        let (fetched_id, bytes) = docs.pop().context("fetch_many returned no result")?;
+        anyhow::ensure!(
+            fetched_id == id,
+            "fetch_many returned doc {fetched_id} for requested doc {id}"
+        );
+        Ok(bytes)
     }
 
     fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, Vec<u8>)>> {
