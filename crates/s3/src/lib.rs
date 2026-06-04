@@ -8,10 +8,18 @@ use fetch::{fetch_one_hedged, AimdLimiter, RetryBudget};
 use futures::stream::{self, StreamExt};
 use holys3_core::{BlobStore, Corpus, DocId};
 use holys3_sigv4::{encode_query_component, sign_get, sign_request, Credentials};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 pub use fetch::FetchConfig;
+
+static FORMAT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
+    LazyLock::new(|| {
+        match time::format_description::parse("[year][month][day]T[hour][minute][second]Z") {
+            Ok(format) => format,
+            Err(error) => panic!("invalid amz date format: {error}"),
+        }
+    });
 
 pub fn build_fetch_config(concurrency: usize) -> FetchConfig {
     let default = FetchConfig::default();
@@ -206,12 +214,10 @@ impl S3Client {
     /// Timestamp helper: returns (`amz_date`, `date`).
     fn now() -> (String, String) {
         let dt = time::OffsetDateTime::now_utc();
-        let amz = dt
-            .format(
-                &time::format_description::parse("[year][month][day]T[hour][minute][second]Z")
-                    .unwrap(),
-            )
-            .unwrap();
+        let amz = match dt.format(FORMAT.as_slice()) {
+            Ok(amz) => amz,
+            Err(error) => panic!("failed to format amz date: {error}"),
+        };
         let date = amz[..8].to_string();
         (amz, date)
     }
