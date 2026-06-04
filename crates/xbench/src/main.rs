@@ -263,7 +263,7 @@ fn run_dir(
     let reader = MmapIndexReader::open(&local_index_dir())?;
     let corpus = LocalCorpus::new(&objects_dir())?;
     let results = run_all(
-        &reader, &corpus, &reader, &corpus, &scenarios, manifest, iterations, warmup,
+        &reader, &corpus, &corpus, &scenarios, manifest, iterations, warmup,
     )?;
     Ok(RunSummary {
         seed: manifest.seed,
@@ -301,17 +301,8 @@ fn run_s3(
         rt.clone(),
         cfg.clone(),
     )?;
-    let single_store = S3BlobStore::new(
-        backend.client.clone(),
-        backend.bucket.clone(),
-        S3_PREFIX.to_owned(),
-        rt.clone(),
-        single_cfg.clone(),
-    )?;
     let cache_dir = reports_dir().join("s3-cache");
-    let single_cache_dir = reports_dir().join("s3-cache-single");
     let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
-    let single_reader = StoreIndexReader::open(Box::new(single_store), &single_cache_dir)?;
     let corpus = S3Corpus::from_docs(
         backend.client.clone(),
         backend.bucket.clone(),
@@ -322,14 +313,13 @@ fn run_s3(
     let single_corpus = S3Corpus::from_docs(
         backend.client.clone(),
         backend.bucket.clone(),
-        single_reader.docs().to_vec(),
+        reader.docs().to_vec(),
         rt,
         single_cfg,
     )?;
     let results = run_all(
         &reader,
         &corpus,
-        &single_reader,
         &single_corpus,
         &scenarios,
         manifest,
@@ -358,7 +348,6 @@ fn run_s3(
 fn run_all(
     reader: &dyn IndexReader,
     corpus: &dyn Corpus,
-    single_reader: &dyn IndexReader,
     single_corpus: &dyn Corpus,
     scenarios: &[Scenario],
     manifest: &SeedManifest,
@@ -374,7 +363,7 @@ fn run_all(
                 .with_context(|| format!("missing expected hit count for {}", scenario.name))?;
             let timed = time_scenario(reader, corpus, scenario, expected, iterations, warmup)?;
             let single = time_scenario(
-                single_reader,
+                reader,
                 single_corpus,
                 scenario,
                 expected,
