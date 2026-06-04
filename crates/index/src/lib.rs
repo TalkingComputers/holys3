@@ -323,6 +323,9 @@ impl StoreIndexReader {
     fn read_block(&self, offset: u64) -> Result<BTreeSet<DocId>> {
         let count_bytes = self.store.get_range(&self.store_postings_name, offset, 4)?;
         let count = u32::from_le_bytes(count_bytes.as_slice().try_into()?);
+        if count == 0 {
+            return Ok(BTreeSet::new());
+        }
         let ids_len = u64::from(count)
             .checked_mul(4)
             .context("postings block byte length overflow")?;
@@ -547,5 +550,70 @@ mod tests {
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.total_docs, 2);
         assert_eq!(stats.bytes_fetched, b"abc world".len());
+    }
+
+    #[test]
+    fn store_reader_skips_empty_postings_range() -> Result<()> {
+        struct CountingStore {
+            blobs: BTreeMap<String, Vec<u8>>,
+            range_calls: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl BlobStore for CountingStore {
+            fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+                anyhow::bail!("unused put {name} {}", bytes.len())
+            }
+
+            fn get(&self, name: &str) -> Result<Vec<u8>> {
+                Ok(self.blobs[name].clone())
+            }
+
+            fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+                self.range_calls.set(self.range_calls.get() + 1);
+                let start = usize::try_from(start)?;
+                let len = usize::try_from(len)?;
+                Ok(self.blobs[name][start..start + len].to_vec())
+            }
+        }
+
+        let build_id = "zero";
+        let mut terms = fst::MapBuilder::new(Vec::new())?;
+        terms.insert(b"abc", 0)?;
+        let terms = terms.into_inner()?;
+        let footer = Footer {
+            strategy: Strategy::Trigram,
+            doc_count: 1,
+            terms_fst_len: u64::try_from(terms.len())?,
+            postings_len: 4,
+            build_id: build_id.to_owned(),
+        };
+        let manifest = Manifest {
+            docs: vec![(0, "doc".into())],
+            strategy: Strategy::Trigram,
+        };
+        let blobs = BTreeMap::from([
+            ("CURRENT".into(), build_id.as_bytes().to_vec()),
+            (
+                format!("builds/{build_id}/footer.bin"),
+                postcard::to_allocvec(&footer)?,
+            ),
+            (format!("builds/{build_id}/terms.fst"), terms),
+            (
+                format!("builds/{build_id}/manifest.bin"),
+                postcard::to_allocvec(&manifest)?,
+            ),
+            (format!("builds/{build_id}/postings.bin"), vec![0, 0, 0, 0]),
+        ]);
+        let range_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let store = CountingStore {
+            blobs,
+            range_calls: std::rc::Rc::clone(&range_calls),
+        };
+        let cache_dir = tempfile::tempdir()?;
+        let reader = StoreIndexReader::open(Box::new(store), cache_dir.path())?;
+
+        assert_eq!(reader.read_block(0)?, BTreeSet::new());
+        assert_eq!(range_calls.get(), 1);
+        Ok(())
     }
 }
