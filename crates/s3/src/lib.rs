@@ -1,8 +1,16 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! S3 client, blob store, and corpus implementations.
 
+pub mod fetch;
+
+use fetch::{fetch_one_hedged, AimdLimiter, RetryBudget};
+use futures::stream::{self, StreamExt};
 use holys3_core::{BlobStore, Corpus, DocId};
 use holys3_sigv4::{encode_query_component, sign_get, sign_request, Credentials};
+use std::sync::Arc;
+use std::time::Duration;
+
+pub use fetch::FetchConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
@@ -65,6 +73,7 @@ pub struct S3Client {
     pub region: String,
     pub creds: Credentials,
     http: reqwest::Client,
+    retry_http: reqwest::Client,
 }
 
 impl S3Client {
@@ -73,7 +82,31 @@ impl S3Client {
             region,
             creds,
             http: reqwest::Client::new(),
+            retry_http: reqwest::Client::new(),
         }
+    }
+
+    pub fn with_fetch_config(&self, cfg: &FetchConfig) -> anyhow::Result<S3Client> {
+        Ok(S3Client {
+            region: self.region.clone(),
+            creds: self.creds.clone(),
+            http: reqwest::Client::builder()
+                .pool_max_idle_per_host(cfg.cap)
+                .pool_idle_timeout(Duration::from_secs(60))
+                .tcp_keepalive(Duration::from_secs(30))
+                .http2_adaptive_window(true)
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(20))
+                .build()?,
+            retry_http: reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .pool_idle_timeout(Duration::from_secs(60))
+                .tcp_keepalive(Duration::from_secs(30))
+                .http2_adaptive_window(true)
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(20))
+                .build()?,
+        })
     }
 
     fn host(&self, bucket: &str) -> String {
@@ -93,12 +126,13 @@ impl S3Client {
         (amz, date)
     }
 
-    pub async fn get(
+    pub(crate) async fn send_get(
         &self,
+        http: &reqwest::Client,
         bucket: &str,
         key: &str,
         range: Option<(u64, u64)>,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<reqwest::Response> {
         let host = self.host(bucket);
         let path = format!("/{key}");
         let (amz, date) = Self::now();
@@ -117,8 +151,7 @@ impl S3Client {
             &amz,
             &date,
         );
-        let mut req = self
-            .http
+        let mut req = http
             .get(format!("https://{host}{path}"))
             .header("host", &host)
             .header("x-amz-date", &signed.x_amz_date)
@@ -130,7 +163,19 @@ impl S3Client {
         if let Some(tok) = &self.creds.session_token {
             req = req.header("x-amz-security-token", tok);
         }
-        let resp = req.send().await?.error_for_status()?;
+        Ok(req.send().await?)
+    }
+
+    pub async fn get(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<(u64, u64)>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let resp = self
+            .send_get(&self.http, bucket, key, range)
+            .await?
+            .error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
     }
 
@@ -246,13 +291,14 @@ impl S3BlobStore {
         bucket: String,
         prefix: String,
         rt: tokio::runtime::Handle,
-    ) -> S3BlobStore {
-        S3BlobStore {
-            client,
+        cfg: FetchConfig,
+    ) -> anyhow::Result<S3BlobStore> {
+        Ok(S3BlobStore {
+            client: client.with_fetch_config(&cfg)?,
             bucket,
             prefix,
             rt,
-        }
+        })
     }
 
     fn build_key(&self, name: &str) -> String {
@@ -320,6 +366,7 @@ pub struct S3Corpus {
     bucket: String,
     docs: Vec<(DocId, String)>,
     rt: tokio::runtime::Handle,
+    cfg: FetchConfig,
 }
 
 impl S3Corpus {
@@ -328,18 +375,20 @@ impl S3Corpus {
         bucket: String,
         objects: Vec<ObjectMeta>,
         rt: tokio::runtime::Handle,
-    ) -> S3Corpus {
+        cfg: FetchConfig,
+    ) -> anyhow::Result<S3Corpus> {
         let docs = objects
             .iter()
             .enumerate()
             .map(|(i, o)| (i as DocId, o.key.clone()))
             .collect();
-        S3Corpus {
-            client,
+        Ok(S3Corpus {
+            client: client.with_fetch_config(&cfg)?,
             bucket,
             docs,
             rt,
-        }
+            cfg,
+        })
     }
 
     pub fn from_docs(
@@ -347,13 +396,15 @@ impl S3Corpus {
         bucket: String,
         docs: Vec<(DocId, String)>,
         rt: tokio::runtime::Handle,
-    ) -> S3Corpus {
-        S3Corpus {
-            client,
+        cfg: FetchConfig,
+    ) -> anyhow::Result<S3Corpus> {
+        Ok(S3Corpus {
+            client: client.with_fetch_config(&cfg)?,
             bucket,
             docs,
             rt,
-        }
+            cfg,
+        })
     }
 }
 
@@ -365,6 +416,39 @@ impl Corpus for S3Corpus {
     fn fetch(&self, id: DocId) -> anyhow::Result<Vec<u8>> {
         let key = self.docs[id as usize].1.clone();
         tokio::task::block_in_place(|| self.rt.block_on(self.client.get(&self.bucket, &key, None)))
+    }
+
+    fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, anyhow::Result<Vec<u8>>)>> {
+        let keys = ids
+            .iter()
+            .map(|&id| (id, self.docs[id as usize].1.clone()))
+            .collect::<Vec<_>>();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let cfg = self.cfg.clone();
+        tokio::task::block_in_place(|| {
+            self.rt.block_on(async move {
+                let limiter = Arc::new(AimdLimiter::new(cfg.start, cfg.cap));
+                let budget = Arc::new(RetryBudget::new(cfg.retry_tokens));
+                let results = stream::iter(keys.into_iter().map(|(id, key)| {
+                    let client = client.clone();
+                    let bucket = bucket.clone();
+                    let limiter = Arc::clone(&limiter);
+                    let budget = Arc::clone(&budget);
+                    let cfg = cfg.clone();
+                    async move {
+                        (
+                            id,
+                            fetch_one_hedged(&client, &bucket, &key, &limiter, &budget, &cfg).await,
+                        )
+                    }
+                }))
+                .buffer_unordered(cfg.buffer)
+                .collect::<Vec<_>>()
+                .await;
+                Ok(results)
+            })
+        })
     }
 }
 
