@@ -428,13 +428,7 @@ pub fn search_with_stats(
     corpus: &dyn Corpus,
     pattern: &str,
 ) -> Result<SearchStats> {
-    let (matches, stats) = search_matches(reader, corpus, pattern)?;
-    Ok(SearchStats {
-        hits: matches.iter().map(|matched| matched.doc).collect(),
-        candidates: stats.candidates,
-        total_docs: stats.total_docs,
-        bytes_fetched: stats.bytes_fetched,
-    })
+    Ok(search_matches(reader, corpus, pattern)?.1)
 }
 
 pub fn search_matches(
