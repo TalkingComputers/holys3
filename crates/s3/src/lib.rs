@@ -2,7 +2,7 @@
 //! S3 client, blob store, and corpus implementations.
 
 use holys3_core::{BlobStore, Corpus, DocId};
-use holys3_sigv4::{sign_get, sign_request, Credentials};
+use holys3_sigv4::{encode_query_component, sign_get, sign_request, Credentials};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
@@ -191,7 +191,13 @@ impl S3Client {
             params.sort_by(|a, b| a.0.cmp(b.0));
             let canonical_query = params
                 .iter()
-                .map(|(k, v)| format!("{}={}", enc(k), enc(v)))
+                .map(|(k, v)| {
+                    format!(
+                        "{}={}",
+                        encode_query_component(k),
+                        encode_query_component(v)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("&");
             let (amz, date) = Self::now();
@@ -288,16 +294,20 @@ pub fn build_index_key(prefix: &str, name: &str) -> String {
 }
 
 pub fn build_index_namespace(prefix: &str) -> String {
-    let prefix = prefix
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/");
+    let prefix = normalize_prefix(prefix);
     if prefix.is_empty() {
         ".holys3".into()
     } else {
         format!("{prefix}/.holys3")
     }
+}
+
+pub fn normalize_prefix(prefix: &str) -> String {
+    prefix
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 pub fn is_index_key(prefix: &str, key: &str) -> bool {
@@ -356,20 +366,6 @@ impl Corpus for S3Corpus {
         let key = self.docs[id as usize].1.clone();
         tokio::task::block_in_place(|| self.rt.block_on(self.client.get(&self.bucket, &key, None)))
     }
-}
-
-/// AWS-style query-component encoding (space -> %20, etc.).
-fn enc(s: &str) -> String {
-    let mut out = String::new();
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

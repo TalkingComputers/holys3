@@ -5,7 +5,10 @@ use holys3_index::{
     build_to_dir, build_to_store, compute_build_id, search, IndexReader, LocalCorpus,
     MmapIndexReader, StoreIndexReader,
 };
-use holys3_s3::{build_index_namespace, is_index_key, ObjectMeta, S3BlobStore, S3Client, S3Corpus};
+use holys3_s3::{
+    build_index_namespace, is_index_key, normalize_prefix, ObjectMeta, S3BlobStore, S3Client,
+    S3Corpus,
+};
 use holys3_sigv4::resolve;
 use std::path::{Path, PathBuf};
 
@@ -86,7 +89,7 @@ async fn build_s3(
     region: Option<String>,
     strategy: Strategy,
 ) -> Result<()> {
-    let prefix = build_prefix(&prefix);
+    let prefix = normalize_prefix(&prefix);
     let region = read_region(region)?;
     let creds = resolve("default")?;
     let client = S3Client::new(region, creds);
@@ -137,14 +140,6 @@ fn search_local(
     )
 }
 
-fn build_prefix(prefix: &str) -> String {
-    prefix
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 fn read_region(region: Option<String>) -> Result<String> {
     match region {
         Some(region) => Ok(region),
@@ -179,7 +174,7 @@ fn search_s3(
     files_only: bool,
     stats: bool,
 ) -> Result<()> {
-    let prefix = build_prefix(&prefix);
+    let prefix = normalize_prefix(&prefix);
     let region = read_region(region)?;
     let creds = resolve("default")?;
     let client = S3Client::new(region, creds);

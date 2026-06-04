@@ -92,6 +92,10 @@ fn uri_encode(s: &str, is_path: bool) -> String {
     out
 }
 
+pub fn encode_query_component(s: &str) -> String {
+    uri_encode(s, false)
+}
+
 /// Sign a GET (or HEAD) request with UNSIGNED-PAYLOAD.
 /// `amz_date` is YYYYMMDD'T'HHMMSS'Z' basic format; `date` is "YYYYMMDD".
 /// `canonical_query` must already be sorted+encoded (or empty).
