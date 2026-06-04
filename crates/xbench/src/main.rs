@@ -12,8 +12,10 @@ use holys3_index::{
     build_to_dir, build_to_store, search_with_stats, IndexReader, LocalCorpus, MmapIndexReader,
     StoreIndexReader,
 };
-use holys3_s3::{build_index_namespace, FetchConfig, ObjectMeta, S3BlobStore, S3Client, S3Corpus};
-use holys3_sigv4::resolve;
+use holys3_s3::{
+    build_fetch_config, build_index_namespace, s3_client_from_env, ObjectMeta, S3BlobStore,
+    S3Client, S3Corpus,
+};
 use scenarios::{read_scenarios, Scenario};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -552,8 +554,7 @@ fn read_s3_backend() -> Result<S3Backend> {
     let bucket = std::env::var("HOLYS3_BENCH_BUCKET")?;
     let region = std::env::var("HOLYS3_BENCH_REGION")?;
     let endpoint = read_optional_env("HOLYS3_BENCH_ENDPOINT")?;
-    let creds = resolve("default")?;
-    let client = S3Client::new(region.clone(), creds, endpoint.clone(), endpoint.is_some());
+    let client = s3_client_from_env(&region, endpoint.clone())?;
     Ok(S3Backend {
         bucket,
         region,
@@ -567,14 +568,5 @@ fn read_optional_env(name: &str) -> Result<Option<String>> {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(err) => Err(err.into()),
-    }
-}
-
-fn build_fetch_config(concurrency: usize) -> FetchConfig {
-    let default = FetchConfig::default();
-    FetchConfig {
-        start: default.start.min(concurrency),
-        cap: concurrency,
-        ..default
     }
 }

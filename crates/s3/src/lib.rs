@@ -3,6 +3,7 @@
 
 pub mod fetch;
 
+use anyhow::Context;
 use fetch::{fetch_one_hedged, AimdLimiter, RetryBudget};
 use futures::stream::{self, StreamExt};
 use holys3_core::{BlobStore, Corpus, DocId};
@@ -11,6 +12,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use fetch::FetchConfig;
+
+pub fn build_fetch_config(concurrency: usize) -> FetchConfig {
+    let default = FetchConfig::default();
+    FetchConfig {
+        start: default.start.min(concurrency),
+        cap: concurrency,
+        ..default
+    }
+}
+
+pub fn region_from_env() -> anyhow::Result<String> {
+    std::env::var("AWS_REGION").context("provide --region or set AWS_REGION")
+}
+
+pub fn s3_client_from_env(region: &str, endpoint: Option<String>) -> anyhow::Result<S3Client> {
+    let creds = holys3_sigv4::resolve("default")?;
+    let path_style = endpoint.is_some();
+    Ok(S3Client::new(
+        region.to_owned(),
+        creds,
+        endpoint,
+        path_style,
+    ))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
@@ -545,6 +570,14 @@ mod tests {
             ]
         );
         assert_eq!(next.as_deref(), Some("TOK"));
+    }
+
+    #[test]
+    fn build_fetch_config_caps_initial_concurrency() {
+        let cfg = build_fetch_config(16);
+        assert_eq!(cfg.start, 16);
+        assert_eq!(cfg.cap, 16);
+        assert_eq!(cfg.buffer, FetchConfig::default().buffer);
     }
 
     #[test]

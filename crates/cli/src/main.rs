@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use holys3_core::{matches_in, Corpus, Strategy};
 use holys3_index::{
@@ -6,10 +6,9 @@ use holys3_index::{
     MmapIndexReader, StoreIndexReader,
 };
 use holys3_s3::{
-    build_index_namespace, is_index_key, normalize_prefix, FetchConfig, ObjectMeta, S3BlobStore,
-    S3Client, S3Corpus,
+    build_fetch_config, build_index_namespace, is_index_key, normalize_prefix, region_from_env,
+    s3_client_from_env, ObjectMeta, S3BlobStore, S3Corpus,
 };
-use holys3_sigv4::resolve;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -87,15 +86,6 @@ fn build_local(dir: &Path, out: &Path, strategy: Strategy) -> Result<()> {
     Ok(())
 }
 
-fn build_fetch_config(concurrency: usize) -> FetchConfig {
-    let default = FetchConfig::default();
-    FetchConfig {
-        start: default.start.min(concurrency),
-        cap: concurrency,
-        ..default
-    }
-}
-
 fn parse_concurrency(value: &str) -> std::result::Result<usize, String> {
     let concurrency = value.parse::<usize>().map_err(|err| err.to_string())?;
     if concurrency == 0 {
@@ -114,8 +104,7 @@ async fn build_s3(
     let prefix = normalize_prefix(&prefix);
     let cfg = build_fetch_config(concurrency);
     let region = read_region(region)?;
-    let creds = resolve("default")?;
-    let client = S3Client::new(region, creds, None, false);
+    let client = s3_client_from_env(&region, None)?;
     let objects = select_user_objects(client.list(&bucket, &prefix).await?, &prefix);
     let object_ids = objects
         .iter()
@@ -172,7 +161,7 @@ fn search_local(
 fn read_region(region: Option<String>) -> Result<String> {
     match region {
         Some(region) => Ok(region),
-        None => Ok(std::env::var("AWS_REGION").context("provide --region or set AWS_REGION")?),
+        None => region_from_env(),
     }
 }
 
@@ -207,8 +196,7 @@ fn search_s3(
     let prefix = normalize_prefix(&prefix);
     let cfg = build_fetch_config(concurrency);
     let region = read_region(region)?;
-    let creds = resolve("default")?;
-    let client = S3Client::new(region, creds, None, false);
+    let client = s3_client_from_env(&region, None)?;
     let rt = tokio::runtime::Handle::current();
     let store = S3BlobStore::new(
         client.clone(),
