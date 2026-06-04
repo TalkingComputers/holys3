@@ -111,6 +111,21 @@ Prints local index statistics:
 
 The index narrows candidates. The verifier decides matches.
 
+## Benchmarks
+
+<!-- BENCH:START -->
+| scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| short_literal | pending | pending | pending | pending | pending | pending | pending | pending |
+| long_literal | pending | pending | pending | pending | pending | pending | pending | pending |
+| alternation | pending | pending | pending | pending | pending | pending | pending | pending |
+| anchored | pending | pending | pending | pending | pending | pending | pending | pending |
+| no_match | pending | pending | pending | pending | pending | pending | pending | pending |
+| QAll | pending | pending | pending | pending | pending | pending | pending | pending |
+<!-- BENCH:END -->
+
+Methodology: one machine, one region, fixed synthetic corpus, fixed seed, object count and object size recorded in `crates/xbench/runs/*.json`, holys3 SHA from `git rev-parse HEAD`, exact command recorded by the runner; reproduce with `make bench`.
+
 ## Security
 
 holys3 signs S3 requests with its own SigV4 implementation and tests it against AWS signature vectors. It reads credentials from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, or an AWS credentials profile.
