@@ -1,18 +1,6 @@
 #![allow(dead_code)]
 
-use holys3_core::{Corpus, DocId};
-
-pub(crate) struct MemCorpus(Vec<(DocId, String)>, Vec<Vec<u8>>);
-
-impl Corpus for MemCorpus {
-    fn docs(&self) -> &[(DocId, String)] {
-        &self.0
-    }
-
-    fn fetch(&self, id: DocId) -> anyhow::Result<Vec<u8>> {
-        Ok(self.1[id as usize].clone())
-    }
-}
+use holys3_core::{testutil::MemCorpus, DocId};
 
 pub(crate) const PATTERNS: &[&str] = &[
     "world",
@@ -39,5 +27,5 @@ pub(crate) fn corpus() -> MemCorpus {
     let docs = (0..bodies.len())
         .map(|i| (i as DocId, format!("doc{i}")))
         .collect();
-    MemCorpus(docs, bodies.into_iter().map(|b| b.to_vec()).collect())
+    MemCorpus::new(docs, bodies.into_iter().map(|b| b.to_vec()).collect())
 }

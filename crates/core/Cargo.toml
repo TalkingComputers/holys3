@@ -19,6 +19,9 @@ serde.workspace = true
 regex.workspace = true
 rapidhash = "4.4.1"
 
+[features]
+testutil = []
+
 [lints]
 workspace = true
 

@@ -457,17 +457,7 @@ pub fn search_with_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct MemCorpus(Vec<(DocId, String)>, Vec<Vec<u8>>);
-    impl Corpus for MemCorpus {
-        fn docs(&self) -> &[(DocId, String)] {
-            &self.0
-        }
-
-        fn fetch(&self, id: DocId) -> Result<Vec<u8>> {
-            Ok(self.1[id as usize].clone())
-        }
-    }
+    use holys3_core::testutil::MemCorpus;
 
     fn build_tmp(c: &MemCorpus, strategy: Strategy) -> (tempfile::TempDir, MmapIndexReader) {
         let dir = tempfile::tempdir().unwrap();
@@ -486,7 +476,7 @@ mod tests {
 
     #[test]
     fn candidate_superset_then_verify() {
-        let c = MemCorpus(
+        let c = MemCorpus::new(
             vec![(0, "x".into()), (1, "y".into())],
             vec![b"world".to_vec(), b"word".to_vec()],
         );
@@ -502,7 +492,7 @@ mod tests {
 
     #[test]
     fn all_returns_every_doc() {
-        let c = MemCorpus(vec![(0, "x".into())], vec![b"abcdef".to_vec()]);
+        let c = MemCorpus::new(vec![(0, "x".into())], vec![b"abcdef".to_vec()]);
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
             let (_d, r) = build_tmp(&c, strategy);
             assert_eq!(r.candidates(&Query::All).unwrap(), BTreeSet::from([0]));
@@ -511,7 +501,7 @@ mod tests {
 
     #[test]
     fn search_stats_counts_candidates_and_bytes() {
-        let c = MemCorpus(
+        let c = MemCorpus::new(
             vec![(0, "x".into()), (1, "y".into())],
             vec![b"abc world".to_vec(), b"nomatch".to_vec()],
         );

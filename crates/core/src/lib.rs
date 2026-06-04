@@ -175,6 +175,34 @@ pub trait BlobStore {
     fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>>;
 }
 
+#[cfg(any(test, feature = "testutil"))]
+pub mod testutil {
+    use super::{Corpus, DocId};
+    use anyhow::Result;
+
+    pub struct MemCorpus {
+        docs: Vec<(DocId, String)>,
+        bodies: Vec<Vec<u8>>,
+    }
+
+    impl MemCorpus {
+        pub fn new(docs: Vec<(DocId, String)>, bodies: Vec<Vec<u8>>) -> MemCorpus {
+            assert_eq!(docs.len(), bodies.len());
+            MemCorpus { docs, bodies }
+        }
+    }
+
+    impl Corpus for MemCorpus {
+        fn docs(&self) -> &[(DocId, String)] {
+            &self.docs
+        }
+
+        fn fetch(&self, id: DocId) -> Result<Vec<u8>> {
+            Ok(self.bodies[id as usize].clone())
+        }
+    }
+}
+
 pub struct LocalBlobStore {
     root: PathBuf,
 }
@@ -415,20 +443,11 @@ mod sparse_tests {
 #[cfg(test)]
 mod corpus_tests {
     use super::*;
-
-    struct MemCorpus(Vec<(DocId, String)>, Vec<Vec<u8>>);
-    impl Corpus for MemCorpus {
-        fn docs(&self) -> &[(DocId, String)] {
-            &self.0
-        }
-        fn fetch(&self, id: DocId) -> Result<Vec<u8>> {
-            Ok(self.1[id as usize].clone())
-        }
-    }
+    use crate::testutil::MemCorpus;
 
     #[test]
     fn scan_finds_matching_docs() {
-        let c = MemCorpus(
+        let c = MemCorpus::new(
             vec![(0, "a".into()), (1, "b".into())],
             vec![b"hello world".to_vec(), b"nothing here".to_vec()],
         );

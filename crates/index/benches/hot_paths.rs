@@ -1,6 +1,5 @@
-use anyhow::Result;
 use criterion::{criterion_group, criterion_main, Criterion};
-use holys3_core::{grams_index, grams_query, Corpus, DocId, LocalBlobStore, Strategy};
+use holys3_core::{grams_index, grams_query, testutil::MemCorpus, DocId, LocalBlobStore, Strategy};
 use holys3_index::{
     build_to_dir, build_to_store, decode_postings_block, eval_query, IndexReader, MmapIndexReader,
     StoreIndexReader,
@@ -10,21 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hint::black_box;
 
 const SAMPLE: &[u8] = include_bytes!("fixtures/sample.txt");
-
-struct MemCorpus {
-    docs: Vec<(DocId, String)>,
-    bodies: Vec<Vec<u8>>,
-}
-
-impl Corpus for MemCorpus {
-    fn docs(&self) -> &[(DocId, String)] {
-        &self.docs
-    }
-
-    fn fetch(&self, id: DocId) -> Result<Vec<u8>> {
-        Ok(self.bodies[id as usize].clone())
-    }
-}
 
 fn mem_corpus() -> MemCorpus {
     let mut docs = Vec::new();
@@ -37,7 +21,7 @@ fn mem_corpus() -> MemCorpus {
         );
         bodies.push(body);
     }
-    MemCorpus { docs, bodies }
+    MemCorpus::new(docs, bodies)
 }
 
 fn postings_fixture() -> (BTreeMap<Vec<u8>, u64>, Vec<u8>, BTreeSet<DocId>) {
