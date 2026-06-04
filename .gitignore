@@ -4,3 +4,7 @@ agentdb.rvf
 agentdb.rvf.lock
 ruvector.db
 .cursor/
+
+# transient xbench artifacts (keep runs/*.json reports)
+crates/xbench/runs/corpus/
+crates/xbench/runs/*-cache*/
