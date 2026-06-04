@@ -111,6 +111,16 @@ pub fn decode_postings_block(postings: &[u8], offset: u64) -> Result<BTreeSet<Do
     Ok(set)
 }
 
+fn candidates_via(
+    map: &fst::Map<memmap2::Mmap>,
+    docs: &[(DocId, String)],
+    read_block: impl Fn(u64) -> Result<BTreeSet<DocId>>,
+    q: &Query,
+) -> Result<BTreeSet<DocId>> {
+    let all_docs = all_docs(docs);
+    eval_query(q, &all_docs, &|gram| map.get(gram), &read_block)
+}
+
 fn build_index_bytes(
     corpus: &dyn Corpus,
     strategy: Strategy,
@@ -242,10 +252,7 @@ impl IndexReader for MmapIndexReader {
     }
 
     fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
-        let all_docs = all_docs(&self.docs);
-        eval_query(q, &all_docs, &|gram| self.map.get(gram), &|offset| {
-            self.read_block(offset)
-        })
+        candidates_via(&self.map, &self.docs, |offset| self.read_block(offset), q)
     }
 
     fn stats(&self) -> IndexStats {
@@ -349,10 +356,7 @@ impl IndexReader for StoreIndexReader {
     }
 
     fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
-        let all_docs = all_docs(&self.docs);
-        eval_query(q, &all_docs, &|gram| self.map.get(gram), &|offset| {
-            self.read_block(offset)
-        })
+        candidates_via(&self.map, &self.docs, |offset| self.read_block(offset), q)
     }
 
     fn stats(&self) -> IndexStats {
