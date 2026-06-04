@@ -347,25 +347,17 @@ impl StoreIndexReader {
     fn read_block(&self, offset: u64) -> Result<BTreeSet<DocId>> {
         let count_bytes = self.store.get_range(&self.store_postings_name, offset, 4)?;
         let count = u32::from_le_bytes(count_bytes.as_slice().try_into()?);
-        if count == 0 {
-            return Ok(BTreeSet::new());
-        }
-        let bytes_len = u64::from(count)
+        let ids_len = u64::from(count)
             .checked_mul(4)
             .context("postings block byte length overflow")?;
-        let ids_offset = offset
-            .checked_add(4)
-            .context("postings ids offset overflow")?;
-        let ids_bytes = self
+        let block_len = 4u64
+            .checked_add(ids_len)
+            .context("postings block byte length overflow")?;
+        let block = self
             .store
-            .get_range(&self.store_postings_name, ids_offset, bytes_len)?;
-        let mut set = BTreeSet::new();
-        for chunk in ids_bytes.chunks_exact(4) {
-            set.insert(u32::from_le_bytes(chunk.try_into()?));
-        }
-        Ok(set)
+            .get_range(&self.store_postings_name, offset, block_len)?;
+        decode_postings_block(&block, 0)
     }
-
     pub fn stats(&self) -> IndexStats {
         IndexStats {
             distinct_grams: self.map.len() as u64,
