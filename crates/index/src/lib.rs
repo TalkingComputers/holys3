@@ -2,7 +2,7 @@
 //! Index construction and local or store-backed index readers.
 
 use anyhow::{Context, Result};
-use holys3_core::{grams_index, hash_ngram, BlobStore, Corpus, DocId, Strategy};
+use holys3_core::{grams_index, hash_ngram, matches_in, BlobStore, Corpus, DocId, Match, Strategy};
 use holys3_query::Query;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -432,34 +432,46 @@ pub fn search_with_stats(
     corpus: &dyn Corpus,
     pattern: &str,
 ) -> Result<SearchStats> {
-    let re = regex::bytes::Regex::new(pattern)?;
-    search_with_regex_stats(reader, corpus, pattern, &re)
+    let (matches, stats) = search_matches(reader, corpus, pattern)?;
+    Ok(SearchStats {
+        hits: matches.iter().map(|matched| matched.doc).collect(),
+        candidates: stats.candidates,
+        total_docs: stats.total_docs,
+        bytes_fetched: stats.bytes_fetched,
+    })
 }
 
-pub fn search_with_regex_stats(
+pub fn search_matches(
     reader: &dyn IndexReader,
     corpus: &dyn Corpus,
     pattern: &str,
-    re: &regex::bytes::Regex,
-) -> Result<SearchStats> {
+) -> Result<(Vec<Match>, SearchStats)> {
     let q = holys3_query::plan(pattern, reader.strategy())?;
     let ids = reader.candidates(&q)?.into_iter().collect::<Vec<_>>();
-    let mut hits = BTreeSet::new();
-    let mut bytes_fetched = 0usize;
-    for (id, bytes) in corpus.fetch_many(&ids)? {
-        bytes_fetched = bytes_fetched
+    let docs = corpus.fetch_many(&ids)?;
+    let bytes_fetched = docs.iter().try_fold(0usize, |total, (_, bytes)| {
+        total
             .checked_add(bytes.len())
-            .context("bytes fetched overflow")?;
-        if re.is_match(&bytes) {
-            hits.insert(id);
-        }
-    }
-    Ok(SearchStats {
-        hits,
-        candidates: ids.len(),
-        total_docs: reader.docs().len(),
-        bytes_fetched,
-    })
+            .context("bytes fetched overflow")
+    })?;
+    let re = regex::bytes::Regex::new(pattern)?;
+    let mut matches = docs
+        .into_par_iter()
+        .flat_map(|(id, bytes)| matches_in(id, &bytes, &re))
+        .collect::<Vec<_>>();
+    matches.sort_by(|a, b| {
+        (a.doc, a.line, a.col, a.text.as_str()).cmp(&(b.doc, b.line, b.col, b.text.as_str()))
+    });
+    let hits = matches.iter().map(|matched| matched.doc).collect();
+    Ok((
+        matches,
+        SearchStats {
+            hits,
+            candidates: ids.len(),
+            total_docs: reader.docs().len(),
+            bytes_fetched,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -508,15 +520,26 @@ mod tests {
     }
 
     #[test]
-    fn search_with_regex_stats_reuses_compiled_pattern() {
+    fn search_matches_returns_verified_matches_and_stats() {
         let c = MemCorpus::new(
             vec![(0, "x".into()), (1, "y".into())],
             vec![b"abc world".to_vec(), b"nomatch".to_vec()],
         );
         let (_d, r) = build_tmp(&c, Strategy::Trigram);
-        let re = regex::bytes::Regex::new("world").unwrap();
-        let stats = search_with_regex_stats(&r, &c, "world", &re).unwrap();
+        let (matches, stats) = search_matches(&r, &c, "world").unwrap();
+        assert_eq!(
+            matches,
+            vec![Match {
+                doc: 0,
+                line: 1,
+                col: 5,
+                text: "abc world".into(),
+            }]
+        );
         assert_eq!(stats.hits, BTreeSet::from([0]));
+        assert_eq!(stats.candidates, 1);
+        assert_eq!(stats.total_docs, 2);
+        assert_eq!(stats.bytes_fetched, b"abc world".len());
     }
 
     #[test]
