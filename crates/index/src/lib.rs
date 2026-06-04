@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use holys3_core::{grams_index, hash_ngram, BlobStore, Corpus, DocId, Strategy};
 use holys3_query::Query;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -77,9 +78,14 @@ fn build_index_bytes(
     strategy: Strategy,
 ) -> Result<(Vec<u8>, Vec<u8>, Manifest)> {
     let mut postings: BTreeMap<Vec<u8>, Vec<DocId>> = BTreeMap::new();
-    for &(id, _) in corpus.docs() {
-        let bytes = corpus.fetch(id)?;
-        for gram in grams_index(&bytes, strategy) {
+    let ids = corpus.docs().iter().map(|&(id, _)| id).collect::<Vec<_>>();
+    let docs = corpus
+        .fetch_many(&ids)?
+        .into_par_iter()
+        .map(|(id, bytes)| Ok((id, grams_index(&bytes?, strategy))))
+        .collect::<Result<Vec<_>>>()?;
+    for (id, grams) in docs {
+        for gram in grams {
             postings.entry(gram).or_default().push(id);
         }
     }
@@ -436,13 +442,15 @@ pub fn search(
 ) -> Result<BTreeSet<DocId>> {
     let q = holys3_query::plan(pattern, reader.strategy())?;
     let re = regex::bytes::Regex::new(pattern)?;
-    let mut hits = BTreeSet::new();
-    for id in reader.candidates(&q)? {
-        if re.is_match(&corpus.fetch(id)?) {
-            hits.insert(id);
-        }
-    }
-    Ok(hits)
+    let ids = reader.candidates(&q)?.into_iter().collect::<Vec<_>>();
+    Ok(corpus
+        .fetch_many(&ids)?
+        .par_iter()
+        .filter_map(|(id, bytes)| match bytes {
+            Ok(bytes) if re.is_match(bytes) => Some(*id),
+            _ => None,
+        })
+        .collect())
 }
 
 #[cfg(test)]
