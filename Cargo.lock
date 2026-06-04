@@ -695,7 +695,6 @@ dependencies = [
  "holys3-query",
  "holys3-s3",
  "holys3-sigv4",
- "regex",
  "tempfile",
  "tokio",
 ]
@@ -751,7 +750,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "holys3-core",
- "regex",
  "regex-syntax",
 ]
 

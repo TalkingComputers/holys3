@@ -16,7 +16,6 @@ publish = false
 [dependencies]
 holys3-core = { path = "../core" }
 anyhow.workspace = true
-regex.workspace = true
 regex-syntax.workspace = true
 
 [lints]
