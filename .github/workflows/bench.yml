@@ -71,7 +71,7 @@ jobs:
           if failed:
               sys.exit(1)
           PY
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: bench-micro
@@ -113,7 +113,7 @@ jobs:
           cargo run --locked -p holys3-bench -- upload --target s3
           cargo run --locked -p holys3-bench -- run --scenarios crates/xbench/scenarios/queries.toml --iterations 3 --warmup 1 --concurrency 64
           cargo run --locked -p holys3-bench -- render --input crates/xbench/runs/latest.json > bench-e2e.md
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: bench-e2e
