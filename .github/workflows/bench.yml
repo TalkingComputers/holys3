@@ -29,7 +29,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run Criterion benches
-        run: cargo bench --locked -p holys3-index -- --save-baseline pr
+        run: cargo bench --locked -p holys3-index --bench hot_paths -- --save-baseline pr
       - name: Collect Criterion medians
         run: |
           python3 <<'PY'
@@ -93,12 +93,14 @@ jobs:
             -e MINIO_ROOT_PASSWORD=minioadmin \
             quay.io/minio/minio server /data --address :9000
       - name: Create bucket
+        env:
+          MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
           for i in $(seq 1 60); do
-            docker run --rm --network host quay.io/minio/mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && break
+            docker run --rm --network host -e MC_HOST_local quay.io/minio/mc ready local && break
             sleep 1
           done
-          docker run --rm --network host quay.io/minio/mc mb --ignore-existing local/holys3-bench
+          docker run --rm --network host -e MC_HOST_local quay.io/minio/mc mb --ignore-existing local/holys3-bench
       - name: Build xbench
         run: cargo build --locked -p holys3-bench
       - name: Run xbench
@@ -154,7 +156,6 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs:
       - micro
-      - e2e
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
