@@ -113,24 +113,28 @@ The index narrows candidates. The verifier decides matches.
 
 ## Benchmarks
 
+**Real-world S3** — end-to-end search latency over 200 synthetic 4 KiB objects, indexed search (concurrency 64) vs a sequential (`--concurrency 1`) baseline. Two effects compound: the trigram index **prunes** the candidate set, and concurrent ranged fetch **fans out** the survivors.
+
+| scenario      | pattern                     | hits | candidates/total | p50 ms | seq p50 ms |               speedup |
+| ------------- | --------------------------- | ---: | ---------------: | -----: | ---------: | --------------------: |
+| no_match      | `UNMATCHABLE_TOKEN`         |    0 |            0/200 |    0.0 |        0.0 | index fetches nothing |
+| QAll          | `.*`                        |  200 |          200/200 |    328 |      14290 |                 43.5x |
+| short_literal | `needle`                    |  100 |          100/200 |    814 |       7593 |                  9.3x |
+| alternation   | `alpha\|beta`               |   63 |           63/200 |   1045 |       5371 |                  5.1x |
+| long_literal  | `longliteralbenchmarktoken` |   67 |           67/200 |   3537 |       7927 |                  2.2x |
+| anchored      | `^ANCHOR_START`             |   19 |           19/200 |   1710 |       3008 |                  1.8x |
+
+A non-matching query fetches **zero** objects; `.*` over all 200 is **43.5x** faster than sequential. Caveat: laptop → `us-east-2` over the public internet (per-object RTT dominates; in-region EC2 is far lower), fixed seed 42, 5 iterations; `long_literal`'s 3.5 s is real-network tail variance. Reproduce against your bucket with `make bench-s3`.
+
+**Continuous (CI)** — the table below is regenerated on every push to `main` against a local MinIO (deterministic, reproducible with `make bench-minio`); it tracks regressions rather than headline latency.
+
 <!-- BENCH:START -->
 
-End-to-end search latency over 200 synthetic 4 KiB objects (800 KiB total), indexed search at concurrency 64 vs a sequential (`--concurrency 1`) baseline:
-
-| scenario      | pattern                     | hits | candidates/total | p50 ms | p95 ms | seq p50 ms |               speedup |
-| ------------- | --------------------------- | ---: | ---------------: | -----: | -----: | ---------: | --------------------: |
-| no_match      | `UNMATCHABLE_TOKEN`         |    0 |            0/200 |    0.0 |    0.0 |        0.0 | index fetches nothing |
-| QAll          | `.*`                        |  200 |          200/200 |    328 |    329 |      14290 |                 43.5x |
-| short_literal | `needle`                    |  100 |          100/200 |    814 |    904 |       7593 |                  9.3x |
-| alternation   | `alpha\|beta`               |   63 |           63/200 |   1045 |   1856 |       5371 |                  5.1x |
-| long_literal  | `longliteralbenchmarktoken` |   67 |           67/200 |   3537 |   4004 |       7927 |                  2.2x |
-| anchored      | `^ANCHOR_START`             |   19 |           19/200 |   1710 |   1912 |       3008 |                  1.8x |
-
-Two effects compound: the trigram index **prunes** the candidate set (a non-matching query fetches **zero** objects), and concurrent ranged fetch **fans out** the survivors (`.*` over all 200 objects is 43.5x faster than sequential).
+_pending first CI run_
 
 <!-- BENCH:END -->
 
-Methodology: numbers above are from a laptop to `us-east-2` over the public internet (per-object round-trip dominates; in-region EC2 is far lower), 200x4 KiB synthetic objects, fixed seed 42, 5 iterations + 2 warmup; `long_literal`'s 3.5 s reflects real-network tail variance at low iteration counts. One machine, one region; full run JSON in `crates/xbench/runs/*.json`. Reproduce with `make bench-s3` (your bucket) or `make bench-minio` (local, deterministic). Microbenchmarks (`make bench-micro`): trigram extraction ~330 us, query plan ~0.7 us, postings decode ~44 ns.
+Microbenchmarks (`make bench-micro`): trigram extraction ~330 us, query plan ~0.7 us, postings decode ~44 ns.
 
 ## Security
 

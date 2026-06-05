@@ -166,7 +166,7 @@ jobs:
           merge-multiple: true
       - name: Update benchmark files
         run: |
-          cp artifacts/current.json benches/baseline.json
+          cp artifacts/benches/current.json benches/baseline.json
           python3 <<'PY'
           from pathlib import Path
 
