@@ -129,9 +129,14 @@ A non-matching query fetches **zero** objects; `.*` over all 200 is **43.5x** fa
 **Continuous (CI)** — the table below is regenerated on every push to `main` against a local MinIO (deterministic, reproducible with `make bench-minio`); it tracks regressions rather than headline latency.
 
 <!-- BENCH:START -->
-
-_pending first CI run_
-
+| scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| short_literal | 50 | 50/100 | 0.500 | 204800 | 94.271 | 101.921 | 101.921 | 114.453 |
+| long_literal | 34 | 34/100 | 0.340 | 139264 | 169.128 | 217.941 | 217.941 | 118.928 |
+| alternation | 32 | 32/100 | 0.320 | 131072 | 47.736 | 81.011 | 81.011 | 60.257 |
+| anchored | 10 | 10/100 | 0.100 | 40960 | 42.291 | 72.336 | 72.336 | 45.838 |
+| no_match | 0 | 0/100 | 0.000 | 0 | 0.118 | 0.147 | 0.147 | 0.112 |
+| QAll | 100 | 100/100 | 1.000 | 409600 | 225.545 | 228.359 | 228.359 | 271.297 |
 <!-- BENCH:END -->
 
 Microbenchmarks (`make bench-micro`): trigram extraction ~330 us, query plan ~0.7 us, postings decode ~44 ns.
