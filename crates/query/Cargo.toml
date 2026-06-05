@@ -14,7 +14,7 @@ categories.workspace = true
 publish = false
 
 [dependencies]
-holys3-core = { path = "../core" }
+holys3-core = { path = "../core", version = "0.1.0" }
 anyhow.workspace = true
 regex-syntax.workspace = true
 

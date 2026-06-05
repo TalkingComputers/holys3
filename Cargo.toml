@@ -5,7 +5,7 @@ members = ["crates/core", "crates/query", "crates/index", "crates/sigv4", "crate
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-rust-version = "1.86"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Indexed regex search for local files and private S3 buckets"
 repository = "https://github.com/holys3/holys3"

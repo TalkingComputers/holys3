@@ -7,7 +7,7 @@ Indexed regex search for local files and private S3 buckets.
 [![CI](https://github.com/holys3/holys3/actions/workflows/ci.yml/badge.svg)](https://github.com/holys3/holys3/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/holys3.svg)](https://crates.io/crates/holys3)
 [![docs.rs](https://docs.rs/holys3/badge.svg)](https://docs.rs/holys3)
-[![MSRV](https://img.shields.io/badge/MSRV-1.86-blue.svg)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
 [![downloads](https://img.shields.io/crates/d/holys3.svg)](https://crates.io/crates/holys3)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 

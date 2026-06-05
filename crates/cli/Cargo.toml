@@ -18,11 +18,11 @@ name = "holys3"
 path = "src/main.rs"
 
 [dependencies]
-holys3-core = { path = "../core" }
-holys3-query = { path = "../query" }
-holys3-index = { path = "../index" }
-holys3-s3 = { path = "../s3" }
-holys3-sigv4 = { path = "../sigv4" }
+holys3-core = { path = "../core", version = "0.1.0" }
+holys3-query = { path = "../query", version = "0.1.0" }
+holys3-index = { path = "../index", version = "0.1.0" }
+holys3-s3 = { path = "../s3", version = "0.1.0" }
+holys3-sigv4 = { path = "../sigv4", version = "0.1.0" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

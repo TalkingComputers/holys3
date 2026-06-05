@@ -14,8 +14,8 @@ categories.workspace = true
 publish = false
 
 [dependencies]
-holys3-core = { path = "../core" }
-holys3-sigv4 = { path = "../sigv4" }
+holys3-core = { path = "../core", version = "0.1.0" }
+holys3-sigv4 = { path = "../sigv4", version = "0.1.0" }
 anyhow.workspace = true
 futures = "0.3.32"
 rand = "0.10.1"
