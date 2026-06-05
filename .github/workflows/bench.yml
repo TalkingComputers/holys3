@@ -145,7 +145,7 @@ jobs:
             echo '### e2e S3'
             if [ -f artifacts/bench-e2e.md ]; then cat artifacts/bench-e2e.md; else echo 'e2e did not produce a table'; fi
           } > bench-comment.md
-      - uses: marocchino/sticky-pull-request-comment@v2
+      - uses: marocchino/sticky-pull-request-comment@v3
         with:
           header: holys3-benchmarks
           path: bench-comment.md
