@@ -38,6 +38,7 @@ allow = [
     "CC0-1.0",
     "Unlicense",
     "OpenSSL",
+    "CDLA-Permissive-2.0",
 ]
 exceptions = []
 
@@ -46,6 +47,7 @@ exceptions = []
 # block CI. Tighten to "deny" + curated skips once the tree is stable.
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 deny = []
 skip = []
 skip-tree = []
