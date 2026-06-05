@@ -179,7 +179,7 @@ jobs:
           _, after = rest.split(end, 1)
           readme.write_text(before + start + "\n" + table + end + after)
           PY
-      - uses: stefanzweifel/git-auto-commit-action@v5
+      - uses: stefanzweifel/git-auto-commit-action@v7
         with:
           commit_message: Update benchmark results [skip ci]
           file_pattern: README.md benches/baseline.json
