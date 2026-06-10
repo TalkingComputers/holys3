@@ -17,7 +17,10 @@ publish = false
 anyhow.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+sha1 = "0.10.6"
 hex.workspace = true
+serde_json.workspace = true
+time = { version = "0.3", features = ["parsing"] }
 
 [lints]
 workspace = true

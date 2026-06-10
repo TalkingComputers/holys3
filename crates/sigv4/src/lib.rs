@@ -220,22 +220,155 @@ pub fn from_credentials_file(body: &str, profile: &str) -> Option<Credentials> {
     })
 }
 
-/// Resolve credentials: env vars first, then `$AWS_PROFILE` (default "default")
-/// in ~/.aws/credentials.
-pub fn resolve() -> anyhow::Result<Credentials> {
-    if let Some(creds) = from_env() {
-        return Ok(creds);
+/// The active profile name: `$AWS_PROFILE` or "default".
+pub fn profile_name() -> anyhow::Result<String> {
+    match std::env::var("AWS_PROFILE") {
+        Ok(profile) => Ok(profile),
+        Err(std::env::VarError::NotPresent) => Ok("default".to_owned()),
+        Err(err) => Err(err.into()),
     }
-    let profile = match std::env::var("AWS_PROFILE") {
-        Ok(profile) => profile,
-        Err(std::env::VarError::NotPresent) => "default".to_owned(),
-        Err(err) => return Err(err.into()),
+}
+
+fn aws_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(std::env::var("HOME")?).join(".aws"))
+}
+
+/// Static credentials: env vars first, then the active profile in
+/// ~/.aws/credentials. `None` when neither has keys (the SSO chain in
+/// holys3-s3 takes over from there).
+pub fn resolve_static() -> anyhow::Result<Option<Credentials>> {
+    if let Some(creds) = from_env() {
+        return Ok(Some(creds));
+    }
+    let path = aws_dir()?.join("credentials");
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Ok(None);
     };
-    let path = std::path::PathBuf::from(std::env::var("HOME")?).join(".aws/credentials");
-    let body = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("no env creds and cannot read {}: {e}", path.display()))?;
-    from_credentials_file(&body, &profile)
-        .ok_or_else(|| anyhow::anyhow!("profile `{profile}` not found in {}", path.display()))
+    Ok(from_credentials_file(&body, &profile_name()?))
+}
+
+/// SSO settings for one profile in ~/.aws/config (modern `sso-session`
+/// style or legacy inline `sso_start_url`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsoProfile {
+    pub profile: String,
+    pub account_id: String,
+    pub role_name: String,
+    pub start_url: String,
+    pub sso_region: String,
+    pub session_name: Option<String>,
+}
+
+fn config_section<'a>(
+    body: &'a str,
+    header: String,
+) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+    let mut in_section = false;
+    body.lines().filter_map(move |line| {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line[1..line.len() - 1].trim() == header;
+            return None;
+        }
+        if !in_section {
+            return None;
+        }
+        line.split_once('=')
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .filter(|(k, _)| !k.is_empty())
+    })
+}
+
+/// Parse the SSO settings for `profile` out of a ~/.aws/config body.
+/// `None` when the profile has no SSO configuration.
+pub fn sso_profile_from_config(body: &str, profile: &str) -> Option<SsoProfile> {
+    let header = if profile == "default" {
+        "default".to_owned()
+    } else {
+        format!("profile {profile}")
+    };
+    let mut account_id = None;
+    let mut role_name = None;
+    let mut start_url = None;
+    let mut sso_region = None;
+    let mut session_name = None;
+    for (key, value) in config_section(body, header) {
+        match key {
+            "sso_account_id" => account_id = Some(value.to_owned()),
+            "sso_role_name" => role_name = Some(value.to_owned()),
+            "sso_start_url" => start_url = Some(value.to_owned()),
+            "sso_region" => sso_region = Some(value.to_owned()),
+            "sso_session" => session_name = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    if let Some(session) = &session_name {
+        let session_header = format!("sso-session {session}");
+        for (key, value) in config_section(body, session_header) {
+            match key {
+                "sso_start_url" => start_url = Some(value.to_owned()),
+                "sso_region" => sso_region = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+    }
+    Some(SsoProfile {
+        profile: profile.to_owned(),
+        account_id: account_id?,
+        role_name: role_name?,
+        start_url: start_url?,
+        sso_region: sso_region?,
+        session_name,
+    })
+}
+
+/// SSO settings for the active profile, from ~/.aws/config on disk.
+pub fn sso_profile() -> anyhow::Result<Option<SsoProfile>> {
+    let path = aws_dir()?.join("config");
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    Ok(sso_profile_from_config(&body, &profile_name()?))
+}
+
+/// The cache filename hash input is the session name when present, else the
+/// start URL (matches botocore's `SSOTokenLoader`).
+pub fn sso_token_cache_key(profile: &SsoProfile) -> String {
+    let input = profile
+        .session_name
+        .as_deref()
+        .unwrap_or(&profile.start_url);
+    hex::encode(<sha1::Sha1 as Digest>::digest(input.as_bytes()))
+}
+
+/// Read the cached SSO access token for `profile`; errors actionably when
+/// missing or expired.
+pub fn read_sso_token(profile: &SsoProfile) -> anyhow::Result<String> {
+    let path = aws_dir()?
+        .join("sso/cache")
+        .join(format!("{}.json", sso_token_cache_key(profile)));
+    let login_hint = format!("run `aws sso login --profile {}`", profile.profile);
+    let body = std::fs::read_to_string(&path).map_err(|_| {
+        anyhow::anyhow!(
+            "no cached SSO token for profile `{}`; {login_hint}",
+            profile.profile
+        )
+    })?;
+    let token: serde_json::Value = serde_json::from_str(&body)?;
+    let expires_at = token["expiresAt"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("SSO token cache {} has no expiresAt", path.display()))?;
+    let expires_at =
+        time::OffsetDateTime::parse(expires_at, &time::format_description::well_known::Rfc3339)?;
+    anyhow::ensure!(
+        expires_at > time::OffsetDateTime::now_utc(),
+        "SSO token for profile `{}` expired; {login_hint}",
+        profile.profile
+    );
+    token["accessToken"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("SSO token cache {} has no accessToken", path.display()))
 }
 
 #[cfg(test)]
@@ -344,5 +477,43 @@ mod cred_tests {
         let p = from_credentials_file(body, "prod").unwrap();
         assert_eq!(p.access_key, "AK2");
         assert_eq!(p.session_token.as_deref(), Some("TOK2"));
+    }
+
+    #[test]
+    fn parse_sso_session_style_config() {
+        let body = "[profile speedtrain]\nsso_session = speedtrain\nsso_account_id = 381235349110\nsso_role_name = AdministratorAccess\nregion = us-east-2\n\n[sso-session speedtrain]\nsso_start_url = https://speedtrain.awsapps.com/start\nsso_region = us-west-2\n";
+        let p = sso_profile_from_config(body, "speedtrain").unwrap();
+        assert_eq!(p.account_id, "381235349110");
+        assert_eq!(p.role_name, "AdministratorAccess");
+        assert_eq!(p.start_url, "https://speedtrain.awsapps.com/start");
+        assert_eq!(p.sso_region, "us-west-2");
+        assert_eq!(p.session_name.as_deref(), Some("speedtrain"));
+        // The cache file is keyed by the session name, per botocore.
+        assert_eq!(
+            sso_token_cache_key(&p),
+            "fd66acda1ac8273e084bf508925ad8f1d566ec92"
+        );
+    }
+
+    #[test]
+    fn parse_legacy_inline_sso_config() {
+        let body = "[profile old]\nsso_start_url = https://corp.awsapps.com/start\nsso_region = eu-west-1\nsso_account_id = 1\nsso_role_name = ReadOnly\n";
+        let p = sso_profile_from_config(body, "old").unwrap();
+        assert_eq!(p.start_url, "https://corp.awsapps.com/start");
+        assert!(p.session_name.is_none());
+        // Legacy style keys the cache by the start URL.
+        assert_eq!(
+            sso_token_cache_key(&p),
+            hex::encode(<sha1::Sha1 as Digest>::digest(
+                b"https://corp.awsapps.com/start"
+            ))
+        );
+    }
+
+    #[test]
+    fn non_sso_profile_yields_none() {
+        let body = "[profile plain]\nregion = us-east-1\n";
+        assert!(sso_profile_from_config(body, "plain").is_none());
+        assert!(sso_profile_from_config(body, "missing").is_none());
     }
 }

@@ -2,8 +2,8 @@ use holys3_core::{Corpus, DocId, Strategy};
 use holys3_index::{
     build_to_store, compute_build_id, search_collect, IndexReader, StoreIndexReader,
 };
+use holys3_s3::resolve_credentials;
 use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus};
-use holys3_sigv4::resolve;
 
 #[test]
 fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
@@ -15,7 +15,7 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
         }
     };
     let region = std::env::var("AWS_REGION")?;
-    let creds = resolve()?;
+    let creds = resolve_credentials()?;
     let client = S3Client::new(region, creds, None, FetchConfig::default())?;
     let objects = client
         .list(&bucket, "")?

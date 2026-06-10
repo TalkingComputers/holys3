@@ -1,5 +1,5 @@
+use holys3_s3::resolve_credentials;
 use holys3_s3::{FetchConfig, S3Client};
-use holys3_sigv4::resolve;
 
 #[test]
 fn list_and_get_roundtrip() {
@@ -8,7 +8,7 @@ fn list_and_get_roundtrip() {
         return;
     };
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
-    let creds = resolve().unwrap();
+    let creds = resolve_credentials().unwrap();
     let client = S3Client::new(region, creds, None, FetchConfig::default()).unwrap();
     let objs = client.list(&bucket, "").unwrap();
     assert!(!objs.is_empty(), "bucket should have at least one object");
