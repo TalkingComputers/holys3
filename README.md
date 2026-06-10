@@ -47,18 +47,20 @@ holys3 search 'TODO|FIXME' --local-dir ./fixtures --index holys3.idxdir --stats
 holys3 stats --index holys3.idxdir
 ```
 
-S3 bucket:
+S3 bucket (with an `aws sso login` session — holys3 reads SSO profiles directly):
+
+```sh
+AWS_PROFILE=my-sso-profile holys3 index --bucket my-log-bucket --region us-east-2 --strategy trigram
+AWS_PROFILE=my-sso-profile holys3 search 'TODO|FIXME' --bucket my-log-bucket --region us-east-2 --stats
+```
+
+or with static credentials:
 
 ```sh
 AWS_ACCESS_KEY_ID=<access-key> \
 AWS_SECRET_ACCESS_KEY=<secret-key> \
 AWS_SESSION_TOKEN=<session-token> \
-holys3 index --bucket holys3-test-381235349110-ue2 --region us-east-2 --strategy trigram
-
-AWS_ACCESS_KEY_ID=<access-key> \
-AWS_SECRET_ACCESS_KEY=<secret-key> \
-AWS_SESSION_TOKEN=<session-token> \
-holys3 search 'TODO|FIXME' --bucket holys3-test-381235349110-ue2 --region us-east-2 --stats
+holys3 search 'TODO|FIXME' --bucket my-log-bucket --region us-east-2 --stats
 ```
 
 ## Usage
@@ -114,7 +116,7 @@ Prints local index statistics:
 
 1. The query planner extracts grams from the regex literal set.
 2. The term dictionary (an fst) maps each gram to its postings offset _and_ doc count, so selectivity is known before any postings fetch: absent grams answer instantly, and only the rarest grams per AND group are fetched at all.
-3. For S3 indexes, holys3 fetches every needed postings block concurrently — one ranged GET each — from `.holys3/`. Candidates are then pruned by any `--key-prefix`/`--key-regex`/`--since`/`--until` scope before a single object is fetched.
+3. For S3 indexes, holys3 fetches every needed postings block concurrently from `.holys3/`, coalescing nearby blocks into single ranged GETs. Candidates are then pruned by any `--key-prefix`/`--key-regex`/`--since`/`--until` scope before a single object is fetched.
 4. Candidate objects are fetched concurrently with adaptive (AIMD) concurrency, retries, and request hedging; bodies are decompressed (multi-member gzip, zstd) and verified on a worker pool as fetches complete, with results streamed per object; deleted objects are skipped as stale.
 5. The regex verifier runs against original bytes and produces the final answer.
 
@@ -138,22 +140,24 @@ A non-matching query fetches **zero** objects; `.*` over all 200 is **43.5x** fa
 **Continuous (CI)** — the table below is regenerated on every push to `main` against a local MinIO (deterministic, reproducible with `make bench-minio`); it tracks regressions rather than headline latency.
 
 <!-- BENCH:START -->
-| scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| short_literal | 50 | 50/100 | 0.500 | 204800 | 51.751 | 51.779 | 51.779 | 73.587 |
-| long_literal | 34 | 34/100 | 0.340 | 139264 | 59.773 | 62.864 | 62.864 | 56.563 |
-| alternation | 32 | 32/100 | 0.320 | 131072 | 38.863 | 40.254 | 40.254 | 54.132 |
-| anchored | 10 | 10/100 | 0.100 | 40960 | 28.099 | 37.262 | 37.262 | 24.584 |
-| no_match | 0 | 0/100 | 0.000 | 0 | 0.109 | 0.118 | 0.118 | 0.116 |
-| QAll | 100 | 100/100 | 1.000 | 409600 | 141.103 | 143.568 | 143.568 | 160.666 |
-| dot_star_gap | 10 | 10/100 | 0.100 | 40960 | 23.448 | 23.477 | 23.477 | 34.128 |
+
+| scenario      | hits | candidates/total | prune ratio |  bytes |  p50 ms |  p95 ms |  p99 ms | concurrency=1 p50 ms |
+| ------------- | ---: | ---------------: | ----------: | -----: | ------: | ------: | ------: | -------------------: |
+| short_literal |   50 |           50/100 |       0.500 | 204800 |  51.751 |  51.779 |  51.779 |               73.587 |
+| long_literal  |   34 |           34/100 |       0.340 | 139264 |  59.773 |  62.864 |  62.864 |               56.563 |
+| alternation   |   32 |           32/100 |       0.320 | 131072 |  38.863 |  40.254 |  40.254 |               54.132 |
+| anchored      |   10 |           10/100 |       0.100 |  40960 |  28.099 |  37.262 |  37.262 |               24.584 |
+| no_match      |    0 |            0/100 |       0.000 |      0 |   0.109 |   0.118 |   0.118 |                0.116 |
+| QAll          |  100 |          100/100 |       1.000 | 409600 | 141.103 | 143.568 | 143.568 |              160.666 |
+| dot_star_gap  |   10 |           10/100 |       0.100 |  40960 |  23.448 |  23.477 |  23.477 |               34.128 |
+
 <!-- BENCH:END -->
 
 Microbenchmarks (`make bench-micro`): trigram extraction ~330 us, query plan ~0.7 us, postings decode ~44 ns.
 
 ## Security
 
-holys3 signs S3 requests with its own SigV4 implementation and tests it against AWS signature vectors. It reads credentials from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, or an AWS credentials profile.
+holys3 signs S3 requests with its own SigV4 implementation and tests it against AWS signature vectors. Credentials resolve in order: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (with optional `AWS_SESSION_TOKEN`) from the environment, then the `AWS_PROFILE` config profile — including AWS IAM Identity Center (SSO) profiles, whose cached `aws sso login` tokens are exchanged for role credentials and refreshed automatically before expiry — then static profile keys.
 
 Use private buckets. The index lives in the same account and bucket namespace as the data and is stored under `.holys3/`. holys3 does not send the index to an external service.
 
