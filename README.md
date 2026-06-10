@@ -138,16 +138,14 @@ A non-matching query fetches **zero** objects; `.*` over all 200 is **43.5x** fa
 **Continuous (CI)** — the table below is regenerated on every push to `main` against a local MinIO (deterministic, reproducible with `make bench-minio`); it tracks regressions rather than headline latency.
 
 <!-- BENCH:START -->
-
-| scenario      | hits | candidates/total | prune ratio |  bytes |  p50 ms |  p95 ms |  p99 ms | concurrency=1 p50 ms |
-| ------------- | ---: | ---------------: | ----------: | -----: | ------: | ------: | ------: | -------------------: |
-| short_literal |   50 |           50/100 |       0.500 | 204800 |  94.271 | 101.921 | 101.921 |              114.453 |
-| long_literal  |   34 |           34/100 |       0.340 | 139264 | 169.128 | 217.941 | 217.941 |              118.928 |
-| alternation   |   32 |           32/100 |       0.320 | 131072 |  47.736 |  81.011 |  81.011 |               60.257 |
-| anchored      |   10 |           10/100 |       0.100 |  40960 |  42.291 |  72.336 |  72.336 |               45.838 |
-| no_match      |    0 |            0/100 |       0.000 |      0 |   0.118 |   0.147 |   0.147 |                0.112 |
-| QAll          |  100 |          100/100 |       1.000 | 409600 | 225.545 | 228.359 | 228.359 |              271.297 |
-
+| scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| short_literal | 50 | 50/100 | 0.500 | 204800 | 52.536 | 74.999 | 74.999 | 73.297 |
+| long_literal | 34 | 34/100 | 0.340 | 139264 | 56.819 | 59.370 | 59.370 | 55.555 |
+| alternation | 32 | 32/100 | 0.320 | 131072 | 39.618 | 40.968 | 40.968 | 54.298 |
+| anchored | 10 | 10/100 | 0.100 | 40960 | 19.570 | 20.051 | 20.051 | 23.197 |
+| no_match | 0 | 0/100 | 0.000 | 0 | 0.107 | 0.125 | 0.125 | 0.102 |
+| QAll | 100 | 100/100 | 1.000 | 409600 | 139.750 | 144.027 | 144.027 | 156.315 |
 <!-- BENCH:END -->
 
 Microbenchmarks (`make bench-micro`): trigram extraction ~330 us, query plan ~0.7 us, postings decode ~44 ns.
