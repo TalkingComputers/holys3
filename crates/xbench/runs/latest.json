@@ -22,10 +22,10 @@
       "total_docs": 1000,
       "prune_ratio": 0.5,
       "bytes_fetched": 8192000,
-      "p50_ms": 15.250708,
-      "p95_ms": 212.19954099999998,
-      "p99_ms": 212.19954099999998,
-      "sequential_p50_ms": 100.984833
+      "p50_ms": 13.092042,
+      "p95_ms": 221.738792,
+      "p99_ms": 221.738792,
+      "sequential_p50_ms": 97.773584
     },
     {
       "name": "long_literal",
@@ -36,10 +36,10 @@
       "total_docs": 1000,
       "prune_ratio": 0.334,
       "bytes_fetched": 5472256,
-      "p50_ms": 16.4885,
-      "p95_ms": 221.033708,
-      "p99_ms": 221.033708,
-      "sequential_p50_ms": 69.127167
+      "p50_ms": 10.313584,
+      "p95_ms": 213.08545800000002,
+      "p99_ms": 213.08545800000002,
+      "sequential_p50_ms": 66.25512499999999
     },
     {
       "name": "alternation",
@@ -50,10 +50,10 @@
       "total_docs": 1000,
       "prune_ratio": 0.314,
       "bytes_fetched": 5144576,
-      "p50_ms": 206.110959,
-      "p95_ms": 226.528875,
-      "p99_ms": 226.528875,
-      "sequential_p50_ms": 63.746042
+      "p50_ms": 12.486958,
+      "p95_ms": 227.010458,
+      "p99_ms": 227.010458,
+      "sequential_p50_ms": 62.183125
     },
     {
       "name": "anchored",
@@ -64,10 +64,10 @@
       "total_docs": 1000,
       "prune_ratio": 0.091,
       "bytes_fetched": 1490944,
-      "p50_ms": 3.9922919999999995,
-      "p95_ms": 7.209084,
-      "p99_ms": 7.209084,
-      "sequential_p50_ms": 19.372500000000002
+      "p50_ms": 3.863792,
+      "p95_ms": 8.537958999999999,
+      "p99_ms": 8.537958999999999,
+      "sequential_p50_ms": 18.760625
     },
     {
       "name": "no_match",
@@ -78,10 +78,10 @@
       "total_docs": 1000,
       "prune_ratio": 0.0,
       "bytes_fetched": 0,
-      "p50_ms": 0.004625,
-      "p95_ms": 0.010792,
-      "p99_ms": 0.010792,
-      "sequential_p50_ms": 0.004625
+      "p50_ms": 0.003458,
+      "p95_ms": 0.003792,
+      "p99_ms": 0.003792,
+      "sequential_p50_ms": 0.002791
     },
     {
       "name": "QAll",
@@ -92,10 +92,24 @@
       "total_docs": 1000,
       "prune_ratio": 1.0,
       "bytes_fetched": 16384000,
-      "p50_ms": 63.258833,
-      "p95_ms": 253.61529199999998,
-      "p99_ms": 253.61529199999998,
-      "sequential_p50_ms": 202.678166
+      "p50_ms": 252.23995900000003,
+      "p95_ms": 286.032042,
+      "p99_ms": 286.032042,
+      "sequential_p50_ms": 196.146375
+    },
+    {
+      "name": "dot_star_gap",
+      "pattern": "(?s)needle.*alpha",
+      "expected_hits": 100,
+      "hits": 100,
+      "candidates": 100,
+      "total_docs": 1000,
+      "prune_ratio": 0.1,
+      "bytes_fetched": 1638400,
+      "p50_ms": 4.033708000000001,
+      "p95_ms": 10.538334,
+      "p99_ms": 10.538334,
+      "sequential_p50_ms": 21.019790999999998
     }
   ]
 }

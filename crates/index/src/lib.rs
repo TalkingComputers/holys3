@@ -103,7 +103,7 @@ pub(crate) fn candidates_with<D: AsRef<[u8]>>(
     q: &Query,
     fetch_blocks: impl FnOnce(&BTreeMap<u64, u32>) -> Result<BTreeMap<u64, Vec<DocId>>>,
 ) -> Result<Vec<DocId>> {
-    let resolved = eval::resolve(q, &|gram| map.get(gram));
+    let resolved = eval::resolve(q, doc_count, &|gram| map.get(gram));
     let mut needed = BTreeMap::new();
     eval::blocks_needed(&resolved, &mut needed);
     let blocks = fetch_blocks(&needed)?;

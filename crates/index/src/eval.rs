@@ -51,22 +51,32 @@ pub(crate) enum Resolved {
 }
 
 /// Resolve grams via `lookup` (an fst get) and simplify: absent grams make
-/// their AND empty without any postings fetch; ALL branches collapse.
-pub(crate) fn resolve(q: &Query, lookup: &dyn Fn(&[u8]) -> Option<u64>) -> Resolved {
+/// their AND empty without any postings fetch; ALL branches collapse. A gram
+/// present in every doc (`count == doc_count`) constrains nothing, so it
+/// resolves to ALL and its posting block is never fetched.
+pub(crate) fn resolve(
+    q: &Query,
+    doc_count: u32,
+    lookup: &dyn Fn(&[u8]) -> Option<u64>,
+) -> Resolved {
     match q {
         Query::All => Resolved::All,
         Query::None => Resolved::None,
         Query::Gram(gram) => match lookup(gram) {
             Some(value) => {
                 let (offset, count) = unpack_posting(value);
-                Resolved::Gram { offset, count }
+                if count >= doc_count {
+                    Resolved::All
+                } else {
+                    Resolved::Gram { offset, count }
+                }
             }
             None => Resolved::None,
         },
         Query::And(subs) => {
             let mut children = Vec::new();
             for sub in subs {
-                match resolve(sub, lookup) {
+                match resolve(sub, doc_count, lookup) {
                     Resolved::None => return Resolved::None,
                     Resolved::All => {}
                     resolved => children.push(resolved),
@@ -77,7 +87,7 @@ pub(crate) fn resolve(q: &Query, lookup: &dyn Fn(&[u8]) -> Option<u64>) -> Resol
         Query::Or(subs) => {
             let mut children = Vec::new();
             for sub in subs {
-                match resolve(sub, lookup) {
+                match resolve(sub, doc_count, lookup) {
                     Resolved::All => return Resolved::All,
                     Resolved::None => {}
                     resolved => children.push(resolved),
@@ -235,13 +245,30 @@ mod tests {
             Query::Gram(b"abc".to_vec()),
             Query::Gram(b"zzz".to_vec()),
         ]);
-        let resolved = resolve(&q, &|g: &[u8]| {
+        let resolved = resolve(&q, 100, &|g: &[u8]| {
             (g == b"abc").then(|| pack_posting(0, 2).expect("test setup failed"))
         });
         assert!(matches!(resolved, Resolved::None));
         let mut needed = BTreeMap::new();
         blocks_needed(&resolved, &mut needed);
         assert!(needed.is_empty());
+    }
+
+    #[test]
+    fn dense_gram_resolves_to_all_without_fetch() {
+        // a gram in every doc constrains nothing: All, no block needed
+        let lookup = |_: &[u8]| Some(pack_posting(64, 100).expect("test setup failed"));
+        let resolved = resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup);
+        assert!(matches!(resolved, Resolved::All));
+        let mut needed = BTreeMap::new();
+        blocks_needed(&resolved, &mut needed);
+        assert!(needed.is_empty());
+        // one doc short of dense -> still a real constraint
+        let lookup = |_: &[u8]| Some(pack_posting(64, 99).expect("test setup failed"));
+        assert!(matches!(
+            resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup),
+            Resolved::Gram { count: 99, .. }
+        ));
     }
 
     #[test]
