@@ -75,11 +75,19 @@ pub enum Strategy {
 }
 
 /// Every overlapping 3-byte window as raw bytes (sorted, deduped). <3 bytes => empty.
+/// Windows pack big-endian into u32 so sort+dedup run over integers (u32
+/// order == lexicographic byte order) and only distinct grams allocate.
 pub fn trigram_grams_bytes(data: &[u8]) -> Vec<Vec<u8>> {
-    let mut v: Vec<Vec<u8>> = data.windows(3).map(|w| w.to_vec()).collect();
-    v.sort_unstable();
-    v.dedup();
-    v
+    let mut packed: Vec<u32> = data
+        .windows(3)
+        .map(|w| u32::from(w[0]) << 16 | u32::from(w[1]) << 8 | u32::from(w[2]))
+        .collect();
+    packed.sort_unstable();
+    packed.dedup();
+    packed
+        .into_iter()
+        .map(|g| vec![(g >> 16) as u8, (g >> 8) as u8, g as u8])
+        .collect()
 }
 
 /// Stable u64 hash of an n-gram's bytes. Deterministic across runs/platforms
