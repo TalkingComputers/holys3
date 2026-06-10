@@ -15,16 +15,16 @@ bench-micro:
 	cargo bench -p holys3-index
 
 bench-s3:
-	cargo run -p holys3-bench -- seed --seed $(BENCH_SEED) --objects $(BENCH_OBJECTS) --size $(BENCH_SIZE)
-	cargo run -p holys3-bench -- upload --target s3
-	cargo run -p holys3-bench -- run --scenarios $(BENCH_SCENARIOS) --iterations $(BENCH_ITERATIONS) --warmup $(BENCH_WARMUP) --concurrency $(BENCH_CONCURRENCY)
-	cargo run -p holys3-bench -- report --out crates/xbench/runs/s3.json
-	cargo run -p holys3-bench -- render --input crates/xbench/runs/s3.json
+	cargo run --release -p holys3-bench -- seed --seed $(BENCH_SEED) --objects $(BENCH_OBJECTS) --size $(BENCH_SIZE)
+	cargo run --release -p holys3-bench -- upload --target s3
+	cargo run --release -p holys3-bench -- run --scenarios $(BENCH_SCENARIOS) --iterations $(BENCH_ITERATIONS) --warmup $(BENCH_WARMUP) --concurrency $(BENCH_CONCURRENCY)
+	cargo run --release -p holys3-bench -- report --out crates/xbench/runs/s3.json
+	cargo run --release -p holys3-bench -- render --input crates/xbench/runs/s3.json
 
 bench-minio:
 	docker compose -f docker-compose.bench.yml up -d
-	$(MINIO_ENV) cargo run -p holys3-bench -- seed --seed $(BENCH_SEED) --objects $(BENCH_OBJECTS) --size $(BENCH_SIZE)
-	$(MINIO_ENV) cargo run -p holys3-bench -- upload --target s3
-	$(MINIO_ENV) cargo run -p holys3-bench -- run --scenarios $(BENCH_SCENARIOS) --iterations $(BENCH_ITERATIONS) --warmup $(BENCH_WARMUP) --concurrency $(BENCH_CONCURRENCY)
-	cargo run -p holys3-bench -- report --out crates/xbench/runs/minio.json
-	cargo run -p holys3-bench -- render --input crates/xbench/runs/minio.json
+	$(MINIO_ENV) cargo run --release -p holys3-bench -- seed --seed $(BENCH_SEED) --objects $(BENCH_OBJECTS) --size $(BENCH_SIZE)
+	$(MINIO_ENV) cargo run --release -p holys3-bench -- upload --target s3
+	$(MINIO_ENV) cargo run --release -p holys3-bench -- run --scenarios $(BENCH_SCENARIOS) --iterations $(BENCH_ITERATIONS) --warmup $(BENCH_WARMUP) --concurrency $(BENCH_CONCURRENCY)
+	cargo run --release -p holys3-bench -- report --out crates/xbench/runs/minio.json
+	cargo run --release -p holys3-bench -- render --input crates/xbench/runs/minio.json

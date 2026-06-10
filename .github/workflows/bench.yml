@@ -53,7 +53,10 @@ jobs:
           import sys
           from pathlib import Path
 
-          threshold = 10.0
+          # Shared runners swing CPU-bound medians ~20% run to run (verified:
+          # an untouched code path flapped +19.8% and back across runs); gate
+          # only on regressions big enough to clear that noise floor.
+          threshold = 30.0
           baseline = json.loads(Path("benches/baseline.json").read_text())
           current = json.loads(Path("benches/current.json").read_text())
           base = baseline["benchmarks"]
