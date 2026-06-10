@@ -33,6 +33,9 @@ const SEGMENT_DOC_CAP: usize = 4_000_000;
 const SEGMENT_COUNT_TARGET: usize = 8;
 /// Never merge segments whose combined postings exceed this many bytes.
 const MERGE_POSTINGS_CAP: u64 = 256 * 1024 * 1024;
+/// Posting-block ranges closer than this merge into one ranged GET: a
+/// request round trip costs more than transferring the gap bytes.
+const RANGE_COALESCE_GAP: u64 = 512 * 1024;
 
 /// Prefix marking docs that contributed no grams (vanished mid-build or
 /// undecodable). The failed etag rides along so the diff retries the doc
@@ -82,6 +85,30 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn segment_blob(seg_id: &str, name: &str) -> String {
     format!("segments/{seg_id}/{name}")
+}
+
+/// Where an input range landed after coalescing: (merged index, byte start).
+type Placement = (usize, usize);
+
+/// Merge sorted (offset, len) ranges whose gap is at most `max_gap` and
+/// return, per input range, which merged range holds it and at what offset.
+fn coalesce_ranges(ranges: &[(u64, u64)], max_gap: u64) -> (Vec<(u64, u64)>, Vec<Placement>) {
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    let mut placements = Vec::with_capacity(ranges.len());
+    for &(offset, len) in ranges {
+        let next = merged.len();
+        match merged.last_mut() {
+            Some((m_off, m_len)) if offset <= *m_off + *m_len + max_gap => {
+                placements.push((next - 1, (offset - *m_off) as usize));
+                *m_len = (offset + len).max(*m_off + *m_len) - *m_off;
+            }
+            _ => {
+                placements.push((next, 0));
+                merged.push((offset, len));
+            }
+        }
+    }
+    (merged, placements)
 }
 
 fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
@@ -673,18 +700,27 @@ impl crate::IndexReader for SegmentedReader {
                     .iter()
                     .map(|(&offset, &count)| (offset, u64::from(count) * 4))
                     .collect::<Vec<_>>();
-                let blocks = self.store.get_ranges(&postings_name, &ranges)?;
+                let (merged, placements) = coalesce_ranges(&ranges, RANGE_COALESCE_GAP);
+                let blobs = self.store.get_ranges(&postings_name, &merged)?;
                 anyhow::ensure!(
-                    blocks.len() == ranges.len(),
-                    "get_ranges returned {} blocks for {} ranges",
-                    blocks.len(),
-                    ranges.len()
+                    blobs.len() == merged.len(),
+                    "get_ranges returned {} blobs for {} ranges",
+                    blobs.len(),
+                    merged.len()
                 );
                 needed
                     .iter()
-                    .zip(blocks)
-                    .map(|((&offset, &count), bytes)| {
-                        Ok((offset, crate::decode_ids(&bytes, count)?))
+                    .zip(&ranges)
+                    .zip(placements)
+                    .map(|(((&offset, &count), &(_, len)), (blob_idx, start))| {
+                        let blob = &blobs[blob_idx];
+                        let end = start + usize::try_from(len)?;
+                        anyhow::ensure!(
+                            blob.len() >= end,
+                            "coalesced blob is {} bytes, posting block needs {end}",
+                            blob.len()
+                        );
+                        Ok((offset, crate::decode_ids(&blob[start..end], count)?))
                     })
                     .collect()
             })?;
@@ -724,5 +760,25 @@ impl crate::IndexReader for SegmentedReader {
             terms_fst_bytes: self.segments.iter().map(|s| s.meta.terms_fst_len).sum(),
             postings_bytes: self.segments.iter().map(|s| s.meta.postings_len).sum(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::coalesce_ranges;
+
+    #[test]
+    fn coalesce_merges_within_gap_and_places_blocks() {
+        let ranges = [(0u64, 100u64), (150, 50), (10_000, 8), (10_008, 4)];
+        let (merged, placements) = coalesce_ranges(&ranges, 64);
+        assert_eq!(merged, vec![(0, 200), (10_000, 12)]);
+        assert_eq!(placements, vec![(0, 0), (0, 150), (1, 0), (1, 8)]);
+
+        let (merged, placements) = coalesce_ranges(&ranges, 0);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(placements[3], (2, 8));
+
+        let (merged, _) = coalesce_ranges(&[], 64);
+        assert!(merged.is_empty());
     }
 }
