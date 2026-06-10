@@ -1,16 +1,16 @@
 {
   "unit": "ns",
   "benchmarks": {
-    "grams_index_sparse": 2200700.804347826,
-    "grams_index_trigram": 550121.8537766831,
-    "grams_query_sparse": 1059.158575755993,
-    "grams_query_trigram": 745.0547637615884,
-    "local_blob_store_index_reader_candidates": 3088.707002403846,
-    "mmap_index_reader_candidates": 2797.8933244685977,
-    "plan_(timeout_panicked_denied)": 6647.624653599891,
-    "plan_._": 487.44810531439975,
-    "plan_ERROR42": 1968.633778911612,
-    "plan__CRITICAL_": 3106.413896103896,
-    "plan_customer_id=abc123 request_id=deadbeef": 10053.23480776239
+    "grams_index_sparse": 2637061.342105263,
+    "grams_index_trigram": 87314.89636986301,
+    "grams_query_sparse": 1126.9623090556624,
+    "grams_query_trigram": 376.02472463353934,
+    "local_blob_store_index_reader_candidates": 2799.7044117647056,
+    "mmap_index_reader_candidates": 2429.459711934156,
+    "plan_(timeout_panicked_denied)": 6464.3859689330275,
+    "plan_._": 521.7488913811328,
+    "plan_ERROR42": 1873.4262356046065,
+    "plan__CRITICAL_": 2953.0619693057943,
+    "plan_customer_id=abc123 request_id=deadbeef": 11438.491580137455
   }
 }
