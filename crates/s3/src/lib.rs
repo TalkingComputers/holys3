@@ -3,9 +3,11 @@
 
 mod client;
 pub mod fetch;
+mod sso;
 
 use anyhow::Context;
 use holys3_core::{BlobStore, Corpus, DocId};
+use holys3_sigv4::Credentials;
 
 pub use client::S3Client;
 pub use fetch::FetchConfig;
@@ -23,12 +25,28 @@ pub fn region_from_env() -> anyhow::Result<String> {
     std::env::var("AWS_REGION").context("provide --region or set AWS_REGION")
 }
 
+/// Credential chain: env vars, then the active profile's static keys in
+/// ~/.aws/credentials, then its IAM Identity Center (SSO) token cache.
+pub fn resolve_credentials() -> anyhow::Result<Credentials> {
+    if let Some(creds) = holys3_sigv4::resolve_static()? {
+        return Ok(creds);
+    }
+    if let Some(profile) = holys3_sigv4::sso_profile()? {
+        return sso::role_credentials(&profile);
+    }
+    let profile = holys3_sigv4::profile_name()?;
+    anyhow::bail!(
+        "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, add profile `{profile}` \
+         to ~/.aws/credentials, or configure SSO for it in ~/.aws/config"
+    )
+}
+
 pub fn s3_client_from_env(
     region: &str,
     endpoint: Option<String>,
     cfg: FetchConfig,
 ) -> anyhow::Result<S3Client> {
-    let creds = holys3_sigv4::resolve()?;
+    let creds = resolve_credentials()?;
     S3Client::new(region.to_owned(), creds, endpoint, cfg)
 }
 
