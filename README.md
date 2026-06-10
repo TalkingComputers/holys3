@@ -140,17 +140,15 @@ A non-matching query fetches **zero** objects; `.*` over all 200 is **43.5x** fa
 **Continuous (CI)** — the table below is regenerated on every push to `main` against a local MinIO (deterministic, reproducible with `make bench-minio`); it tracks regressions rather than headline latency.
 
 <!-- BENCH:START -->
-
-| scenario      | hits | candidates/total | prune ratio |  bytes |  p50 ms |  p95 ms |  p99 ms | concurrency=1 p50 ms |
-| ------------- | ---: | ---------------: | ----------: | -----: | ------: | ------: | ------: | -------------------: |
-| short_literal |   50 |           50/100 |       0.500 | 204800 |  51.751 |  51.779 |  51.779 |               73.587 |
-| long_literal  |   34 |           34/100 |       0.340 | 139264 |  59.773 |  62.864 |  62.864 |               56.563 |
-| alternation   |   32 |           32/100 |       0.320 | 131072 |  38.863 |  40.254 |  40.254 |               54.132 |
-| anchored      |   10 |           10/100 |       0.100 |  40960 |  28.099 |  37.262 |  37.262 |               24.584 |
-| no_match      |    0 |            0/100 |       0.000 |      0 |   0.109 |   0.118 |   0.118 |                0.116 |
-| QAll          |  100 |          100/100 |       1.000 | 409600 | 141.103 | 143.568 | 143.568 |              160.666 |
-| dot_star_gap  |   10 |           10/100 |       0.100 |  40960 |  23.448 |  23.477 |  23.477 |               34.128 |
-
+| scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| short_literal | 50 | 50/100 | 0.500 | 204800 | 36.770 | 38.392 | 38.392 | 53.960 |
+| long_literal | 34 | 34/100 | 0.340 | 139264 | 26.872 | 28.892 | 28.892 | 38.538 |
+| alternation | 32 | 32/100 | 0.320 | 131072 | 27.713 | 28.615 | 28.615 | 37.524 |
+| anchored | 10 | 10/100 | 0.100 | 40960 | 9.149 | 9.252 | 9.252 | 12.269 |
+| no_match | 0 | 0/100 | 0.000 | 0 | 0.091 | 0.142 | 0.142 | 0.082 |
+| QAll | 100 | 100/100 | 1.000 | 409600 | 107.759 | 109.403 | 109.403 | 124.638 |
+| dot_star_gap | 10 | 10/100 | 0.100 | 40960 | 12.972 | 13.304 | 13.304 | 15.207 |
 <!-- BENCH:END -->
 
 Microbenchmarks (`make bench-micro`): trigram extraction ~330 us, query plan ~0.7 us, postings decode ~44 ns.
