@@ -216,7 +216,8 @@ mod invariant_grams {
     }
 }
 
-/// A source of documents. Implemented by a local dir (tests) and S3 (prod).
+/// A source of documents for INDEX BUILDS, which need full enumeration.
+/// Implemented by a local dir (tests) and S3 (prod).
 pub trait Corpus {
     /// All document ids with their keys (object key / file path).
     fn docs(&self) -> &[(DocId, String)];
@@ -229,21 +230,19 @@ pub trait Corpus {
     fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, Vec<u8>)>> {
         ids.iter().map(|&id| Ok((id, self.fetch(id)?))).collect()
     }
+}
 
-    /// Stream docs to `consume` as fetches complete (order NOT guaranteed).
-    /// Implementations may fetch concurrently and may skip vanished docs.
-    /// The first `consume` error aborts the remaining fetches.
-    /// Default = sequential.
+/// Fetches documents by key for SEARCH verification — no enumeration, no
+/// doc table. `consume` receives the index into `keys` plus the body, as
+/// fetches complete (order NOT guaranteed). Implementations may fetch
+/// concurrently and may skip vanished docs; the first `consume` error
+/// aborts the remaining fetches.
+pub trait DocFetcher {
     fn fetch_each(
         &self,
-        ids: &[DocId],
-        consume: &mut dyn FnMut(DocId, Vec<u8>) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        for &id in ids {
-            consume(id, self.fetch(id)?)?;
-        }
-        Ok(())
-    }
+        keys: &[String],
+        consume: &mut dyn FnMut(usize, Vec<u8>) -> AnyhowResult<()>,
+    ) -> AnyhowResult<()>;
 }
 
 pub trait BlobStore {
@@ -286,6 +285,24 @@ pub mod testutil {
             Ok(self.bodies[id as usize].clone())
         }
     }
+
+    impl crate::DocFetcher for MemCorpus {
+        fn fetch_each(
+            &self,
+            keys: &[String],
+            consume: &mut dyn FnMut(usize, Vec<u8>) -> Result<()>,
+        ) -> Result<()> {
+            for (idx, key) in keys.iter().enumerate() {
+                let (id, _) = self
+                    .docs
+                    .iter()
+                    .find(|(_, k)| k == key)
+                    .ok_or_else(|| anyhow::anyhow!("unknown key {key}"))?;
+                consume(idx, self.bodies[*id as usize].clone())?;
+            }
+            Ok(())
+        }
+    }
 }
 
 pub struct LocalBlobStore {
@@ -323,10 +340,10 @@ impl BlobStore for LocalBlobStore {
     }
 }
 
-/// One verified match: which doc, 1-based line, 1-based column (byte), the line text.
+/// One verified match: 1-based line, 1-based column (byte), the line text.
+/// The owning object's key travels alongside, not inside.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
-    pub doc: DocId,
     pub line: usize,
     pub col: usize,
     pub text: String,
@@ -334,7 +351,7 @@ pub struct Match {
 
 /// Run `re` over `bytes`, returning one Match per matching occurrence.
 /// Single pass: line numbers are tracked incrementally across matches.
-pub fn matches_in(doc: DocId, bytes: &[u8], re: &regex::bytes::Regex) -> Vec<Match> {
+pub fn matches_in(bytes: &[u8], re: &regex::bytes::Regex) -> Vec<Match> {
     let mut out = Vec::new();
     let mut line = 1usize;
     let mut line_start = 0usize;
@@ -349,7 +366,6 @@ pub fn matches_in(doc: DocId, bytes: &[u8], re: &regex::bytes::Regex) -> Vec<Mat
         counted_to = start;
         let line_end = memchr::memchr(b'\n', &bytes[start..]).map_or(bytes.len(), |p| start + p);
         out.push(Match {
-            doc,
             line,
             col: start - line_start + 1,
             text: String::from_utf8_lossy(&bytes[line_start..line_end]).into_owned(),
@@ -358,16 +374,17 @@ pub fn matches_in(doc: DocId, bytes: &[u8], re: &regex::bytes::Regex) -> Vec<Mat
     out
 }
 
-/// Oracle: docs that contain at least one match. The differential ground truth.
+/// Oracle: keys of docs containing at least one match, sorted. The
+/// differential ground truth.
 pub fn scan_matching_docs(
     corpus: &dyn Corpus,
     re: &regex::bytes::Regex,
-) -> AnyhowResult<Vec<DocId>> {
+) -> AnyhowResult<Vec<String>> {
     let mut hits = Vec::new();
-    for &(id, _) in corpus.docs() {
-        let bytes = corpus.fetch(id)?;
+    for (id, key) in corpus.docs() {
+        let bytes = corpus.fetch(*id)?;
         if re.is_match(&bytes) {
-            hits.push(id);
+            hits.push(key.clone());
         }
     }
     hits.sort_unstable();
@@ -545,20 +562,15 @@ mod corpus_tests {
             vec![b"hello world".to_vec(), b"nothing here".to_vec()],
         );
         let re = regex::bytes::Regex::new("world").unwrap();
-        assert_eq!(scan_matching_docs(&c, &re).unwrap(), vec![0]);
+        assert_eq!(scan_matching_docs(&c, &re).unwrap(), vec!["a".to_owned()]);
     }
 
     #[test]
     fn match_line_col() {
-        let m = matches_in(
-            7,
-            b"foo\nbar baz",
-            &regex::bytes::Regex::new("baz").unwrap(),
-        );
+        let m = matches_in(b"foo\nbar baz", &regex::bytes::Regex::new("baz").unwrap());
         assert_eq!(
             m,
             vec![Match {
-                doc: 7,
                 line: 2,
                 col: 5,
                 text: "bar baz".into()
@@ -570,7 +582,7 @@ mod corpus_tests {
     fn matches_in_tracks_lines_across_matches() {
         let bytes = b"alpha x\nbeta\nx gamma x\nx";
         let re = regex::bytes::Regex::new("x").unwrap();
-        let m = matches_in(1, bytes, &re);
+        let m = matches_in(bytes, &re);
         let positions: Vec<(usize, usize, &str)> =
             m.iter().map(|m| (m.line, m.col, m.text.as_str())).collect();
         assert_eq!(
@@ -614,19 +626,21 @@ mod corpus_tests {
     }
 
     #[test]
-    fn fetch_each_streams_in_order_for_default_impl() {
+    fn doc_fetcher_resolves_keys() {
         use crate::testutil::MemCorpus;
+        use crate::DocFetcher;
         let c = MemCorpus::new(
             vec![(0, "a".into()), (1, "b".into())],
             vec![b"one".to_vec(), b"two".to_vec()],
         );
+        let keys = vec!["b".to_owned(), "a".to_owned()];
         let mut seen = Vec::new();
-        c.fetch_each(&[1, 0], &mut |id, bytes| {
-            seen.push((id, bytes));
+        c.fetch_each(&keys, &mut |idx, bytes| {
+            seen.push((idx, bytes));
             Ok(())
         })
         .unwrap();
-        assert_eq!(seen, vec![(1, b"two".to_vec()), (0, b"one".to_vec())]);
+        assert_eq!(seen, vec![(0, b"two".to_vec()), (1, b"one".to_vec())]);
     }
 
     #[test]

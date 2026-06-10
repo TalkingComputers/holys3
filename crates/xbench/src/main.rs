@@ -7,13 +7,14 @@ use gen::{
     doc_path, latest_run_path, local_index_dir, objects_dir, read_manifest, remove_dir,
     reports_dir, write_seed, SeedManifest,
 };
-use holys3_core::{Corpus, DocId, Strategy};
+use holys3_core::{Corpus, DocFetcher, Strategy};
 use holys3_index::{
     build_to_dir, build_to_store, compute_build_id, search_collect, IndexReader, LocalCorpus,
-    MmapIndexReader, StoreIndexReader,
+    LocalFetcher, MmapIndexReader, StoreIndexReader,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, s3_client_from_env, S3BlobStore, S3Client, S3Corpus,
+    S3Fetcher,
 };
 use scenarios::{read_scenarios, Scenario};
 use serde::{Deserialize, Serialize};
@@ -114,7 +115,7 @@ struct RunSummary {
 
 struct SearchMeasurement {
     elapsed: Duration,
-    hits: Vec<DocId>,
+    hits: Vec<String>,
     candidates: usize,
     total_docs: usize,
     bytes_fetched: u64,
@@ -255,9 +256,14 @@ fn run_dir(
     concurrency: usize,
 ) -> Result<RunSummary> {
     let reader = MmapIndexReader::open(&local_index_dir())?;
-    let corpus = LocalCorpus::new(&objects_dir())?;
     let results = run_all(
-        &reader, &corpus, &corpus, &scenarios, manifest, iterations, warmup,
+        &reader,
+        &LocalFetcher,
+        &LocalFetcher,
+        &scenarios,
+        manifest,
+        iterations,
+        warmup,
     )?;
     Ok(RunSummary {
         seed: manifest.seed,
@@ -293,20 +299,12 @@ fn run_s3(
     );
     let cache_dir = reports_dir().join("s3-cache");
     let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
-    let corpus = S3Corpus::from_docs(
-        backend.client.clone(),
-        backend.bucket.clone(),
-        reader.docs().to_vec(),
-    );
-    let single_corpus = S3Corpus::from_docs(
-        single_backend.client,
-        backend.bucket.clone(),
-        reader.docs().to_vec(),
-    );
+    let fetcher = S3Fetcher::new(backend.client.clone(), backend.bucket.clone());
+    let single_fetcher = S3Fetcher::new(single_backend.client, backend.bucket.clone());
     let results = run_all(
         &reader,
-        &corpus,
-        &single_corpus,
+        &fetcher,
+        &single_fetcher,
         &scenarios,
         manifest,
         iterations,
@@ -333,8 +331,8 @@ fn run_s3(
 #[allow(clippy::too_many_arguments)]
 fn run_all(
     reader: &dyn IndexReader,
-    corpus: &dyn Corpus,
-    single_corpus: &dyn Corpus,
+    fetcher: &dyn DocFetcher,
+    single_fetcher: &dyn DocFetcher,
     scenarios: &[Scenario],
     manifest: &SeedManifest,
     iterations: usize,
@@ -347,10 +345,10 @@ fn run_all(
                 .expected_hits
                 .get(&scenario.name)
                 .with_context(|| format!("missing expected hit count for {}", scenario.name))?;
-            let timed = time_scenario(reader, corpus, scenario, expected, iterations, warmup)?;
+            let timed = time_scenario(reader, fetcher, scenario, expected, iterations, warmup)?;
             let single = time_scenario(
                 reader,
-                single_corpus,
+                single_fetcher,
                 scenario,
                 expected,
                 iterations,
@@ -383,14 +381,14 @@ fn run_all(
 
 fn time_scenario(
     reader: &dyn IndexReader,
-    corpus: &dyn Corpus,
+    fetcher: &dyn DocFetcher,
     scenario: &Scenario,
     expected: usize,
     iterations: usize,
     warmup: usize,
 ) -> Result<TimedScenario> {
     for _ in 0..warmup {
-        let measurement = measure_search(reader, corpus, &scenario.pattern)?;
+        let measurement = measure_search(reader, fetcher, &scenario.pattern)?;
         anyhow::ensure!(
             measurement.hits.len() == expected,
             "{} expected {} hits, got {}",
@@ -402,7 +400,7 @@ fn time_scenario(
     let mut elapsed = Vec::with_capacity(iterations);
     let mut last = None;
     for _ in 0..iterations {
-        let measurement = measure_search(reader, corpus, &scenario.pattern)?;
+        let measurement = measure_search(reader, fetcher, &scenario.pattern)?;
         anyhow::ensure!(
             measurement.hits.len() == expected,
             "{} expected {} hits, got {}",
@@ -428,11 +426,11 @@ fn time_scenario(
 
 fn measure_search(
     reader: &dyn IndexReader,
-    corpus: &dyn Corpus,
+    fetcher: &dyn DocFetcher,
     pattern: &str,
 ) -> Result<SearchMeasurement> {
     let start = Instant::now();
-    let (_, stats) = search_collect(reader, corpus, pattern)?;
+    let (_, stats) = search_collect(reader, fetcher, pattern)?;
     Ok(SearchMeasurement {
         elapsed: start.elapsed(),
         hits: stats.hits,

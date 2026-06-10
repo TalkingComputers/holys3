@@ -58,7 +58,7 @@ fn bench_index_reader(c: &mut Criterion) {
     c.bench_function("mmap_index_reader_candidates", |b| {
         b.iter(|| {
             mmap_reader
-                .candidates(black_box(&q))
+                .candidate_keys(black_box(&q), None)
                 .expect("benchmark setup failed");
         });
     });
@@ -77,7 +77,7 @@ fn bench_index_reader(c: &mut Criterion) {
     c.bench_function("local_blob_store_index_reader_candidates", |b| {
         b.iter(|| {
             store_reader
-                .candidates(black_box(&q))
+                .candidate_keys(black_box(&q), None)
                 .expect("benchmark setup failed");
         });
     });
