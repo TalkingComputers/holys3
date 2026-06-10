@@ -21,3 +21,7 @@ pattern = "UNMATCHABLE_TOKEN"
 [[scenarios]]
 name = "QAll"
 pattern = ".*"
+
+[[scenarios]]
+name = "dot_star_gap"
+pattern = "(?s)needle.*alpha"

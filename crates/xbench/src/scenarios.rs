@@ -45,5 +45,9 @@ pub(crate) fn default_scenarios() -> Vec<Scenario> {
             name: "QAll".to_owned(),
             pattern: ".*".to_owned(),
         },
+        Scenario {
+            name: "dot_star_gap".to_owned(),
+            pattern: "(?s)needle.*alpha".to_owned(),
+        },
     ]
 }
