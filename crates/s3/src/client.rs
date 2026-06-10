@@ -70,9 +70,65 @@ enum Outcome {
     Fatal(anyhow::Error),
 }
 
+type RefreshFn =
+    dyn Fn() -> Result<(Credentials, Option<time::OffsetDateTime>)> + Send + Sync + 'static;
+
+/// Refresh when credentials expire within this margin.
+const REFRESH_MARGIN: time::Duration = time::Duration::minutes(5);
+
+struct CredentialCell {
+    state: std::sync::Mutex<(Arc<Credentials>, Option<time::OffsetDateTime>)>,
+    refresher: std::sync::OnceLock<Arc<RefreshFn>>,
+    refresh_gate: tokio::sync::Mutex<()>,
+}
+
+impl CredentialCell {
+    fn snapshot(&self) -> Result<(Arc<Credentials>, Option<time::OffsetDateTime>)> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("credential refresh panicked"))?;
+        Ok(state.clone())
+    }
+
+    fn expiring(expires_at: Option<time::OffsetDateTime>) -> bool {
+        expires_at.is_some_and(|at| at - time::OffsetDateTime::now_utc() < REFRESH_MARGIN)
+    }
+
+    /// The credentials to sign with, refreshed via the registered resolver
+    /// when close to expiry. The portal call inside the resolver builds its
+    /// own runtime, so it runs on a blocking thread.
+    async fn current(&self) -> Result<Arc<Credentials>> {
+        let (creds, expires_at) = self.snapshot()?;
+        if !Self::expiring(expires_at) {
+            return Ok(creds);
+        }
+        let Some(refresher) = self.refresher.get() else {
+            return Ok(creds);
+        };
+        let _gate = self.refresh_gate.lock().await;
+        let (creds, expires_at) = self.snapshot()?;
+        if !Self::expiring(expires_at) {
+            return Ok(creds);
+        }
+        let refresher = Arc::clone(refresher);
+        let (fresh, fresh_expiry) = tokio::task::spawn_blocking(move || refresher())
+            .await
+            .map_err(|err| anyhow::anyhow!("credential refresh panicked: {err}"))?
+            .context("credential refresh failed")?;
+        let fresh = Arc::new(fresh);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("credential refresh panicked"))?;
+        *state = (Arc::clone(&fresh), fresh_expiry);
+        Ok(fresh)
+    }
+}
+
 struct ClientInner {
     region: String,
-    creds: Credentials,
+    creds: CredentialCell,
     endpoint_host: Option<String>,
     endpoint_base: Option<String>,
     cfg: FetchConfig,
@@ -121,12 +177,33 @@ impl S3Client {
             limiter: AimdLimiter::new(cfg.start, cfg.cap),
             hedges: HedgeBudget::new(cfg.hedge_tokens),
             region,
-            creds,
+            creds: CredentialCell {
+                state: std::sync::Mutex::new((Arc::new(creds), None)),
+                refresher: std::sync::OnceLock::new(),
+                refresh_gate: tokio::sync::Mutex::new(()),
+            },
             endpoint_host,
             endpoint_base,
             cfg,
             rt,
         })))
+    }
+
+    /// Arm credential refresh: `expires_at` marks the current credentials'
+    /// lifetime, and `refresh` re-resolves them (called off-runtime when they
+    /// near expiry). Static-credential clients never call this.
+    pub fn enable_refresh(
+        &self,
+        expires_at: time::OffsetDateTime,
+        refresh: impl Fn() -> Result<(Credentials, Option<time::OffsetDateTime>)>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        if let Ok(mut state) = self.0.creds.state.lock() {
+            state.1 = Some(expires_at);
+        }
+        self.0.creds.refresher.get_or_init(|| Arc::new(refresh));
     }
 
     pub fn region(&self) -> &str {
@@ -165,6 +242,10 @@ impl S3Client {
 
     /// One signed attempt: build, sign, send, and read the full body.
     async fn attempt(&self, req: &S3Request<'_>, http: &reqwest::Client) -> Outcome {
+        let creds = match self.0.creds.current().await {
+            Ok(creds) => creds,
+            Err(err) => return Outcome::Fatal(err),
+        };
         let host = self.host(req.bucket);
         let path = self.request_path(req.bucket, req.key);
         let (amz, date) = now();
@@ -175,7 +256,7 @@ impl S3Client {
         };
         let signed = sign_request(
             req.method,
-            &self.0.creds,
+            &creds,
             &self.0.region,
             &host,
             &path,
@@ -190,12 +271,7 @@ impl S3Client {
             "PUT" => http.put(url),
             _ => http.get(url),
         };
-        let mut builder = apply_signed(
-            builder,
-            &signed,
-            &host,
-            self.0.creds.session_token.as_deref(),
-        );
+        let mut builder = apply_signed(builder, &signed, &host, creds.session_token.as_deref());
         if let Some(range) = &range_header {
             builder = builder.header("range", range);
         }
