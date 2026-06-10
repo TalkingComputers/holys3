@@ -4,8 +4,10 @@
 
 use anyhow::{Context, Result};
 use holys3_sigv4::{encode_query_component, read_sso_token, Credentials, SsoProfile};
+use time::OffsetDateTime;
 
-pub(crate) fn role_credentials(profile: &SsoProfile) -> Result<Credentials> {
+/// Role credentials plus their expiry instant, for proactive refresh.
+pub(crate) fn role_credentials(profile: &SsoProfile) -> Result<(Credentials, OffsetDateTime)> {
     let token = read_sso_token(profile)?;
     let url = format!(
         "https://portal.sso.{}.amazonaws.com/federation/credentials?account_id={}&role_name={}",
@@ -40,9 +42,17 @@ pub(crate) fn role_credentials(profile: &SsoProfile) -> Result<Credentials> {
             .map(str::to_owned)
             .with_context(|| format!("SSO roleCredentials missing {name}"))
     };
-    Ok(Credentials {
-        access_key: field("accessKeyId")?,
-        secret_key: field("secretAccessKey")?,
-        session_token: Some(field("sessionToken")?),
-    })
+    let expiration_ms = role["expiration"]
+        .as_i64()
+        .context("SSO roleCredentials missing expiration")?;
+    let expires_at = OffsetDateTime::from_unix_timestamp(expiration_ms / 1000)
+        .context("SSO expiration out of range")?;
+    Ok((
+        Credentials {
+            access_key: field("accessKeyId")?,
+            secret_key: field("secretAccessKey")?,
+            session_token: Some(field("sessionToken")?),
+        },
+        expires_at,
+    ))
 }

@@ -25,14 +25,34 @@ pub fn region_from_env() -> anyhow::Result<String> {
     std::env::var("AWS_REGION").context("provide --region or set AWS_REGION")
 }
 
-/// Credential chain: env vars, then the active profile's static keys in
-/// ~/.aws/credentials, then its IAM Identity Center (SSO) token cache.
-pub fn resolve_credentials() -> anyhow::Result<Credentials> {
-    if let Some(creds) = holys3_sigv4::resolve_static()? {
-        return Ok(creds);
+/// Credentials plus the instant they stop working (None = static, never).
+pub struct ResolvedCredentials {
+    pub credentials: Credentials,
+    pub expires_at: Option<time::OffsetDateTime>,
+}
+
+/// Credential chain in botocore precedence order: env vars, then the active
+/// profile's IAM Identity Center (SSO) config, then static keys in
+/// ~/.aws/credentials.
+pub fn resolve_credentials() -> anyhow::Result<ResolvedCredentials> {
+    if let Some(credentials) = holys3_sigv4::from_env() {
+        return Ok(ResolvedCredentials {
+            credentials,
+            expires_at: None,
+        });
     }
     if let Some(profile) = holys3_sigv4::sso_profile()? {
-        return sso::role_credentials(&profile);
+        let (credentials, expires_at) = sso::role_credentials(&profile)?;
+        return Ok(ResolvedCredentials {
+            credentials,
+            expires_at: Some(expires_at),
+        });
+    }
+    if let Some(credentials) = holys3_sigv4::resolve_static()? {
+        return Ok(ResolvedCredentials {
+            credentials,
+            expires_at: None,
+        });
     }
     let profile = holys3_sigv4::profile_name()?;
     anyhow::bail!(
@@ -46,8 +66,15 @@ pub fn s3_client_from_env(
     endpoint: Option<String>,
     cfg: FetchConfig,
 ) -> anyhow::Result<S3Client> {
-    let creds = resolve_credentials()?;
-    S3Client::new(region.to_owned(), creds, endpoint, cfg)
+    let resolved = resolve_credentials()?;
+    let client = S3Client::new(region.to_owned(), resolved.credentials, endpoint, cfg)?;
+    if let Some(expires_at) = resolved.expires_at {
+        client.enable_refresh(expires_at, || {
+            let resolved = resolve_credentials()?;
+            Ok((resolved.credentials, resolved.expires_at))
+        });
+    }
+    Ok(client)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

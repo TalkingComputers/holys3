@@ -8,7 +8,7 @@ fn list_and_get_roundtrip() {
         return;
     };
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
-    let creds = resolve_credentials().unwrap();
+    let creds = resolve_credentials().unwrap().credentials;
     let client = S3Client::new(region, creds, None, FetchConfig::default()).unwrap();
     let objs = client.list(&bucket, "").unwrap();
     assert!(!objs.is_empty(), "bucket should have at least one object");
