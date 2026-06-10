@@ -492,20 +492,16 @@ impl SegmentedReader {
         let list = parse_segment_list(&bytes)?;
         let mut segments = Vec::with_capacity(list.segments.len());
         for meta in list.segments {
-            let fst_bytes = cached_blob(
-                store.as_ref(),
-                cache_dir,
-                &meta.seg_id,
-                "terms.fst",
-                meta.terms_fst_len,
-            )?;
-            let dead = load_dead(store.as_ref(), cache_dir, &meta)?;
-            segments.push(Segment {
-                map: fst::Map::new(fst_bytes)?,
-                dead,
-                docs: OnceLock::new(),
-                meta,
-            });
+            // A corrupt cached blob (same length, damaged bytes) self-heals:
+            // wipe this segment's cache and refetch once.
+            let segment = match load_segment(store.as_ref(), cache_dir, &meta) {
+                Ok(segment) => segment,
+                Err(_) => {
+                    std::fs::remove_dir_all(cache_dir.join(&meta.seg_id)).ok();
+                    load_segment(store.as_ref(), cache_dir, &meta)?
+                }
+            };
+            segments.push(segment);
         }
         evict_stale_segments(cache_dir, &segments);
         Ok(SegmentedReader {
@@ -551,6 +547,23 @@ impl SegmentedReader {
         }
         upper.is_empty() || meta.min_key.as_bytes() < upper.as_slice()
     }
+}
+
+fn load_segment(store: &dyn BlobStore, cache_dir: &Path, meta: &SegmentMeta) -> Result<Segment> {
+    let fst_bytes = cached_blob(
+        store,
+        cache_dir,
+        &meta.seg_id,
+        "terms.fst",
+        meta.terms_fst_len,
+    )?;
+    let dead = load_dead(store, cache_dir, meta)?;
+    Ok(Segment {
+        map: fst::Map::new(fst_bytes)?,
+        dead,
+        docs: OnceLock::new(),
+        meta: meta.clone(),
+    })
 }
 
 fn evict_stale_segments(cache_dir: &Path, segments: &[Segment]) {
