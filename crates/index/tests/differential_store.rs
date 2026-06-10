@@ -21,25 +21,32 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
                 .iter()
                 .map(|(_, key)| (key.clone(), format!("etag-{key}")))
                 .collect::<Vec<_>>();
-            update_index(&store, cache_dir.path(), strategy, &listing, &|keys| {
-                let docs = keys
-                    .iter()
-                    .enumerate()
-                    .map(|(i, key)| (i as u32, key.clone()))
-                    .collect();
-                let bodies = keys
-                    .iter()
-                    .map(|key| {
-                        let (id, _) = c
-                            .docs()
-                            .iter()
-                            .find(|(_, k)| k == key)
-                            .expect("listed key exists");
-                        c.fetch(*id)
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                Ok(Box::new(MemCorpus::new(docs, bodies)))
-            })?;
+            update_index(
+                &store,
+                cache_dir.path(),
+                strategy,
+                &listing,
+                false,
+                &|keys| {
+                    let docs = keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, key)| (i as u32, key.clone()))
+                        .collect();
+                    let bodies = keys
+                        .iter()
+                        .map(|key| {
+                            let (id, _) = c
+                                .docs()
+                                .iter()
+                                .find(|(_, k)| k == key)
+                                .expect("listed key exists");
+                            c.fetch(*id)
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    Ok(Box::new(MemCorpus::new(docs, bodies)))
+                },
+            )?;
             let reader = SegmentedReader::open(
                 Box::new(LocalBlobStore::new(store_dir.path())),
                 cache_dir.path(),

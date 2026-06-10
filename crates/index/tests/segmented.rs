@@ -79,7 +79,7 @@ impl DocFetcher for BucketFetcher<'_> {
 fn reindex(bucket: &Bucket, store_dir: &Path, cache_dir: &Path, strategy: Strategy) -> Result<()> {
     let store = LocalBlobStore::new(store_dir);
     let listing = bucket.listing();
-    update_index(&store, cache_dir, strategy, &listing, &|keys| {
+    update_index(&store, cache_dir, strategy, &listing, false, &|keys| {
         Ok(Box::new(bucket.corpus_over(keys)))
     })?;
     Ok(())
@@ -211,6 +211,7 @@ fn lifecycle_add_modify_delete_readd() -> Result<()> {
         cache_dir.path(),
         Strategy::Trigram,
         &listing,
+        false,
         &|keys| Ok(Box::new(bucket.corpus_over(keys))),
     )?;
     assert!(report.up_to_date, "run6 should be a no-op");
@@ -343,6 +344,146 @@ fn corrupt_cache_self_heals_and_stale_segments_evict() -> Result<()> {
     assert!(
         !seg_dir.exists(),
         "stale segment cache dir should be evicted"
+    );
+    Ok(())
+}
+
+#[test]
+fn undecodable_objects_tombstone_and_converge() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    // A truncated gzip header: detected as gzip, fails to decode.
+    bucket.put("bad.gz", &[0x1f, 0x8b, 0x08, 0x00]);
+    bucket.put("good", b"needle fine");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+
+    // The undecodable object must NOT force a refetch every run: the next
+    // run over an unchanged bucket is a no-op.
+    let store = LocalBlobStore::new(store_dir.path());
+    let listing = bucket.listing();
+    let report = update_index(
+        &store,
+        cache_dir.path(),
+        Strategy::Trigram,
+        &listing,
+        false,
+        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+    )?;
+    assert!(report.up_to_date, "tombstoned object must not loop");
+
+    // Replacing the bad object with decodable content picks it up.
+    bucket.put("bad.gz", b"needle recovered");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    assert_matches_oracle(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        &["needle", "recovered"],
+        "tombstone-recovery",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn rebuild_flag_reingests_from_scratch() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("a", b"needle one");
+    bucket.put("b", b"needle two");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+
+    let store = LocalBlobStore::new(store_dir.path());
+    let listing = bucket.listing();
+    let report = update_index(
+        &store,
+        cache_dir.path(),
+        Strategy::Trigram,
+        &listing,
+        true,
+        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+    )?;
+    assert!(!report.up_to_date);
+    assert_eq!(report.added, 2, "rebuild re-ingests everything");
+    assert_matches_oracle(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        &["needle"],
+        "post-rebuild",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
+    use holys3_core::BlobStore;
+
+    struct FlakyStore {
+        inner: LocalBlobStore,
+        fail_next_root_get: std::cell::Cell<bool>,
+    }
+
+    impl BlobStore for FlakyStore {
+        fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put(name, bytes)
+        }
+
+        fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+            if name == "segments.bin" && self.fail_next_root_get.replace(false) {
+                anyhow::bail!("simulated transient outage");
+            }
+            self.inner.get(name)
+        }
+
+        fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+            self.inner.get_range(name, start, len)
+        }
+    }
+
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("a", b"needle one");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+
+    let flaky = FlakyStore {
+        inner: LocalBlobStore::new(store_dir.path()),
+        fail_next_root_get: std::cell::Cell::new(true),
+    };
+    let listing = bucket.listing();
+    let result = update_index(
+        &flaky,
+        cache_dir.path(),
+        Strategy::Trigram,
+        &listing,
+        false,
+        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+    );
+    assert!(
+        result.is_err(),
+        "a transient store error must fail loudly, not silently rebuild"
     );
     Ok(())
 }

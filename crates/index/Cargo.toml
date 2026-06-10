@@ -11,7 +11,6 @@ authors.workspace = true
 description.workspace = true
 keywords.workspace = true
 categories.workspace = true
-publish = false
 
 [dependencies]
 holys3-core = { path = "../core", version = "0.1.0" }

@@ -32,6 +32,7 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
         cache_dir.path(),
         Strategy::Trigram,
         &listing,
+        false,
         &|keys| {
             let objects = keys
                 .iter()

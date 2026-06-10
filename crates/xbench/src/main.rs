@@ -225,21 +225,28 @@ fn upload_s3(manifest: &SeedManifest) -> Result<()> {
     );
     let client = backend.client;
     let bucket = backend.bucket.clone();
-    let report = update_index(&store, &cache_dir, Strategy::Sparse, &listing, &|keys| {
-        let objects = keys
-            .iter()
-            .map(|key| holys3_s3::ObjectMeta {
-                key: key.clone(),
-                etag: String::new(),
-                size: 0,
-            })
-            .collect::<Vec<_>>();
-        Ok(Box::new(S3Corpus::new(
-            client.clone(),
-            bucket.clone(),
-            &objects,
-        )))
-    })?;
+    let report = update_index(
+        &store,
+        &cache_dir,
+        Strategy::Sparse,
+        &listing,
+        false,
+        &|keys| {
+            let objects = keys
+                .iter()
+                .map(|key| holys3_s3::ObjectMeta {
+                    key: key.clone(),
+                    etag: String::new(),
+                    size: 0,
+                })
+                .collect::<Vec<_>>();
+            Ok(Box::new(S3Corpus::new(
+                client.clone(),
+                bucket.clone(),
+                &objects,
+            )))
+        },
+    )?;
     println!(
         "s3://{}/{} ({} docs, {} segments)",
         backend.bucket,

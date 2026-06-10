@@ -247,7 +247,9 @@ pub trait DocFetcher {
 
 pub trait BlobStore {
     fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()>;
-    fn get(&self, name: &str) -> AnyhowResult<Vec<u8>>;
+    /// `Ok(None)` = blob does not exist. Transient store failures are `Err`
+    /// so callers never mistake an outage for an empty store.
+    fn get(&self, name: &str) -> AnyhowResult<Option<Vec<u8>>>;
     fn get_range(&self, name: &str, start: u64, len: u64) -> AnyhowResult<Vec<u8>>;
     /// Fetch many byte ranges of one blob, preserving order. Implementations
     /// may fetch concurrently. Default = sequential.
@@ -325,8 +327,12 @@ impl BlobStore for LocalBlobStore {
         Ok(())
     }
 
-    fn get(&self, name: &str) -> AnyhowResult<Vec<u8>> {
-        Ok(std::fs::read(self.root.join(name))?)
+    fn get(&self, name: &str) -> AnyhowResult<Option<Vec<u8>>> {
+        match std::fs::read(self.root.join(name)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn get_range(&self, name: &str, start: u64, len: u64) -> AnyhowResult<Vec<u8>> {
@@ -440,7 +446,11 @@ mod tests {
         ));
         let store = LocalBlobStore::new(&root);
         store.put("builds/a/postings.bin", b"abcdef")?;
-        assert_eq!(store.get("builds/a/postings.bin")?, b"abcdef");
+        assert_eq!(
+            store.get("builds/a/postings.bin")?.as_deref(),
+            Some(b"abcdef".as_slice())
+        );
+        assert_eq!(store.get("missing")?, None);
         assert_eq!(store.get_range("builds/a/postings.bin", 2, 3)?, b"cde");
         assert_eq!(
             store.get_ranges("builds/a/postings.bin", &[(0, 2), (4, 2)])?,

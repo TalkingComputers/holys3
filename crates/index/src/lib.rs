@@ -24,7 +24,7 @@ const BUILD_FETCH_CHUNK: usize = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 2;
+const INDEX_FORMAT: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct Manifest {
@@ -163,6 +163,17 @@ fn build_index_bytes(
             ungrammed.len()
         );
     }
+    let (fst_bytes, postings_buf) = serialize_postings(postings)?;
+    ungrammed.sort_unstable();
+    Ok((fst_bytes, postings_buf, ungrammed))
+}
+
+/// THE postings format: per gram, sorted deduped doc ids as u32 LE runs in
+/// postings.bin; the fst maps gram -> packed (offset, count). Shared by
+/// fresh builds and compaction merges so the format is defined once.
+pub(crate) fn serialize_postings(
+    postings: BTreeMap<Vec<u8>, Vec<DocId>>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut postings_buf: Vec<u8> = Vec::new();
     let mut builder = fst::MapBuilder::new(Vec::new())?;
     for (gram, mut ids) in postings {
@@ -174,8 +185,7 @@ fn build_index_bytes(
         }
         builder.insert(gram, eval::pack_posting(offset, ids.len())?)?;
     }
-    ungrammed.sort_unstable();
-    Ok((builder.into_inner()?, postings_buf, ungrammed))
+    Ok((builder.into_inner()?, postings_buf))
 }
 
 fn make_manifest(

@@ -78,6 +78,7 @@ fn bench_index_reader(c: &mut Criterion) {
         cache_dir.path(),
         Strategy::Sparse,
         &listing,
+        false,
         &|keys| {
             let docs = keys
                 .iter()

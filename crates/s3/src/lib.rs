@@ -209,10 +209,8 @@ impl BlobStore for S3BlobStore {
         self.client.put(&self.bucket, &self.build_key(name), bytes)
     }
 
-    fn get(&self, name: &str) -> anyhow::Result<Vec<u8>> {
-        self.client
-            .get(&self.bucket, &self.build_key(name))?
-            .with_context(|| self.blob_context(name))
+    fn get(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.client.get(&self.bucket, &self.build_key(name))
     }
 
     fn get_range(&self, name: &str, start: u64, len: u64) -> anyhow::Result<Vec<u8>> {

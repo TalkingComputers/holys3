@@ -57,6 +57,7 @@ struct S3Source {
     client: S3Client,
     bucket: String,
     prefix: String,
+    endpoint: Option<String>,
 }
 
 impl SourceArgs {
@@ -70,13 +71,14 @@ impl SourceArgs {
                 };
                 let client = s3_client_from_env(
                     &region,
-                    self.endpoint,
+                    self.endpoint.clone(),
                     build_fetch_config(self.concurrency),
                 )?;
                 Ok(Source::S3(S3Source {
                     client,
                     bucket,
                     prefix: normalize_prefix(&self.prefix),
+                    endpoint: self.endpoint,
                 }))
             }
             _ => anyhow::bail!("provide --local-dir or --bucket"),
@@ -95,6 +97,9 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, value_enum, default_value = "trigram")]
         strategy: StrategyArg,
+        /// Ignore any existing index and re-ingest everything.
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Search a pattern using a prebuilt index.
     Search {
@@ -169,16 +174,16 @@ fn list_user_objects(src: &S3Source) -> Result<Vec<ObjectMeta>> {
         .collect())
 }
 
-fn build_s3(src: S3Source, strategy: Strategy) -> Result<()> {
+fn build_s3(src: S3Source, strategy: Strategy, rebuild: bool) -> Result<()> {
     let listing = list_user_objects(&src)?
         .into_iter()
         .map(|object| (object.key, object.etag))
         .collect::<Vec<_>>();
-    let cache_dir = build_cache_dir(&src.bucket, &src.prefix)?;
+    let cache_dir = build_cache_dir(src.endpoint.as_deref(), &src.bucket, &src.prefix)?;
     let store = S3BlobStore::new(src.client.clone(), src.bucket.clone(), src.prefix.clone());
     let client = src.client;
     let bucket = src.bucket.clone();
-    let report = update_index(&store, &cache_dir, strategy, &listing, &|keys| {
+    let report = update_index(&store, &cache_dir, strategy, &listing, rebuild, &|keys| {
         let objects = keys
             .iter()
             .map(|key| ObjectMeta {
@@ -231,7 +236,7 @@ fn search_s3(
     stats: bool,
     scope: Option<&Scope>,
 ) -> Result<()> {
-    let cache_dir = build_cache_dir(&src.bucket, &src.prefix)?;
+    let cache_dir = build_cache_dir(src.endpoint.as_deref(), &src.bucket, &src.prefix)?;
     let store = S3BlobStore::new(src.client.clone(), src.bucket.clone(), src.prefix.clone());
     let reader = SegmentedReader::open(Box::new(store), &cache_dir)?;
     let fetcher = S3Fetcher::new(src.client, src.bucket);
@@ -314,14 +319,17 @@ fn emit_results(
     Ok(())
 }
 
-fn build_cache_dir(bucket: &str, prefix: &str) -> Result<PathBuf> {
+/// Cache dir per (endpoint, bucket, prefix): readable bucket name plus a
+/// short hash so `a/b` vs `a__b` prefixes (or the same bucket name on two
+/// endpoints) can never share state.
+fn build_cache_dir(endpoint: Option<&str>, bucket: &str, prefix: &str) -> Result<PathBuf> {
     let mut path = read_cache_home(std::env::var("XDG_CACHE_HOME"), std::env::var("HOME"))?;
     path.push("holys3");
-    path.push(bucket);
-    let prefix = prefix.replace('/', "__");
-    if !prefix.is_empty() {
-        path.push(prefix);
-    }
+    let scope = format!("{}\0{bucket}\0{prefix}", endpoint.unwrap_or(""));
+    path.push(format!(
+        "{bucket}-{:016x}",
+        holys3_core::hash_ngram(scope.as_bytes())
+    ));
     Ok(path)
 }
 
@@ -342,9 +350,10 @@ fn main() -> Result<()> {
             source,
             out,
             strategy,
+            rebuild,
         } => match source.open()? {
             Source::Local(dir) => build_local(&dir, &out, strategy.into()),
-            Source::S3(src) => build_s3(src, strategy.into()),
+            Source::S3(src) => build_s3(src, strategy.into(), rebuild),
         },
         Cmd::Search {
             pattern,

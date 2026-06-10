@@ -34,9 +34,19 @@ const SEGMENT_COUNT_TARGET: usize = 8;
 /// Never merge segments whose combined postings exceed this many bytes.
 const MERGE_POSTINGS_CAP: u64 = 256 * 1024 * 1024;
 
-/// Etag recorded for docs that contributed no grams (vanished mid-build or
-/// undecodable): never matches a real listing etag, so the next run retries.
-const TOMBSTONE_ETAG: &str = "";
+/// Prefix marking docs that contributed no grams (vanished mid-build or
+/// undecodable). The failed etag rides along so the diff retries the doc
+/// only when the OBJECT changes — a permanently undecodable object cannot
+/// force a refetch every run. NUL never appears in real S3 etags.
+const TOMBSTONE_PREFIX: char = '\u{0}';
+
+fn tombstone(etag: &str) -> String {
+    format!("{TOMBSTONE_PREFIX}{etag}")
+}
+
+fn is_tombstone(etag: &str) -> bool {
+    etag.starts_with(TOMBSTONE_PREFIX)
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SegmentMeta {
@@ -85,10 +95,23 @@ fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
     Ok(list)
 }
 
-fn load_segment_list(store: &dyn BlobStore) -> Result<Option<SegmentList>> {
-    match store.get("segments.bin") {
-        Ok(bytes) => Ok(Some(parse_segment_list(&bytes)?)),
-        Err(_) => Ok(None),
+enum RootState {
+    Loaded(SegmentList),
+    Absent,
+    /// Present but undecodable (old format, corruption): a definitive
+    /// rebuild signal, unlike a transient store failure which is `Err`.
+    Unreadable(String),
+}
+
+/// A failing store is an error so a transient outage can never silently
+/// trigger a full rebuild; absence and unreadability are first-class states.
+fn load_segment_list(store: &dyn BlobStore) -> Result<RootState> {
+    match store.get("segments.bin").context("reading segments.bin")? {
+        None => Ok(RootState::Absent),
+        Some(bytes) => match parse_segment_list(&bytes) {
+            Ok(list) => Ok(RootState::Loaded(list)),
+            Err(err) => Ok(RootState::Unreadable(format!("{err:#}"))),
+        },
     }
 }
 
@@ -118,18 +141,26 @@ fn cached_blob(
             return Ok(bytes);
         }
     }
-    let bytes = store.get(&segment_blob(seg_id, name))?;
+    let bytes = store
+        .get(&segment_blob(seg_id, name))?
+        .with_context(|| format!("segment blob {name} of {seg_id} missing from the store"))?;
     anyhow::ensure!(
         bytes.len() as u64 == expected_len,
         "segment blob {name} of {seg_id} is {} bytes, expected {expected_len}",
         bytes.len()
     );
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = cache_path.with_file_name(format!("{name}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, &cache_path)?;
+    // Cache population is best-effort: a concurrent eviction (another search
+    // process opening a newer index) may yank this directory mid-write, and
+    // that must not fail a search that already holds the bytes.
+    let cache = || -> std::io::Result<()> {
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = cache_path.with_file_name(format!("{name}.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &cache_path)
+    };
+    cache().ok();
     Ok(bytes)
 }
 
@@ -154,18 +185,30 @@ pub fn update_index(
     cache_dir: &Path,
     strategy: Strategy,
     listing: &[(String, String)],
+    rebuild: bool,
     make_corpus: &CorpusFactory<'_>,
 ) -> Result<UpdateReport> {
-    let existing = match load_segment_list(store) {
-        Ok(Some(list)) if list.strategy == strategy => list.segments,
-        Ok(Some(_)) => {
-            eprintln!("note: index strategy changed; rebuilding from scratch");
-            Vec::new()
-        }
-        Ok(None) => Vec::new(),
-        Err(err) => {
-            eprintln!("note: {err:#}; rebuilding from scratch");
-            Vec::new()
+    let mut forced = rebuild;
+    let existing = if rebuild {
+        eprintln!("note: --rebuild requested; re-ingesting everything");
+        Vec::new()
+    } else {
+        match load_segment_list(store)? {
+            RootState::Loaded(list) if list.strategy == strategy => list.segments,
+            RootState::Loaded(_) => {
+                eprintln!("note: index strategy changed; rebuilding from scratch");
+                forced = true;
+                Vec::new()
+            }
+            RootState::Absent => {
+                eprintln!("note: no existing index; building from scratch");
+                Vec::new()
+            }
+            RootState::Unreadable(reason) => {
+                eprintln!("note: {reason}; rebuilding from scratch");
+                forced = true;
+                Vec::new()
+            }
         }
     };
 
@@ -197,8 +240,9 @@ pub fn update_index(
     let mut to_add: Vec<(String, String)> = listing
         .iter()
         .filter(|(key, etag)| {
-            live.get(key.as_str())
-                .is_none_or(|(_, _, indexed_etag)| *indexed_etag != etag.as_str())
+            live.get(key.as_str()).is_none_or(|(_, _, indexed_etag)| {
+                *indexed_etag != etag.as_str() && *indexed_etag != tombstone(etag)
+            })
         })
         .cloned()
         .collect();
@@ -209,16 +253,23 @@ pub fn update_index(
         .collect();
     let mut newly_dead: Vec<(usize, u32)> = live
         .iter()
-        .filter(|(key, (_, _, etag))| listed.get(*key) != Some(etag))
+        .filter(|(key, (_, _, etag))| match listed.get(*key) {
+            Some(listed_etag) => {
+                let current: &str = etag;
+                current != *listed_etag && current != tombstone(listed_etag)
+            }
+            None => true,
+        })
         .map(|(_, &(seg_idx, local_id, _))| (seg_idx, local_id))
         .collect();
     newly_dead.sort_unstable();
 
-    if to_add.is_empty() && newly_dead.is_empty() {
+    let needs_compaction = existing.len() > SEGMENT_COUNT_TARGET;
+    if to_add.is_empty() && newly_dead.is_empty() && !forced && !needs_compaction {
         return Ok(UpdateReport {
             added: 0,
             removed: 0,
-            total_docs: live.len(),
+            total_docs: live_doc_count(&live),
             segments: existing.len(),
             compacted: false,
             up_to_date: true,
@@ -230,22 +281,14 @@ pub fn update_index(
     // Fold new tombstones into per-segment dead sets, then drop fully-dead
     // segments (their blobs stay as orphans for racing readers).
     let mut metas = existing;
-    for (seg_idx, group) in &newly_dead.iter().copied().fold(
-        Vec::<(usize, Vec<u32>)>::new(),
-        |mut groups, (seg_idx, id)| {
-            match groups.last_mut() {
-                Some((last_idx, ids)) if *last_idx == seg_idx => ids.push(id),
-                _ => groups.push((seg_idx, vec![id])),
-            }
-            groups
-        },
-    ) {
-        let mut dead = dead_sets[*seg_idx].clone();
-        dead.extend(group);
+    for group in newly_dead.chunk_by(|a, b| a.0 == b.0) {
+        let seg_idx = group[0].0;
+        let mut dead = dead_sets[seg_idx].clone();
+        dead.extend(group.iter().map(|&(_, id)| id));
         dead.sort_unstable();
         dead.dedup();
-        write_dead(store, &mut metas[*seg_idx], &dead)?;
-        dead_sets[*seg_idx] = dead;
+        write_dead(store, &mut metas[seg_idx], &dead)?;
+        dead_sets[seg_idx] = dead;
     }
     let mut keep: Vec<(SegmentMeta, Vec<u32>)> = metas
         .into_iter()
@@ -263,10 +306,7 @@ pub fn update_index(
 
     let compacted = maybe_compact(store, cache_dir, &mut keep)?;
 
-    let total_docs = keep
-        .iter()
-        .map(|(meta, dead)| meta.doc_count as usize - dead.len())
-        .sum();
+    let total_docs = live_after_update(store, cache_dir, &keep)?;
     let segments: Vec<SegmentMeta> = keep.into_iter().map(|(meta, _)| meta).collect();
     let count = segments.len();
     let list = SegmentList {
@@ -283,6 +323,38 @@ pub fn update_index(
         compacted,
         up_to_date: false,
     })
+}
+
+fn live_doc_count(live: &HashMap<&str, (usize, u32, &str)>) -> usize {
+    live.values()
+        .filter(|(_, _, etag)| !is_tombstone(etag))
+        .count()
+}
+
+/// Live (non-tombstoned) doc count over the final segment set.
+fn live_after_update(
+    store: &dyn BlobStore,
+    cache_dir: &Path,
+    keep: &[(SegmentMeta, Vec<u32>)],
+) -> Result<usize> {
+    let mut total = 0;
+    for (meta, dead) in keep {
+        let docs = parse_docs(&cached_blob(
+            store,
+            cache_dir,
+            &meta.seg_id,
+            "docs.bin",
+            meta.docs_len,
+        )?)?;
+        total += docs
+            .iter()
+            .enumerate()
+            .filter(|(local_id, (_, etag))| {
+                dead.binary_search(&(*local_id as u32)).is_err() && !is_tombstone(etag)
+            })
+            .count();
+    }
+    Ok(total)
 }
 
 fn load_dead(store: &dyn BlobStore, cache_dir: &Path, meta: &SegmentMeta) -> Result<Vec<u32>> {
@@ -321,7 +393,8 @@ fn write_segment(
     let (fst_bytes, postings_buf, ungrammed) = crate::build_index_bytes(corpus, strategy)?;
     let mut table: DocsTable = docs.to_vec();
     for id in &ungrammed {
-        table[*id as usize].1 = TOMBSTONE_ETAG.to_owned();
+        let etag = table[*id as usize].1.clone();
+        table[*id as usize].1 = tombstone(&etag);
     }
     put_segment_blobs(store, &fst_bytes, &postings_buf, &table)
 }
@@ -427,7 +500,9 @@ fn merge_segments(
             "terms.fst",
             meta.terms_fst_len,
         )?;
-        let postings_bytes = store.get(&segment_blob(&meta.seg_id, "postings.bin"))?;
+        let postings_bytes = store
+            .get(&segment_blob(&meta.seg_id, "postings.bin"))?
+            .with_context(|| format!("postings.bin of {} missing from the store", meta.seg_id))?;
         anyhow::ensure!(
             postings_bytes.len() as u64 == meta.postings_len,
             "postings.bin of {} is {} bytes, expected {}",
@@ -452,18 +527,8 @@ fn merge_segments(
                 .extend(ids.into_iter().filter_map(|id| remap[id as usize]));
         }
     }
-    let mut postings_buf: Vec<u8> = Vec::new();
-    let mut builder = fst::MapBuilder::new(Vec::new())?;
-    for (gram, mut ids) in postings {
-        ids.sort_unstable();
-        ids.dedup();
-        let offset = postings_buf.len() as u64;
-        for id in &ids {
-            postings_buf.extend_from_slice(&id.to_le_bytes());
-        }
-        builder.insert(gram, crate::eval::pack_posting(offset, ids.len())?)?;
-    }
-    let (meta, _) = put_segment_blobs(store, &builder.into_inner()?, &postings_buf, &table)?;
+    let (fst_bytes, postings_buf) = crate::serialize_postings(postings)?;
+    let (meta, _) = put_segment_blobs(store, &fst_bytes, &postings_buf, &table)?;
     Ok(meta)
 }
 
@@ -488,6 +553,7 @@ impl SegmentedReader {
     pub fn open(store: Box<dyn BlobStore>, cache_dir: &Path) -> Result<SegmentedReader> {
         let bytes = store
             .get("segments.bin")
+            .context("reading segments.bin")?
             .context("no index found — run `holys3 index` first")?;
         let list = parse_segment_list(&bytes)?;
         let mut segments = Vec::with_capacity(list.segments.len());
@@ -622,6 +688,14 @@ impl crate::IndexReader for SegmentedReader {
                     })
                     .collect()
             })?;
+            if let Some(&bad) = ids.iter().find(|&&id| id >= segment.meta.doc_count) {
+                anyhow::bail!(
+                    "posting block of segment {} references doc {bad} >= doc_count {}; \
+                     the index is corrupt — run `holys3 index --rebuild`",
+                    segment.meta.seg_id,
+                    segment.meta.doc_count
+                );
+            }
             let live: Vec<DocId> = ids
                 .into_iter()
                 .filter(|id| segment.dead.binary_search(id).is_err())
@@ -632,7 +706,7 @@ impl crate::IndexReader for SegmentedReader {
             let docs = self.segment_docs(segment)?;
             keys.extend(live.into_iter().filter_map(|id| {
                 let (key, etag) = &docs[id as usize];
-                if etag == TOMBSTONE_ETAG {
+                if is_tombstone(etag) {
                     return None;
                 }
                 if key_prefix.is_some_and(|prefix| !key.starts_with(prefix)) {
