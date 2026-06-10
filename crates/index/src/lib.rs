@@ -4,11 +4,13 @@
 mod eval;
 mod search;
 
-pub use search::{search_collect, search_streaming, MatchSink, NullSink, SinkFlow};
+pub use search::{search_collect, search_streaming, KeyScope, MatchSink, NullSink, SinkFlow};
 
 use anyhow::{Context, Result};
 use eval::Selection;
-use holys3_core::{decode_body, grams_index, hash_ngram, BlobStore, Corpus, DocId, Strategy};
+use holys3_core::{
+    decode_body, grams_index, hash_ngram, BlobStore, Corpus, DocFetcher, DocId, Strategy,
+};
 use holys3_query::Query;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -55,19 +57,29 @@ pub struct IndexStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchStats {
-    /// Sorted doc ids with at least one verified match.
-    pub hits: Vec<DocId>,
+    /// Sorted keys of docs with at least one verified match.
+    pub hits: Vec<String>,
     pub candidates: usize,
     pub total_docs: usize,
     pub bytes_fetched: usize,
 }
 
 pub trait IndexReader {
-    fn docs(&self) -> &[(DocId, String)];
     fn strategy(&self) -> Strategy;
-    /// Sorted candidate doc ids: a superset of the docs that can match.
-    fn candidates(&self, q: &Query) -> Result<Vec<DocId>>;
+    fn total_docs(&self) -> usize;
+    /// Candidate object keys: a superset of the docs that can match.
+    /// `key_prefix` lets implementations prune whole index regions before
+    /// any fetch; the engine re-applies it per key regardless.
+    fn candidate_keys(&self, q: &Query, key_prefix: Option<&str>) -> Result<Vec<String>>;
     fn stats(&self) -> IndexStats;
+}
+
+/// Map candidate local ids to keys, applying the prefix filter.
+fn ids_to_keys(docs: &[(DocId, String)], ids: Vec<DocId>, key_prefix: Option<&str>) -> Vec<String> {
+    ids.into_iter()
+        .map(|id| docs[id as usize].1.clone())
+        .filter(|key| key_prefix.is_none_or(|prefix| key.starts_with(prefix)))
+        .collect()
 }
 
 fn decode_ids(bytes: &[u8], count: u32) -> Result<Vec<DocId>> {
@@ -248,17 +260,24 @@ impl MmapIndexReader {
     }
 }
 
-impl IndexReader for MmapIndexReader {
-    fn docs(&self) -> &[(DocId, String)] {
-        &self.docs
+impl MmapIndexReader {
+    /// All doc keys in this index (id order). Local-mode helper.
+    pub fn doc_keys(&self) -> impl Iterator<Item = &str> {
+        self.docs.iter().map(|(_, key)| key.as_str())
     }
+}
 
+impl IndexReader for MmapIndexReader {
     fn strategy(&self) -> Strategy {
         self.strategy
     }
 
-    fn candidates(&self, q: &Query) -> Result<Vec<DocId>> {
-        candidates_with(&self.map, &self.docs, q, |needed| {
+    fn total_docs(&self) -> usize {
+        self.docs.len()
+    }
+
+    fn candidate_keys(&self, q: &Query, key_prefix: Option<&str>) -> Result<Vec<String>> {
+        let ids = candidates_with(&self.map, &self.docs, q, |needed| {
             needed
                 .iter()
                 .map(|(&offset, &count)| {
@@ -273,7 +292,8 @@ impl IndexReader for MmapIndexReader {
                     Ok((offset, decode_ids(bytes, count)?))
                 })
                 .collect()
-        })
+        })?;
+        Ok(ids_to_keys(&self.docs, ids, key_prefix))
     }
 
     fn stats(&self) -> IndexStats {
@@ -384,16 +404,16 @@ fn read_cached_blob(store: &dyn BlobStore, cache_path: &Path, store_name: &str) 
 }
 
 impl IndexReader for StoreIndexReader {
-    fn docs(&self) -> &[(DocId, String)] {
-        &self.docs
-    }
-
     fn strategy(&self) -> Strategy {
         self.strategy
     }
 
-    fn candidates(&self, q: &Query) -> Result<Vec<DocId>> {
-        candidates_with(&self.map, &self.docs, q, |needed| {
+    fn total_docs(&self) -> usize {
+        self.docs.len()
+    }
+
+    fn candidate_keys(&self, q: &Query, key_prefix: Option<&str>) -> Result<Vec<String>> {
+        let ids = candidates_with(&self.map, &self.docs, q, |needed| {
             let ranges = needed
                 .iter()
                 .map(|(&offset, &count)| (offset, u64::from(count) * 4))
@@ -410,7 +430,8 @@ impl IndexReader for StoreIndexReader {
                 .zip(blocks)
                 .map(|((&offset, &count), bytes)| Ok((offset, decode_ids(&bytes, count)?)))
                 .collect()
-        })
+        })?;
+        Ok(ids_to_keys(&self.docs, ids, key_prefix))
     }
 
     fn stats(&self) -> IndexStats {
@@ -464,6 +485,22 @@ impl Corpus for LocalCorpus {
     }
 }
 
+/// Search-side fetch for local files: the key IS the path.
+pub struct LocalFetcher;
+
+impl DocFetcher for LocalFetcher {
+    fn fetch_each(
+        &self,
+        keys: &[String],
+        consume: &mut dyn FnMut(usize, Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        for (idx, key) in keys.iter().enumerate() {
+            consume(idx, std::fs::read(key)?)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,10 +523,10 @@ mod tests {
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
             let (_d, r) = build_tmp(&c, strategy);
             let cands = r
-                .candidates(&holys3_query::plan("world", r.strategy()).unwrap())
+                .candidate_keys(&holys3_query::plan("world", r.strategy()).unwrap(), None)
                 .unwrap();
-            assert!(cands.contains(&0));
-            assert!(cands.iter().all(|id| [0, 1].contains(id)));
+            assert!(cands.iter().any(|key| key == "x"));
+            assert!(cands.iter().all(|key| key == "x" || key == "y"));
         }
     }
 
@@ -498,7 +535,7 @@ mod tests {
         let c = MemCorpus::new(vec![(0, "x".into())], vec![b"abcdef".to_vec()]);
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
             let (_d, r) = build_tmp(&c, strategy);
-            assert_eq!(r.candidates(&Query::All).unwrap(), vec![0]);
+            assert_eq!(r.candidate_keys(&Query::All, None).unwrap(), vec!["x"]);
         }
     }
 
@@ -512,14 +549,16 @@ mod tests {
         let (matches, stats) = search_collect(&r, &c, "world").unwrap();
         assert_eq!(
             matches,
-            vec![Match {
-                doc: 0,
-                line: 1,
-                col: 5,
-                text: "abc world".into(),
-            }]
+            vec![(
+                "x".to_owned(),
+                Match {
+                    line: 1,
+                    col: 5,
+                    text: "abc world".into(),
+                }
+            )]
         );
-        assert_eq!(stats.hits, vec![0]);
+        assert_eq!(stats.hits, vec!["x"]);
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.total_docs, 2);
         assert_eq!(stats.bytes_fetched, b"abc world".len());
@@ -536,10 +575,10 @@ mod tests {
             ],
         );
         let (_d, r) = build_tmp(&c, Strategy::Trigram);
-        let stats = search_streaming(&r, &c, "world", None, &NullSink).unwrap();
+        let stats = search_streaming(&r, &c, "world", KeyScope::default(), &NullSink).unwrap();
         let (_, full_stats) = search_collect(&r, &c, "world").unwrap();
         assert_eq!(stats.hits, full_stats.hits);
-        assert_eq!(stats.hits, vec![0, 2]);
+        assert_eq!(stats.hits, vec!["x", "z"]);
     }
 
     #[test]
@@ -549,9 +588,12 @@ mod tests {
             vec![b"abc world".to_vec(), b"abc world".to_vec()],
         );
         let (_d, r) = build_tmp(&c, Strategy::Trigram);
-        let filter = |key: &str| key.starts_with("logs/");
-        let stats = search_streaming(&r, &c, "world", Some(&filter), &NullSink).unwrap();
-        assert_eq!(stats.hits, vec![0]);
+        let scope = KeyScope {
+            prefix: Some("logs/"),
+            matches: None,
+        };
+        let stats = search_streaming(&r, &c, "world", scope, &NullSink).unwrap();
+        assert_eq!(stats.hits, vec!["logs/a"]);
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.bytes_fetched, b"abc world".len());
     }
@@ -573,9 +615,13 @@ mod tests {
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
             let (_d, r) = build_tmp(&c, strategy);
             let (matches, stats) = search_collect(&r, &c, "needle").unwrap();
-            assert_eq!(stats.hits, vec![0, 1], "strategy {strategy:?}");
-            assert_eq!(matches[0].line, 2);
-            assert_eq!(matches[0].text, "needle in second member");
+            assert_eq!(
+                stats.hits,
+                vec!["a.log.gz", "b.log"],
+                "strategy {strategy:?}"
+            );
+            assert_eq!(matches[0].1.line, 2);
+            assert_eq!(matches[0].1.text, "needle in second member");
         }
     }
 
@@ -595,7 +641,8 @@ mod tests {
             .collect();
         let c = MemCorpus::new(docs, bodies);
         let (_d, r) = build_tmp(&c, Strategy::Trigram);
-        let stats = search_streaming(&r, &c, "needle", None, &StopAfterFirst).unwrap();
+        let stats =
+            search_streaming(&r, &c, "needle", KeyScope::default(), &StopAfterFirst).unwrap();
         // Stop is cooperative: at least one hit was reported, the search
         // ended Ok, and whatever was skipped is simply absent from hits.
         assert!(!stats.hits.is_empty());
@@ -647,12 +694,12 @@ mod tests {
             cache_dir.path(),
         )?;
 
-        let cands = reader.candidates(&Query::Gram(b"wor".to_vec()))?;
-        assert_eq!(cands, vec![0]);
+        let cands = reader.candidate_keys(&Query::Gram(b"wor".to_vec()), None)?;
+        assert_eq!(cands, vec!["x"]);
         let calls_after_hit = range_calls.get();
         assert!(calls_after_hit >= 1);
 
-        let cands = reader.candidates(&Query::Gram(b"zzz".to_vec()))?;
+        let cands = reader.candidate_keys(&Query::Gram(b"zzz".to_vec()), None)?;
         assert!(cands.is_empty());
         assert_eq!(range_calls.get(), calls_after_hit);
         Ok(())
@@ -677,7 +724,7 @@ mod tests {
             Box::new(LocalBlobStore::new(store_dir.path())),
             cache_dir.path(),
         )?;
-        assert_eq!(reader.docs().len(), 1);
+        assert_eq!(reader.total_docs(), 1);
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 mod common;
 
 use common::{corpus, gzipped_corpus, PATTERNS};
-use holys3_core::{scan_matching_docs, Corpus, DocId};
+use holys3_core::{scan_matching_docs, Corpus};
 use holys3_index::{build_to_dir, search_collect, MmapIndexReader};
 
 #[test]
@@ -16,7 +16,7 @@ fn index_equals_scan_for_many_patterns() {
             build_to_dir(&c, dir.path(), strategy).unwrap();
             let reader = MmapIndexReader::open(dir.path()).unwrap();
             for p in PATTERNS {
-                let indexed: Vec<DocId> = search_collect(&reader, &c, p).unwrap().1.hits;
+                let indexed: Vec<String> = search_collect(&reader, &c, p).unwrap().1.hits;
                 let re = regex::bytes::Regex::new(p).unwrap();
                 let oracle = scan_decoded(&c, &re);
                 assert_eq!(
@@ -30,7 +30,7 @@ fn index_equals_scan_for_many_patterns() {
 
 /// Oracle over decompressed bodies — searches must behave as if every object
 /// were plain text.
-fn scan_decoded(c: &dyn Corpus, re: &regex::bytes::Regex) -> Vec<DocId> {
+fn scan_decoded(c: &dyn Corpus, re: &regex::bytes::Regex) -> Vec<String> {
     let decoded = common::decoded_corpus(c);
     scan_matching_docs(&decoded, re).unwrap()
 }

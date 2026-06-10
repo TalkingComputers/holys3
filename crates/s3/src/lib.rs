@@ -6,7 +6,7 @@ pub mod fetch;
 mod sso;
 
 use anyhow::Context;
-use holys3_core::{BlobStore, Corpus, DocId};
+use holys3_core::{BlobStore, Corpus, DocFetcher, DocId};
 use holys3_sigv4::Credentials;
 
 pub use client::S3Client;
@@ -228,7 +228,7 @@ impl BlobStore for S3BlobStore {
     }
 }
 
-/// Corpus over an S3 prefix. Loads object list eagerly; fetches bytes on demand.
+/// Corpus over a fixed S3 object list — the index BUILD side.
 pub struct S3Corpus {
     client: S3Client,
     bucket: String,
@@ -242,10 +242,6 @@ impl S3Corpus {
             .enumerate()
             .map(|(i, o)| (i as DocId, o.key.clone()))
             .collect();
-        S3Corpus::from_docs(client, bucket, docs)
-    }
-
-    pub fn from_docs(client: S3Client, bucket: String, docs: Vec<(DocId, String)>) -> S3Corpus {
         S3Corpus {
             client,
             bucket,
@@ -266,34 +262,64 @@ impl Corpus for S3Corpus {
             .with_context(|| format!("s3://{}/{key} not found", self.bucket))
     }
 
-    /// Concurrent batch fetch. Objects deleted since indexing (404) are
-    /// skipped with a warning — the index entry is stale, not the search.
+    /// Concurrent batch fetch. Objects deleted since listing (404) are
+    /// skipped with a warning.
     fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, Vec<u8>)>> {
-        let mut docs = Vec::with_capacity(ids.len());
-        self.fetch_each(ids, &mut |id, bytes| {
-            docs.push((id, bytes));
-            Ok(())
-        })?;
-        Ok(docs)
-    }
-
-    /// Concurrent streaming fetch with the same stale-404 skip policy.
-    fn fetch_each(
-        &self,
-        ids: &[DocId],
-        consume: &mut dyn FnMut(DocId, Vec<u8>) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
         let keys = ids
             .iter()
             .map(|&id| (id, self.docs[id as usize].1.clone()))
             .collect::<Vec<_>>();
+        let mut docs = Vec::with_capacity(keys.len());
         self.client
             .get_each(&self.bucket, keys, &mut |id, bytes| match bytes {
-                Some(bytes) => consume(id, bytes),
+                Some(bytes) => {
+                    docs.push((id, bytes));
+                    Ok(())
+                }
+                None => {
+                    eprintln!(
+                        "warning: s3://{}/{} vanished since listing; skipping",
+                        self.bucket, self.docs[id as usize].1
+                    );
+                    Ok(())
+                }
+            })?;
+        Ok(docs)
+    }
+}
+
+/// Fetches objects by key for search verification — no doc table at all.
+pub struct S3Fetcher {
+    client: S3Client,
+    bucket: String,
+}
+
+impl S3Fetcher {
+    pub fn new(client: S3Client, bucket: String) -> S3Fetcher {
+        S3Fetcher { client, bucket }
+    }
+}
+
+impl DocFetcher for S3Fetcher {
+    /// Concurrent streaming fetch. Objects deleted since indexing (404) are
+    /// skipped with a warning — the index entry is stale, not the search.
+    fn fetch_each(
+        &self,
+        keys: &[String],
+        consume: &mut dyn FnMut(usize, Vec<u8>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let indexed_keys = keys
+            .iter()
+            .enumerate()
+            .map(|(idx, key)| (idx as DocId, key.clone()))
+            .collect::<Vec<_>>();
+        self.client
+            .get_each(&self.bucket, indexed_keys, &mut |idx, bytes| match bytes {
+                Some(bytes) => consume(idx as usize, bytes),
                 None => {
                     eprintln!(
                         "warning: s3://{}/{} vanished since indexing; skipping",
-                        self.bucket, self.docs[id as usize].1
+                        self.bucket, keys[idx as usize]
                     );
                     Ok(())
                 }

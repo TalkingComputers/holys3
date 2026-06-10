@@ -1,9 +1,7 @@
-use holys3_core::{Corpus, DocId, Strategy};
-use holys3_index::{
-    build_to_store, compute_build_id, search_collect, IndexReader, StoreIndexReader,
-};
+use holys3_core::{DocFetcher, Strategy};
+use holys3_index::{build_to_store, compute_build_id, search_collect, StoreIndexReader};
 use holys3_s3::resolve_credentials;
-use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus};
+use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus, S3Fetcher};
 
 #[test]
 fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
@@ -32,33 +30,30 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
     build_to_store(&corpus, &store, Strategy::Trigram, &build_id)?;
     let cache_dir = tempfile::tempdir()?;
     let reader = StoreIndexReader::open(
-        Box::new(S3BlobStore::new(client, bucket, String::new())),
+        Box::new(S3BlobStore::new(
+            client.clone(),
+            bucket.clone(),
+            String::new(),
+        )),
         cache_dir.path(),
     )?;
-    assert_hit(&reader, &corpus, "world", "b.txt")?;
-    assert_hit(&reader, &corpus, "handleClick", "a.rs")?;
-    assert_hit(&reader, &corpus, "EMAIL", "c/d.log")?;
+    let fetcher = S3Fetcher::new(client, bucket);
+    assert_hit(&reader, &fetcher, "world", "b.txt")?;
+    assert_hit(&reader, &fetcher, "handleClick", "a.rs")?;
+    assert_hit(&reader, &fetcher, "EMAIL", "c/d.log")?;
     Ok(())
 }
 
 fn assert_hit(
     reader: &StoreIndexReader,
-    corpus: &dyn Corpus,
+    fetcher: &dyn DocFetcher,
     pattern: &str,
     expected_key: &str,
 ) -> anyhow::Result<()> {
-    let hits = search_collect(reader, corpus, pattern)?.1.hits;
-    let keys = hits
-        .iter()
-        .map(|id| key_for_doc(reader, *id))
-        .collect::<Vec<_>>();
+    let hits = search_collect(reader, fetcher, pattern)?.1.hits;
     assert!(
-        keys.iter().any(|key| key == expected_key),
-        "pattern {pattern} expected {expected_key}, got {keys:?}"
+        hits.iter().any(|key| key == expected_key),
+        "pattern {pattern} expected {expected_key}, got {hits:?}"
     );
     Ok(())
-}
-
-fn key_for_doc(reader: &StoreIndexReader, id: DocId) -> String {
-    reader.docs()[id as usize].1.clone()
 }

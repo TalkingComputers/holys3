@@ -1,9 +1,10 @@
 mod common;
 
 use common::{corpus, decoded_corpus, gzipped_corpus, PATTERNS};
-use holys3_core::{scan_matching_docs, Corpus, DocId, LocalBlobStore, Strategy};
+use holys3_core::{scan_matching_docs, Corpus, LocalBlobStore, Strategy};
 use holys3_index::{
-    build_to_store, compute_build_id, search_collect, search_streaming, NullSink, StoreIndexReader,
+    build_to_store, compute_build_id, search_collect, search_streaming, KeyScope, NullSink,
+    StoreIndexReader,
 };
 
 #[test]
@@ -27,14 +28,14 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
             )?;
             let decoded = decoded_corpus(&c);
             for p in PATTERNS {
-                let indexed: Vec<DocId> = search_collect(&reader, &c, p)?.1.hits;
+                let indexed: Vec<String> = search_collect(&reader, &c, p)?.1.hits;
                 let re = regex::bytes::Regex::new(p)?;
                 let oracle = scan_matching_docs(&decoded, &re)?;
                 assert_eq!(
                     indexed, oracle,
                     "corpus {label} strategy {strategy:?} pattern `{p}`: store index != scan"
                 );
-                let fast = search_streaming(&reader, &c, p, None, &NullSink)?.hits;
+                let fast = search_streaming(&reader, &c, p, KeyScope::default(), &NullSink)?.hits;
                 assert_eq!(
                     fast, oracle,
                     "corpus {label} strategy {strategy:?} pattern `{p}`: files-only path != scan"

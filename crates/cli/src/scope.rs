@@ -75,6 +75,10 @@ impl Scope {
         true
     }
 
+    pub(crate) fn key_prefix(&self) -> Option<&str> {
+        self.key_prefix.as_deref()
+    }
+
     /// One stderr note after filtering, so a time window over undated keys
     /// is never silently meaningless.
     pub(crate) fn report(&self) {

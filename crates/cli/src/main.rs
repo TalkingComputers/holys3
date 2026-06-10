@@ -2,14 +2,14 @@ mod scope;
 
 use anyhow::Result;
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
-use holys3_core::{Corpus, Match, Strategy};
+use holys3_core::{Corpus, DocFetcher, Match, Strategy};
 use holys3_index::{
-    build_to_dir, build_to_store, compute_build_id, search_streaming, IndexReader, LocalCorpus,
-    MatchSink, MmapIndexReader, SinkFlow, StoreIndexReader,
+    build_to_dir, build_to_store, compute_build_id, search_streaming, IndexReader, KeyScope,
+    LocalCorpus, LocalFetcher, MatchSink, MmapIndexReader, SinkFlow, StoreIndexReader,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, list_prefix, normalize_prefix, region_from_env,
-    s3_client_from_env, ObjectMeta, S3BlobStore, S3Client, S3Corpus,
+    s3_client_from_env, ObjectMeta, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
 };
 use scope::Scope;
 use std::io::Write;
@@ -190,15 +190,13 @@ fn build_s3(src: S3Source, strategy: Strategy) -> Result<()> {
 
 fn search_local(
     pattern: &str,
-    dir: &Path,
     index: &Path,
     files_only: bool,
     stats: bool,
     scope: Option<&Scope>,
 ) -> Result<()> {
-    let corpus = LocalCorpus::new(dir)?;
     let reader = MmapIndexReader::open(index)?;
-    emit_results(&reader, &corpus, pattern, files_only, stats, scope)
+    emit_results(&reader, &LocalFetcher, pattern, files_only, stats, scope)
 }
 
 fn search_s3(
@@ -211,8 +209,8 @@ fn search_s3(
     let cache_dir = build_cache_dir(&src.bucket, &src.prefix)?;
     let store = S3BlobStore::new(src.client.clone(), src.bucket.clone(), src.prefix.clone());
     let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
-    let corpus = S3Corpus::from_docs(src.client, src.bucket, reader.docs().to_vec());
-    emit_results(&reader, &corpus, pattern, files_only, stats, scope)
+    let fetcher = S3Fetcher::new(src.client, src.bucket);
+    emit_results(&reader, &fetcher, pattern, files_only, stats, scope)
 }
 
 /// Prints each doc's results as verification completes (unordered across
@@ -255,7 +253,7 @@ impl MatchSink for PrintSink {
 
 fn emit_results(
     reader: &dyn IndexReader,
-    corpus: &dyn Corpus,
+    fetcher: &dyn DocFetcher,
     pattern: &str,
     files_only: bool,
     stats: bool,
@@ -266,15 +264,13 @@ fn emit_results(
         files_only,
     };
     let key_filter = scope.map(|scope| move |key: &str| scope.matches(key));
-    let search_stats = search_streaming(
-        reader,
-        corpus,
-        pattern,
-        key_filter
+    let key_scope = KeyScope {
+        prefix: scope.and_then(Scope::key_prefix),
+        matches: key_filter
             .as_ref()
-            .map(|filter| filter as &dyn Fn(&str) -> bool),
-        &sink,
-    )?;
+            .map(|filter| filter as &(dyn Fn(&str) -> bool + Sync)),
+    };
+    let search_stats = search_streaming(reader, fetcher, pattern, key_scope, &sink)?;
     if let Some(scope) = scope {
         scope.report();
     }
@@ -338,8 +334,8 @@ fn main() -> Result<()> {
         } => {
             let scope = Scope::from_args(key_prefix, key_regex, since, until)?;
             match source.open()? {
-                Source::Local(dir) => {
-                    search_local(&pattern, &dir, &index, files_only, stats, scope.as_ref())
+                Source::Local(_) => {
+                    search_local(&pattern, &index, files_only, stats, scope.as_ref())
                 }
                 Source::S3(src) => search_s3(src, &pattern, files_only, stats, scope.as_ref()),
             }
