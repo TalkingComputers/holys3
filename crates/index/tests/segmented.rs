@@ -309,3 +309,40 @@ fn gzipped_objects_and_prefix_pruning() -> Result<()> {
     assert_eq!(stats.hits, vec!["logs/2026/06/08/x.gz"]);
     Ok(())
 }
+
+#[test]
+fn corrupt_cache_self_heals_and_stale_segments_evict() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("a", b"hello world");
+    reindex(&bucket, store_dir.path(), cache.path(), Strategy::Trigram)?;
+    drop(SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache.path(),
+    )?);
+
+    // Same-length corruption of a cached terms.fst self-heals on open.
+    let seg_dir = std::fs::read_dir(cache.path())?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("one cached segment");
+    let fst_path = seg_dir.join("terms.fst");
+    let len = std::fs::metadata(&fst_path)?.len() as usize;
+    std::fs::write(&fst_path, vec![0u8; len])?;
+    assert_matches_oracle(&bucket, store_dir.path(), cache.path(), PATTERNS, "healed")?;
+
+    // Replacing the corpus retires the old segment; its cache dir goes too.
+    bucket.put("a", b"replacement world");
+    reindex(&bucket, store_dir.path(), cache.path(), Strategy::Trigram)?;
+    drop(SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache.path(),
+    )?);
+    assert!(
+        !seg_dir.exists(),
+        "stale segment cache dir should be evicted"
+    );
+    Ok(())
+}
