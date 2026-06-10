@@ -3,20 +3,19 @@
 
 mod eval;
 mod search;
+mod segment;
 
 pub use search::{search_collect, search_streaming, KeyScope, MatchSink, NullSink, SinkFlow};
+pub use segment::{update_index, CorpusFactory, SegmentedReader, UpdateReport};
 
 use anyhow::{Context, Result};
 use eval::Selection;
-use holys3_core::{
-    decode_body, grams_index, hash_ngram, BlobStore, Corpus, DocFetcher, DocId, Strategy,
-};
+use holys3_core::{decode_body, grams_index, hash_ngram, Corpus, DocFetcher, DocId, Strategy};
 use holys3_query::Query;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Docs are fetched and gram-extracted in chunks of this many, bounding build
 /// memory to one chunk of bodies instead of the whole corpus.
@@ -82,7 +81,7 @@ fn ids_to_keys(docs: &[(DocId, String)], ids: Vec<DocId>, key_prefix: Option<&st
         .collect()
 }
 
-fn decode_ids(bytes: &[u8], count: u32) -> Result<Vec<DocId>> {
+pub(crate) fn decode_ids(bytes: &[u8], count: u32) -> Result<Vec<DocId>> {
     let expected = usize::try_from(count)? * 4;
     anyhow::ensure!(
         bytes.len() == expected,
@@ -97,9 +96,10 @@ fn decode_ids(bytes: &[u8], count: u32) -> Result<Vec<DocId>> {
 
 /// Shared candidates pipeline: resolve grams against the term dict (no IO),
 /// fetch every needed posting block via `fetch_blocks`, evaluate purely.
-fn candidates_with(
-    map: &fst::Map<memmap2::Mmap>,
-    docs: &[(DocId, String)],
+/// Returns local ids in `0..doc_count`.
+pub(crate) fn candidates_with<D: AsRef<[u8]>>(
+    map: &fst::Map<D>,
+    doc_count: u32,
     q: &Query,
     fetch_blocks: impl FnOnce(&BTreeMap<u64, u32>) -> Result<BTreeMap<u64, Vec<DocId>>>,
 ) -> Result<Vec<DocId>> {
@@ -108,40 +108,60 @@ fn candidates_with(
     eval::blocks_needed(&resolved, &mut needed);
     let blocks = fetch_blocks(&needed)?;
     match eval::eval(&resolved, &blocks)? {
-        Selection::All => Ok(docs.iter().map(|&(id, _)| id).collect()),
+        Selection::All => Ok((0..doc_count).collect()),
         Selection::Ids(ids) => Ok(ids),
     }
 }
 
-fn build_index_bytes(corpus: &dyn Corpus, strategy: Strategy) -> Result<(Vec<u8>, Vec<u8>)> {
+/// Build terms.fst + postings.bin over the corpus. Also returns the ids of
+/// docs that contributed NO grams because they vanished mid-build (404) or
+/// failed to decompress — segment writers tombstone their etags so the next
+/// incremental run retries them.
+fn build_index_bytes(
+    corpus: &dyn Corpus,
+    strategy: Strategy,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<DocId>)> {
     let mut postings: BTreeMap<Vec<u8>, Vec<DocId>> = BTreeMap::new();
     let doc_keys = corpus.docs();
     let ids = doc_keys.iter().map(|&(id, _)| id).collect::<Vec<_>>();
-    let undecodable = AtomicUsize::new(0);
+    let mut ungrammed: Vec<DocId> = Vec::new();
     for chunk in ids.chunks(BUILD_FETCH_CHUNK) {
-        let docs = corpus
-            .fetch_many(chunk)?
+        let fetched = corpus.fetch_many(chunk)?;
+        let mut seen = vec![false; chunk.len()];
+        let base = chunk[0];
+        let docs = fetched
             .into_par_iter()
             .filter_map(
                 |(id, bytes)| match decode_body(&doc_keys[id as usize].1, bytes) {
                     Ok(text) => Some((id, grams_index(&text, strategy))),
                     Err(err) => {
                         eprintln!("warning: {err:#}; object excluded from index");
-                        undecodable.fetch_add(1, Ordering::Relaxed);
                         None
                     }
                 },
             )
             .collect::<Vec<_>>();
+        for (id, _) in &docs {
+            seen[(id - base) as usize] = true;
+        }
+        ungrammed.extend(
+            chunk
+                .iter()
+                .zip(&seen)
+                .filter(|(_, seen)| !**seen)
+                .map(|(&id, _)| id),
+        );
         for (id, grams) in docs {
             for gram in grams {
                 postings.entry(gram).or_default().push(id);
             }
         }
     }
-    let undecodable = undecodable.into_inner();
-    if undecodable > 0 {
-        eprintln!("warning: {undecodable} objects could not be decompressed and were excluded");
+    if !ungrammed.is_empty() {
+        eprintln!(
+            "warning: {} objects vanished or could not be decompressed and were excluded",
+            ungrammed.len()
+        );
     }
     let mut postings_buf: Vec<u8> = Vec::new();
     let mut builder = fst::MapBuilder::new(Vec::new())?;
@@ -154,7 +174,8 @@ fn build_index_bytes(corpus: &dyn Corpus, strategy: Strategy) -> Result<(Vec<u8>
         }
         builder.insert(gram, eval::pack_posting(offset, ids.len())?)?;
     }
-    Ok((builder.into_inner()?, postings_buf))
+    ungrammed.sort_unstable();
+    Ok((builder.into_inner()?, postings_buf, ungrammed))
 }
 
 fn make_manifest(
@@ -177,7 +198,7 @@ fn make_manifest(
 /// Write terms.fst + postings.bin + manifest.bin into `dir`.
 pub fn build_to_dir(corpus: &dyn Corpus, dir: &Path, strategy: Strategy) -> Result<()> {
     std::fs::create_dir_all(dir)?;
-    let (fst_bytes, postings_buf) = build_index_bytes(corpus, strategy)?;
+    let (fst_bytes, postings_buf, _) = build_index_bytes(corpus, strategy)?;
     let ids = corpus
         .docs()
         .iter()
@@ -199,7 +220,7 @@ pub fn build_to_dir(corpus: &dyn Corpus, dir: &Path, strategy: Strategy) -> Resu
 /// Content-addressed build id. Includes the strategy and index format so a
 /// rebuild of the same corpus with different settings can never collide with
 /// (and silently mix into) a cached build under `builds/<id>`.
-pub fn compute_build_id(objects: &[(String, String)], strategy: Strategy) -> String {
+fn compute_build_id(objects: &[(String, String)], strategy: Strategy) -> String {
     let mut objects = objects.iter().collect::<Vec<_>>();
     objects.sort_unstable();
     let mut bytes = format!("format={INDEX_FORMAT};strategy={strategy:?}\n").into_bytes();
@@ -210,25 +231,6 @@ pub fn compute_build_id(objects: &[(String, String)], strategy: Strategy) -> Str
         bytes.push(b'\n');
     }
     format!("{:016x}", hash_ngram(&bytes))
-}
-
-pub fn build_to_store(
-    corpus: &dyn Corpus,
-    store: &dyn BlobStore,
-    strategy: Strategy,
-    build_id: &str,
-) -> Result<()> {
-    let (fst_bytes, postings_buf) = build_index_bytes(corpus, strategy)?;
-    let manifest = make_manifest(corpus, strategy, build_id, &fst_bytes, &postings_buf)?;
-    let base = format!("builds/{build_id}");
-    store.put(&format!("{base}/terms.fst"), &fst_bytes)?;
-    store.put(&format!("{base}/postings.bin"), &postings_buf)?;
-    store.put(
-        &format!("{base}/manifest.bin"),
-        &postcard::to_allocvec(&manifest)?,
-    )?;
-    store.put("CURRENT", build_id.as_bytes())?;
-    Ok(())
 }
 
 pub struct MmapIndexReader {
@@ -277,7 +279,7 @@ impl IndexReader for MmapIndexReader {
     }
 
     fn candidate_keys(&self, q: &Query, key_prefix: Option<&str>) -> Result<Vec<String>> {
-        let ids = candidates_with(&self.map, &self.docs, q, |needed| {
+        let ids = candidates_with(&self.map, self.docs.len() as u32, q, |needed| {
             needed
                 .iter()
                 .map(|(&offset, &count)| {
@@ -301,144 +303,6 @@ impl IndexReader for MmapIndexReader {
             distinct_grams: self.map.len() as u64,
             terms_fst_bytes: self.map.as_fst().as_bytes().len() as u64,
             postings_bytes: self.postings.len() as u64,
-        }
-    }
-}
-
-pub struct StoreIndexReader {
-    map: fst::Map<memmap2::Mmap>,
-    docs: Vec<(DocId, String)>,
-    strategy: Strategy,
-    store_postings_name: String,
-    store: Box<dyn BlobStore>,
-    terms_fst_len: u64,
-    postings_len: u64,
-}
-
-impl StoreIndexReader {
-    pub fn open(store: Box<dyn BlobStore>, cache_dir: &Path) -> Result<StoreIndexReader> {
-        let build_id = String::from_utf8(store.get("CURRENT")?)?;
-        let build_cache_dir = cache_dir.join(&build_id);
-        let (map, manifest) = match open_cached_build(store.as_ref(), &build_cache_dir, &build_id) {
-            Ok(parts) => parts,
-            Err(_) => {
-                // Cached blobs can be truncated or corrupt; refetch once.
-                std::fs::remove_dir_all(&build_cache_dir).ok();
-                open_cached_build(store.as_ref(), &build_cache_dir, &build_id)?
-            }
-        };
-        evict_stale_builds(cache_dir, &build_id);
-        Ok(StoreIndexReader {
-            map,
-            docs: manifest.docs,
-            strategy: manifest.strategy,
-            store_postings_name: format!("builds/{build_id}/postings.bin"),
-            store,
-            terms_fst_len: manifest.terms_fst_len,
-            postings_len: manifest.postings_len,
-        })
-    }
-}
-
-fn open_cached_build(
-    store: &dyn BlobStore,
-    build_cache_dir: &Path,
-    build_id: &str,
-) -> Result<(fst::Map<memmap2::Mmap>, Manifest)> {
-    let manifest_bytes = read_cached_blob(
-        store,
-        &build_cache_dir.join("manifest.bin"),
-        &format!("builds/{build_id}/manifest.bin"),
-    )?;
-    let manifest = parse_manifest(&manifest_bytes)?;
-    anyhow::ensure!(
-        manifest.build_id == build_id,
-        "manifest build_id {} does not match CURRENT {build_id}",
-        manifest.build_id
-    );
-    let terms_path = build_cache_dir.join("terms.fst");
-    let terms_bytes =
-        read_cached_blob(store, &terms_path, &format!("builds/{build_id}/terms.fst"))?;
-    anyhow::ensure!(
-        u64::try_from(terms_bytes.len())? == manifest.terms_fst_len,
-        "terms.fst length mismatch"
-    );
-    let fst_file = std::fs::File::open(&terms_path)?;
-    let map = fst::Map::new(unsafe {
-        // The cache file was just written atomically and is never edited in place.
-        memmap2::Mmap::map(&fst_file)?
-    })?;
-    Ok((map, manifest))
-}
-
-fn evict_stale_builds(cache_dir: &Path, current: &str) {
-    let Ok(entries) = std::fs::read_dir(cache_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy() != current {
-            std::fs::remove_dir_all(entry.path()).ok();
-        }
-    }
-}
-
-/// Read a blob through the local cache; cache writes are atomic (temp +
-/// rename) so an interrupted write can never produce a half-written blob.
-fn read_cached_blob(store: &dyn BlobStore, cache_path: &Path, store_name: &str) -> Result<Vec<u8>> {
-    if let Ok(bytes) = std::fs::read(cache_path) {
-        return Ok(bytes);
-    }
-    let bytes = store.get(store_name)?;
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file_name = cache_path
-        .file_name()
-        .context("cache path has no file name")?
-        .to_string_lossy()
-        .into_owned();
-    let tmp = cache_path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, cache_path)?;
-    Ok(bytes)
-}
-
-impl IndexReader for StoreIndexReader {
-    fn strategy(&self) -> Strategy {
-        self.strategy
-    }
-
-    fn total_docs(&self) -> usize {
-        self.docs.len()
-    }
-
-    fn candidate_keys(&self, q: &Query, key_prefix: Option<&str>) -> Result<Vec<String>> {
-        let ids = candidates_with(&self.map, &self.docs, q, |needed| {
-            let ranges = needed
-                .iter()
-                .map(|(&offset, &count)| (offset, u64::from(count) * 4))
-                .collect::<Vec<_>>();
-            let blocks = self.store.get_ranges(&self.store_postings_name, &ranges)?;
-            anyhow::ensure!(
-                blocks.len() == ranges.len(),
-                "get_ranges returned {} blocks for {} ranges",
-                blocks.len(),
-                ranges.len()
-            );
-            needed
-                .iter()
-                .zip(blocks)
-                .map(|((&offset, &count), bytes)| Ok((offset, decode_ids(&bytes, count)?)))
-                .collect()
-        })?;
-        Ok(ids_to_keys(&self.docs, ids, key_prefix))
-    }
-
-    fn stats(&self) -> IndexStats {
-        IndexStats {
-            distinct_grams: self.map.len() as u64,
-            terms_fst_bytes: self.terms_fst_len,
-            postings_bytes: self.postings_len,
         }
     }
 }
@@ -505,7 +369,7 @@ impl DocFetcher for LocalFetcher {
 mod tests {
     use super::*;
     use holys3_core::testutil::MemCorpus;
-    use holys3_core::{LocalBlobStore, Match};
+    use holys3_core::Match;
 
     fn build_tmp(c: &MemCorpus, strategy: Strategy) -> (tempfile::TempDir, MmapIndexReader) {
         let dir = tempfile::tempdir().unwrap();
@@ -647,102 +511,5 @@ mod tests {
         // ended Ok, and whatever was skipped is simply absent from hits.
         assert!(!stats.hits.is_empty());
         assert_eq!(stats.candidates, 100);
-    }
-
-    #[test]
-    fn store_reader_round_trips_and_skips_absent_grams() -> Result<()> {
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        struct CountingStore {
-            inner: LocalBlobStore,
-            range_calls: Rc<Cell<usize>>,
-        }
-
-        impl BlobStore for CountingStore {
-            fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
-                self.inner.put(name, bytes)
-            }
-
-            fn get(&self, name: &str) -> Result<Vec<u8>> {
-                self.inner.get(name)
-            }
-
-            fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
-                self.range_calls.set(self.range_calls.get() + 1);
-                self.inner.get_range(name, start, len)
-            }
-        }
-
-        let corpus = MemCorpus::new(
-            vec![(0, "x".into()), (1, "y".into())],
-            vec![b"hello world".to_vec(), b"goodbye moon".to_vec()],
-        );
-        let store_dir = tempfile::tempdir()?;
-        let range_calls = Rc::new(Cell::new(0));
-        let store = CountingStore {
-            inner: LocalBlobStore::new(store_dir.path()),
-            range_calls: Rc::clone(&range_calls),
-        };
-        build_to_store(&corpus, &store, Strategy::Trigram, "test-build")?;
-        let cache_dir = tempfile::tempdir()?;
-        let reader = StoreIndexReader::open(
-            Box::new(CountingStore {
-                inner: LocalBlobStore::new(store_dir.path()),
-                range_calls: Rc::clone(&range_calls),
-            }),
-            cache_dir.path(),
-        )?;
-
-        let cands = reader.candidate_keys(&Query::Gram(b"wor".to_vec()), None)?;
-        assert_eq!(cands, vec!["x"]);
-        let calls_after_hit = range_calls.get();
-        assert!(calls_after_hit >= 1);
-
-        let cands = reader.candidate_keys(&Query::Gram(b"zzz".to_vec()), None)?;
-        assert!(cands.is_empty());
-        assert_eq!(range_calls.get(), calls_after_hit);
-        Ok(())
-    }
-
-    #[test]
-    fn store_reader_heals_corrupt_cache() -> Result<()> {
-        let corpus = MemCorpus::new(vec![(0, "x".into())], vec![b"hello world".to_vec()]);
-        let store_dir = tempfile::tempdir()?;
-        let store = LocalBlobStore::new(store_dir.path());
-        build_to_store(&corpus, &store, Strategy::Trigram, "build-a")?;
-
-        let cache_dir = tempfile::tempdir()?;
-        drop(StoreIndexReader::open(
-            Box::new(LocalBlobStore::new(store_dir.path())),
-            cache_dir.path(),
-        )?);
-        let cached_manifest = cache_dir.path().join("build-a/manifest.bin");
-        std::fs::write(&cached_manifest, b"garbage")?;
-
-        let reader = StoreIndexReader::open(
-            Box::new(LocalBlobStore::new(store_dir.path())),
-            cache_dir.path(),
-        )?;
-        assert_eq!(reader.total_docs(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn store_reader_evicts_stale_builds() -> Result<()> {
-        let corpus = MemCorpus::new(vec![(0, "x".into())], vec![b"hello world".to_vec()]);
-        let store_dir = tempfile::tempdir()?;
-        let store = LocalBlobStore::new(store_dir.path());
-        build_to_store(&corpus, &store, Strategy::Trigram, "build-b")?;
-
-        let cache_dir = tempfile::tempdir()?;
-        std::fs::create_dir_all(cache_dir.path().join("stale-build"))?;
-        drop(StoreIndexReader::open(
-            Box::new(LocalBlobStore::new(store_dir.path())),
-            cache_dir.path(),
-        )?);
-        assert!(!cache_dir.path().join("stale-build").exists());
-        assert!(cache_dir.path().join("build-b").exists());
-        Ok(())
     }
 }

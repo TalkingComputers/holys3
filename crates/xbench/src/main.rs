@@ -9,8 +9,8 @@ use gen::{
 };
 use holys3_core::{Corpus, DocFetcher, Strategy};
 use holys3_index::{
-    build_to_dir, build_to_store, compute_build_id, search_collect, IndexReader, LocalCorpus,
-    LocalFetcher, MmapIndexReader, StoreIndexReader,
+    build_to_dir, search_collect, update_index, IndexReader, LocalCorpus, LocalFetcher,
+    MmapIndexReader, SegmentedReader,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, s3_client_from_env, S3BlobStore, S3Client, S3Corpus,
@@ -213,18 +213,39 @@ fn upload_s3(manifest: &SeedManifest) -> Result<()> {
         manifest.docs.len(),
         objects.len()
     );
-    let object_ids = objects
+    let listing = objects
         .iter()
         .map(|object| (object.key.clone(), object.etag.clone()))
         .collect::<Vec<_>>();
-    let build_id = compute_build_id(&object_ids, Strategy::Sparse);
-    let corpus = S3Corpus::new(backend.client.clone(), backend.bucket.clone(), &objects);
-    let store = S3BlobStore::new(backend.client, backend.bucket.clone(), S3_PREFIX.to_owned());
-    build_to_store(&corpus, &store, Strategy::Sparse, &build_id)?;
+    let cache_dir = reports_dir().join("s3-cache");
+    let store = S3BlobStore::new(
+        backend.client.clone(),
+        backend.bucket.clone(),
+        S3_PREFIX.to_owned(),
+    );
+    let client = backend.client;
+    let bucket = backend.bucket.clone();
+    let report = update_index(&store, &cache_dir, Strategy::Sparse, &listing, &|keys| {
+        let objects = keys
+            .iter()
+            .map(|key| holys3_s3::ObjectMeta {
+                key: key.clone(),
+                etag: String::new(),
+                size: 0,
+            })
+            .collect::<Vec<_>>();
+        Ok(Box::new(S3Corpus::new(
+            client.clone(),
+            bucket.clone(),
+            &objects,
+        )))
+    })?;
     println!(
-        "s3://{}/{}/builds/{build_id}",
+        "s3://{}/{} ({} docs, {} segments)",
         backend.bucket,
-        build_index_namespace(S3_PREFIX)
+        build_index_namespace(S3_PREFIX),
+        report.total_docs,
+        report.segments
     );
     Ok(())
 }
@@ -298,7 +319,7 @@ fn run_s3(
         S3_PREFIX.to_owned(),
     );
     let cache_dir = reports_dir().join("s3-cache");
-    let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
+    let reader = SegmentedReader::open(Box::new(store), &cache_dir)?;
     let fetcher = S3Fetcher::new(backend.client.clone(), backend.bucket.clone());
     let single_fetcher = S3Fetcher::new(single_backend.client, backend.bucket.clone());
     let results = run_all(

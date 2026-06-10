@@ -4,8 +4,8 @@ use anyhow::Result;
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use holys3_core::{Corpus, DocFetcher, Match, Strategy};
 use holys3_index::{
-    build_to_dir, build_to_store, compute_build_id, search_streaming, IndexReader, KeyScope,
-    LocalCorpus, LocalFetcher, MatchSink, MmapIndexReader, SinkFlow, StoreIndexReader,
+    build_to_dir, search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, LocalFetcher,
+    MatchSink, MmapIndexReader, SegmentedReader, SinkFlow,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, list_prefix, normalize_prefix, region_from_env,
@@ -170,21 +170,46 @@ fn list_user_objects(src: &S3Source) -> Result<Vec<ObjectMeta>> {
 }
 
 fn build_s3(src: S3Source, strategy: Strategy) -> Result<()> {
-    let objects = list_user_objects(&src)?;
-    let object_ids = objects
-        .iter()
-        .map(|object| (object.key.clone(), object.etag.clone()))
+    let listing = list_user_objects(&src)?
+        .into_iter()
+        .map(|object| (object.key, object.etag))
         .collect::<Vec<_>>();
-    let build_id = compute_build_id(&object_ids, strategy);
-    let corpus = S3Corpus::new(src.client.clone(), src.bucket.clone(), &objects);
-    let store = S3BlobStore::new(src.client, src.bucket.clone(), src.prefix.clone());
-    build_to_store(&corpus, &store, strategy, &build_id)?;
-    eprintln!(
-        "indexed {} docs -> s3://{}/{}/builds/{build_id}",
-        corpus.docs().len(),
-        src.bucket,
-        build_index_namespace(&src.prefix)
-    );
+    let cache_dir = build_cache_dir(&src.bucket, &src.prefix)?;
+    let store = S3BlobStore::new(src.client.clone(), src.bucket.clone(), src.prefix.clone());
+    let client = src.client;
+    let bucket = src.bucket.clone();
+    let report = update_index(&store, &cache_dir, strategy, &listing, &|keys| {
+        let objects = keys
+            .iter()
+            .map(|key| ObjectMeta {
+                key: key.clone(),
+                etag: String::new(),
+                size: 0,
+            })
+            .collect::<Vec<_>>();
+        Ok(Box::new(S3Corpus::new(
+            client.clone(),
+            bucket.clone(),
+            &objects,
+        )))
+    })?;
+    let namespace = build_index_namespace(&src.prefix);
+    if report.up_to_date {
+        eprintln!(
+            "index up to date: {} docs in {} segments at s3://{}/{namespace}",
+            report.total_docs, report.segments, src.bucket
+        );
+    } else {
+        eprintln!(
+            "indexed +{} -{} -> {} docs in {} segments{} at s3://{}/{namespace}",
+            report.added,
+            report.removed,
+            report.total_docs,
+            report.segments,
+            if report.compacted { " (compacted)" } else { "" },
+            src.bucket
+        );
+    }
     Ok(())
 }
 
@@ -208,7 +233,7 @@ fn search_s3(
 ) -> Result<()> {
     let cache_dir = build_cache_dir(&src.bucket, &src.prefix)?;
     let store = S3BlobStore::new(src.client.clone(), src.bucket.clone(), src.prefix.clone());
-    let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
+    let reader = SegmentedReader::open(Box::new(store), &cache_dir)?;
     let fetcher = S3Fetcher::new(src.client, src.bucket);
     emit_results(&reader, &fetcher, pattern, files_only, stats, scope)
 }

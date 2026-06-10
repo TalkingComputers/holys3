@@ -1,12 +1,13 @@
 mod common;
 
 use common::{corpus, decoded_corpus, gzipped_corpus, PATTERNS};
-use holys3_core::{scan_matching_docs, Corpus, LocalBlobStore, Strategy};
+use holys3_core::{scan_matching_docs, testutil::MemCorpus, Corpus, LocalBlobStore, Strategy};
 use holys3_index::{
-    build_to_store, compute_build_id, search_collect, search_streaming, KeyScope, NullSink,
-    StoreIndexReader,
+    search_collect, search_streaming, update_index, KeyScope, NullSink, SegmentedReader,
 };
 
+/// The store-backed (segmented) index must agree with a full scan of
+/// decompressed bodies for both strategies and both corpora.
 #[test]
 fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
     for (label, c) in [("plain", corpus()), ("gzipped", gzipped_corpus())] {
@@ -15,14 +16,31 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
             let store_dir = tempfile::tempdir()?;
             let cache_dir = tempfile::tempdir()?;
             let store = LocalBlobStore::new(store_dir.path());
-            let objects = c
+            let listing = c
                 .docs()
                 .iter()
                 .map(|(_, key)| (key.clone(), format!("etag-{key}")))
                 .collect::<Vec<_>>();
-            let build_id = compute_build_id(&objects, strategy);
-            build_to_store(&c, &store, strategy, &build_id)?;
-            let reader = StoreIndexReader::open(
+            update_index(&store, cache_dir.path(), strategy, &listing, &|keys| {
+                let docs = keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, key)| (i as u32, key.clone()))
+                    .collect();
+                let bodies = keys
+                    .iter()
+                    .map(|key| {
+                        let (id, _) = c
+                            .docs()
+                            .iter()
+                            .find(|(_, k)| k == key)
+                            .expect("listed key exists");
+                        c.fetch(*id)
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Ok(Box::new(MemCorpus::new(docs, bodies)))
+            })?;
+            let reader = SegmentedReader::open(
                 Box::new(LocalBlobStore::new(store_dir.path())),
                 cache_dir.path(),
             )?;

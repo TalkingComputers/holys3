@@ -1,6 +1,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use holys3_core::{grams_index, grams_query, testutil::MemCorpus, LocalBlobStore, Strategy};
-use holys3_index::{build_to_dir, build_to_store, IndexReader, MmapIndexReader, StoreIndexReader};
+use holys3_core::{
+    grams_index, grams_query, testutil::MemCorpus, Corpus, LocalBlobStore, Strategy,
+};
+use holys3_index::{build_to_dir, update_index, IndexReader, MmapIndexReader, SegmentedReader};
 use holys3_query::plan;
 use std::hint::black_box;
 
@@ -65,10 +67,39 @@ fn bench_index_reader(c: &mut Criterion) {
 
     let store_dir = tempfile::tempdir().expect("benchmark setup failed");
     let store = LocalBlobStore::new(store_dir.path());
-    build_to_store(&corpus, &store, Strategy::Sparse, "bench-build")
-        .expect("benchmark setup failed");
     let cache_dir = tempfile::tempdir().expect("benchmark setup failed");
-    let store_reader = StoreIndexReader::open(
+    let listing: Vec<(String, String)> = corpus
+        .docs()
+        .iter()
+        .map(|(_, key)| (key.clone(), format!("etag-{key}")))
+        .collect();
+    update_index(
+        &store,
+        cache_dir.path(),
+        Strategy::Sparse,
+        &listing,
+        &|keys| {
+            let docs = keys
+                .iter()
+                .enumerate()
+                .map(|(i, key)| (i as u32, key.clone()))
+                .collect();
+            let bodies = keys
+                .iter()
+                .map(|key| {
+                    let (id, _) = corpus
+                        .docs()
+                        .iter()
+                        .find(|(_, k)| k == key)
+                        .expect("listed key exists");
+                    corpus.fetch(*id)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(Box::new(MemCorpus::new(docs, bodies)))
+        },
+    )
+    .expect("benchmark setup failed");
+    let store_reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache_dir.path(),
     )

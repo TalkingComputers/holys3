@@ -829,6 +829,7 @@ dependencies = [
  "rayon",
  "regex",
  "serde",
+ "sha2",
  "tempfile",
 ]
 
