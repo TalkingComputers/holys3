@@ -98,13 +98,28 @@ pub fn detect_codec(bytes: &[u8]) -> Codec {
         Codec::Lz4Legacy
     } else if bytes.starts_with(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) {
         Codec::Xz
-    } else if bytes.len() >= 12 && bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1") {
+    } else if is_parquet(bytes) {
         Codec::Parquet
     } else if bytes.starts_with(&[b'O', b'b', b'j', 0x01]) {
         Codec::Avro
     } else {
         Codec::Raw
     }
+}
+
+/// PAR1 at both ends is printable ASCII a text file could carry; the footer
+/// length field (4 LE bytes before the trailing magic) must also fit the
+/// file, which no plain-text impostor satisfies by accident.
+fn is_parquet(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || !bytes.starts_with(b"PAR1") || !bytes.ends_with(b"PAR1") {
+        return false;
+    }
+    let len_field = &bytes[bytes.len() - 8..bytes.len() - 4];
+    let metadata_len = u32::from_le_bytes(len_field.try_into().expect("4 bytes")) as usize;
+    // header magic + metadata + length field + footer magic must fit
+    metadata_len
+        .checked_add(12)
+        .is_some_and(|need| need <= bytes.len())
 }
 
 fn is_bzip2(bytes: &[u8]) -> bool {
@@ -196,12 +211,92 @@ fn finite_floats(value: apache_avro::types::Value) -> apache_avro::types::Value 
     }
 }
 
-/// One record per line via the crate's own Value -> JSON conversion. A
-/// mid-stream read error after some records decoded salvages the decoded
-/// records with a warning, like the compressed-codec paths.
+/// Render an unscaled decimal integer string at `scale` (digits after the
+/// point), the same text fastavro/pyarrow produce.
+fn decimal_text(unscaled: &num_bigint::BigInt, scale: usize) -> String {
+    let raw = unscaled.to_string();
+    let (sign, digits) = match raw.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", raw.as_str()),
+    };
+    if scale == 0 {
+        return format!("{sign}{digits}");
+    }
+    let padded = if digits.len() <= scale {
+        format!("{}{digits}", "0".repeat(scale + 1 - digits.len()))
+    } else {
+        digits.to_owned()
+    };
+    let point = padded.len() - scale;
+    format!("{sign}{}.{}", &padded[..point], &padded[point..])
+}
+
+/// The crate's own JSON conversion renders Decimal as a raw byte array —
+/// unsearchable. The schema (which holds the scale) is in hand, so walk
+/// value and schema together and render decimals as decimal strings.
+fn scaled_decimals(
+    value: apache_avro::types::Value,
+    schema: &apache_avro::Schema,
+    names: &std::collections::HashMap<apache_avro::schema::Name, &apache_avro::Schema>,
+) -> AnyhowResult<apache_avro::types::Value> {
+    use apache_avro::types::Value;
+    use apache_avro::Schema;
+    Ok(match (value, schema) {
+        (value, Schema::Ref { name }) => {
+            let resolved = names
+                .get(name)
+                .with_context(|| format!("avro schema reference {name} unresolved"))?;
+            scaled_decimals(value, resolved, names)?
+        }
+        (Value::Decimal(decimal), Schema::Decimal(spec)) => {
+            let unscaled: num_bigint::BigInt = decimal.into();
+            Value::String(decimal_text(&unscaled, spec.scale))
+        }
+        (Value::Record(fields), Schema::Record(spec)) => Value::Record(
+            fields
+                .into_iter()
+                .zip(&spec.fields)
+                .map(|((name, value), field)| {
+                    anyhow::ensure!(
+                        name == field.name,
+                        "avro record field order diverged from schema"
+                    );
+                    Ok((name, scaled_decimals(value, &field.schema, names)?))
+                })
+                .collect::<AnyhowResult<_>>()?,
+        ),
+        (Value::Array(items), Schema::Array(spec)) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| scaled_decimals(item, &spec.items, names))
+                .collect::<AnyhowResult<_>>()?,
+        ),
+        (Value::Map(entries), Schema::Map(spec)) => Value::Map(
+            entries
+                .into_iter()
+                .map(|(k, v)| Ok((k, scaled_decimals(v, &spec.types, names)?)))
+                .collect::<AnyhowResult<_>>()?,
+        ),
+        (Value::Union(branch, inner), Schema::Union(spec)) => {
+            let variant = spec
+                .variants()
+                .get(branch as usize)
+                .with_context(|| format!("avro union branch {branch} out of range"))?;
+            Value::Union(branch, Box::new(scaled_decimals(*inner, variant, names)?))
+        }
+        (value, _) => value,
+    })
+}
+
+/// One record per line via the crate's own Value -> JSON conversion (with
+/// schema-aware decimal rendering and NaN -> null). A mid-stream read error
+/// after some records decoded salvages the decoded records with a warning,
+/// like the compressed-codec paths.
 fn avro_to_json_lines(key: &str, bytes: &[u8]) -> AnyhowResult<Vec<u8>> {
     let context = || format!("avro decode failed for {key}");
     let reader = apache_avro::Reader::new(bytes).with_context(context)?;
+    let schema = reader.writer_schema().clone();
+    let resolved = apache_avro::schema::ResolvedSchema::try_from(&schema).with_context(context)?;
     let mut out = Vec::new();
     for value in reader {
         let value = match value {
@@ -216,6 +311,7 @@ fn avro_to_json_lines(key: &str, bytes: &[u8]) -> AnyhowResult<Vec<u8>> {
             }
             Err(err) => return Err(anyhow::Error::new(err)).with_context(context),
         };
+        let value = scaled_decimals(value, &schema, resolved.get_names()).with_context(context)?;
         let json = serde_json::Value::try_from(finite_floats(value)).with_context(context)?;
         out.extend_from_slice(json.to_string().as_bytes());
         out.push(b'\n');
@@ -546,6 +642,9 @@ mod invariant_grams {
 pub trait Corpus {
     /// All document ids with their keys (object key / file path).
     fn docs(&self) -> &[(DocId, String)];
+    /// Compressed/raw byte size per doc, aligned with `docs()`. Bounds the
+    /// build's per-chunk fetch memory; 0 = unknown.
+    fn sizes(&self) -> &[u64];
     /// Fetch the full bytes of one document.
     fn fetch(&self, id: DocId) -> AnyhowResult<Vec<u8>>;
     /// Fetch many docs concurrently. Result order is NOT guaranteed; each item
@@ -586,6 +685,17 @@ pub trait BlobStore {
     }
     /// Remove a blob; deleting an absent blob is not an error.
     fn delete(&self, name: &str) -> AnyhowResult<()>;
+    /// Fetch a blob plus an opaque version token for `put_if`.
+    fn get_versioned(&self, name: &str) -> AnyhowResult<Option<(Vec<u8>, String)>>;
+    /// Compare-and-swap write: succeeds only if the blob's current version
+    /// matches `expected` (`None` = the blob must not exist). Returns false
+    /// when another writer won the race — never silently overwrites.
+    fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> AnyhowResult<bool>;
+}
+
+/// Version token for stores without native versions: content-derived.
+pub fn content_version(bytes: &[u8]) -> String {
+    format!("{:016x}-{}", hash_ngram(bytes), bytes.len())
 }
 
 #[cfg(any(test, feature = "testutil"))]
@@ -596,16 +706,25 @@ pub mod testutil {
     pub struct MemCorpus {
         docs: Vec<(DocId, String)>,
         bodies: Vec<Vec<u8>>,
+        sizes: Vec<u64>,
     }
 
     impl MemCorpus {
         pub fn new(docs: Vec<(DocId, String)>, bodies: Vec<Vec<u8>>) -> MemCorpus {
-            assert_eq!(docs.len(), bodies.len());
-            MemCorpus { docs, bodies }
+            let sizes = bodies.iter().map(|b| b.len() as u64).collect();
+            MemCorpus {
+                docs,
+                bodies,
+                sizes,
+            }
         }
     }
 
     impl Corpus for MemCorpus {
+        fn sizes(&self) -> &[u64] {
+            &self.sizes
+        }
+
         fn docs(&self) -> &[(DocId, String)] {
             &self.docs
         }
@@ -724,6 +843,51 @@ impl BlobStore for LocalBlobStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn get_versioned(&self, name: &str) -> AnyhowResult<Option<(Vec<u8>, String)>> {
+        Ok(self.get(name)?.map(|bytes| {
+            let version = content_version(&bytes);
+            (bytes, version)
+        }))
+    }
+
+    /// CAS via an exclusive lock file beside the blob: check-then-write runs
+    /// under the lock, so two local writers serialize.
+    fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> AnyhowResult<bool> {
+        let path = self.root.join(name);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let lock_path = path.with_extension("lock");
+        let lock = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(file) => break file,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        };
+        drop(lock);
+        let result = (|| {
+            let current = match std::fs::read(&path) {
+                Ok(bytes) => Some(content_version(&bytes)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err.into()),
+            };
+            if current.as_deref() != expected {
+                return Ok(false);
+            }
+            std::fs::write(&path, bytes)?;
+            Ok(true)
+        })();
+        std::fs::remove_file(&lock_path).ok();
+        result
     }
 
     fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()> {
@@ -1399,11 +1563,23 @@ mod corpus_tests {
             Codec::Raw
         );
         assert_eq!(detect_codec(b"BZh0123456789"), Codec::Raw); // '0' invalid level
-                                                                // parquet needs PAR1 at BOTH ends
+
+        // parquet needs PAR1 at BOTH ends AND a plausible footer length: a
+        // text impostor's 4 bytes before the trailing magic decode as a
+        // metadata length far larger than the file, so it stays Raw
         assert_eq!(detect_codec(b"PAR1 some text file"), Codec::Raw);
-        assert_eq!(detect_codec(b"PAR1tinyPAR1"), Codec::Parquet); // 12 bytes, both ends
-        assert!(decode_body("fake.parquet", b"PAR1tinyPAR1".to_vec()).is_err());
-        // loud, not garbage
+        assert_eq!(detect_codec(b"PAR1tinyPAR1"), Codec::Raw);
+        assert_eq!(
+            detect_codec(b"PAR1 this is a text file that ends with PAR1"),
+            Codec::Raw
+        );
+        // a structurally plausible footer (metadata_len = 0) IS detected,
+        // and the decoder then fails loudly rather than producing garbage
+        let mut tiny = b"PAR1".to_vec();
+        tiny.extend(0u32.to_le_bytes());
+        tiny.extend(b"PAR1");
+        assert_eq!(detect_codec(&tiny), Codec::Parquet);
+        assert!(decode_body("fake.parquet", tiny).is_err());
     }
 
     #[test]
@@ -1536,6 +1712,49 @@ mod corpus_tests {
     }
 
     #[test]
+    fn avro_decimal_renders_as_decimal_string() {
+        use apache_avro::types::Record;
+        let schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"r","fields":[
+                {"name":"amount","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}},
+                {"name":"msg","type":"string"}]}"#,
+        )
+        .unwrap();
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        let mut record = Record::new(&schema).unwrap();
+        record.put(
+            "amount",
+            apache_avro::types::Value::Decimal(apache_avro::Decimal::from(
+                12345i64.to_be_bytes().to_vec(),
+            )),
+        );
+        record.put("msg", "price tag");
+        writer.append(record).unwrap();
+        let text = decode_body("k.avro", writer.into_inner().unwrap()).unwrap();
+        assert_eq!(text, b"{\"amount\":\"123.45\",\"msg\":\"price tag\"}\n");
+    }
+
+    #[test]
+    fn avro_bzip2_and_xz_codecs_decode() {
+        use apache_avro::types::Record;
+        let schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"r","fields":[{"name":"msg","type":"string"}]}"#,
+        )
+        .unwrap();
+        for codec in [
+            apache_avro::Codec::Bzip2(apache_avro::Bzip2Settings::default()),
+            apache_avro::Codec::Xz(apache_avro::XzSettings::default()),
+        ] {
+            let mut writer = apache_avro::Writer::with_codec(&schema, Vec::new(), codec);
+            let mut record = Record::new(&schema).unwrap();
+            record.put("msg", "needle in codec");
+            writer.append(record).unwrap();
+            let text = decode_body("k.avro", writer.into_inner().unwrap()).unwrap();
+            assert_eq!(text, b"{\"msg\":\"needle in codec\"}\n");
+        }
+    }
+
+    #[test]
     fn decode_body_avro_projects_records_as_json_lines() {
         use apache_avro::types::Record;
         let schema = apache_avro::Schema::parse_str(
@@ -1584,6 +1803,10 @@ mod corpus_tests {
         }
 
         impl Corpus for BrokenCorpus {
+            fn sizes(&self) -> &[u64] {
+                &[2, 2]
+            }
+
             fn docs(&self) -> &[(DocId, String)] {
                 &self.docs
             }

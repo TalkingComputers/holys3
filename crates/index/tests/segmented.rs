@@ -547,6 +547,141 @@ fn unreferenced_segment_blobs_are_garbage_collected() -> Result<()> {
 }
 
 #[test]
+fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
+    use holys3_core::BlobStore;
+    // Simulate writer B winning the root swap between A's load and A's swap:
+    // a store wrapper that rewrites segments.bin under A's feet once.
+    struct RacingStore {
+        inner: LocalBlobStore,
+        interloper: Vec<u8>,
+        armed: std::cell::Cell<bool>,
+    }
+
+    impl BlobStore for RacingStore {
+        fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put(name, bytes)
+        }
+        fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get(name)
+        }
+        fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+            self.inner.get_range(name, start, len)
+        }
+        fn delete(&self, name: &str) -> Result<()> {
+            self.inner.delete(name)
+        }
+        fn get_versioned(&self, name: &str) -> Result<Option<(Vec<u8>, String)>> {
+            self.inner.get_versioned(name)
+        }
+        fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
+            if name == "segments.bin" && self.armed.replace(false) {
+                // B sneaks in first
+                self.inner.put(name, &self.interloper)?;
+            }
+            self.inner.put_if(name, bytes, expected)
+        }
+    }
+
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("a", b"needle one");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    let inner = LocalBlobStore::new(store_dir.path());
+    let winner_root = inner.get("segments.bin")?.expect("root exists");
+
+    bucket.put("b", b"needle two");
+    let store = RacingStore {
+        inner: LocalBlobStore::new(store_dir.path()),
+        interloper: {
+            // any DIFFERENT bytes: simulate B's root
+            let mut altered = winner_root.clone();
+            altered.push(0xFF);
+            altered
+        },
+        armed: std::cell::Cell::new(true),
+    };
+    let listing = bucket.listing();
+    let err = update_index(
+        &store,
+        cache_dir.path(),
+        Strategy::Trigram,
+        &listing,
+        false,
+        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+    )
+    .expect_err("losing writer must error");
+    assert!(
+        err.to_string().contains("concurrently"),
+        "error must name the race: {err:#}"
+    );
+    // B's root is intact (last write standing is the interloper's)
+    let root_now = LocalBlobStore::new(store_dir.path())
+        .get("segments.bin")?
+        .expect("root present");
+    assert_ne!(root_now, winner_root);
+    // and the ORIGINAL segment blobs were NOT garbage collected (the bucket
+    // oracle does not apply here: "b" was never indexed by design)
+    let segments = std::fs::read_dir(store_dir.path().join("segments"))?.count();
+    assert!(segments >= 1, "winner's segment blobs must survive");
+    Ok(())
+}
+
+#[test]
+fn same_run_compacted_newborns_are_garbage_collected() -> Result<()> {
+    // SEGMENT_COUNT_TARGET is 8: build 9 segments across runs, then one run
+    // that adds a 10th AND compacts — the newborn that merges away in its
+    // own birth run must not leak blobs.
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    for i in 0..10 {
+        bucket.put(&format!("doc{i:02}"), format!("needle {i}").as_bytes());
+        reindex(
+            &bucket,
+            store_dir.path(),
+            cache_dir.path(),
+            Strategy::Trigram,
+        )?;
+    }
+    let store = LocalBlobStore::new(store_dir.path());
+    let report = update_index(
+        &store,
+        cache_dir.path(),
+        Strategy::Trigram,
+        &bucket.listing(),
+        false,
+        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+    )?;
+    let dirs_on_disk = std::fs::read_dir(store_dir.path().join("segments"))?
+        .filter(|e| {
+            e.as_ref().unwrap().file_type().unwrap().is_dir()
+                && std::fs::read_dir(e.as_ref().unwrap().path())
+                    .unwrap()
+                    .count()
+                    > 0
+        })
+        .count();
+    assert_eq!(
+        dirs_on_disk, report.segments,
+        "non-empty segment dirs on disk must equal live segments (no leaks)"
+    );
+    assert_matches_oracle(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        &["needle"],
+        "post-churn",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
     use holys3_core::BlobStore;
 
@@ -573,6 +708,17 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
 
         fn delete(&self, name: &str) -> Result<()> {
             self.inner.delete(name)
+        }
+
+        fn get_versioned(&self, name: &str) -> Result<Option<(Vec<u8>, String)>> {
+            if name == "segments.bin" && self.fail_next_root_get.replace(false) {
+                anyhow::bail!("simulated transient outage");
+            }
+            self.inner.get_versioned(name)
+        }
+
+        fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
+            self.inner.put_if(name, bytes, expected)
         }
     }
 

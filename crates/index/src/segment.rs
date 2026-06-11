@@ -105,12 +105,17 @@ enum RootState {
 
 /// A failing store is an error so a transient outage can never silently
 /// trigger a full rebuild; absence and unreadability are first-class states.
-fn load_segment_list(store: &dyn BlobStore) -> Result<RootState> {
-    match store.get("segments.bin").context("reading segments.bin")? {
-        None => Ok(RootState::Absent),
-        Some(bytes) => match parse_segment_list(&bytes) {
-            Ok(list) => Ok(RootState::Loaded(list)),
-            Err(err) => Ok(RootState::Unreadable(format!("{err:#}"))),
+/// Loads the root plus its version token, the CAS expectation for the swap
+/// at the end of an index run.
+fn load_segment_list(store: &dyn BlobStore) -> Result<(RootState, Option<String>)> {
+    match store
+        .get_versioned("segments.bin")
+        .context("reading segments.bin")?
+    {
+        None => Ok((RootState::Absent, None)),
+        Some((bytes, version)) => match parse_segment_list(&bytes) {
+            Ok(list) => Ok((RootState::Loaded(list), Some(version))),
+            Err(err) => Ok((RootState::Unreadable(format!("{err:#}")), Some(version))),
         },
     }
 }
@@ -165,6 +170,7 @@ fn cached_blob(
 }
 
 /// What an index run did; everything the CLI needs to report.
+#[derive(Debug)]
 pub struct UpdateReport {
     pub added: usize,
     pub removed: usize,
@@ -190,15 +196,17 @@ pub fn update_index(
 ) -> Result<UpdateReport> {
     let mut forced = rebuild;
     let mut replaced: Vec<SegmentMeta> = Vec::new();
-    let existing = if rebuild {
+    if rebuild {
         eprintln!("note: --rebuild requested; re-ingesting everything");
-        // best-effort load purely so the replaced segments can be GC'd
-        if let Ok(RootState::Loaded(list)) = load_segment_list(store) {
+    }
+    let (root, root_version) = load_segment_list(store)?;
+    let existing = if rebuild {
+        if let RootState::Loaded(list) = root {
             replaced = list.segments;
         }
         Vec::new()
     } else {
-        match load_segment_list(store)? {
+        match root {
             RootState::Loaded(list) if list.strategy == strategy => list.segments,
             RootState::Loaded(list) => {
                 eprintln!("note: index strategy changed; rebuilding from scratch");
@@ -271,8 +279,9 @@ pub fn update_index(
         .collect();
     newly_dead.sort_unstable();
 
+    let root_missing = root_version.is_none();
     let needs_compaction = existing.len() > SEGMENT_COUNT_TARGET;
-    if to_add.is_empty() && newly_dead.is_empty() && !forced && !needs_compaction {
+    if to_add.is_empty() && newly_dead.is_empty() && !forced && !needs_compaction && !root_missing {
         return Ok(UpdateReport {
             added: 0,
             removed: 0,
@@ -312,6 +321,9 @@ pub fn update_index(
         let keys: Vec<String> = shard.iter().map(|(key, _)| key.clone()).collect();
         let corpus = make_corpus(&keys)?;
         let (meta, _) = write_segment(store, corpus.as_ref(), strategy, shard)?;
+        // newborns are GC candidates too: a segment born and compacted away
+        // in the SAME run would otherwise be in neither before nor after
+        replaced.push(meta.clone());
         keep.push((meta, Vec::new()));
     }
 
@@ -325,7 +337,17 @@ pub fn update_index(
         strategy,
         segments,
     };
-    store.put("segments.bin", &postcard::to_allocvec(&list)?)?;
+    // Compare-and-swap on the root: a concurrent index run that swapped
+    // first wins; overwriting it would orphan its segments and then GC
+    // would delete blobs its root still references.
+    anyhow::ensure!(
+        store.put_if(
+            "segments.bin",
+            &postcard::to_allocvec(&list)?,
+            root_version.as_deref()
+        )?,
+        "another holys3 index run updated this index concurrently; rerun to pick up its result"
+    );
     collect_garbage(store, &replaced, &list.segments);
     Ok(UpdateReport {
         added,

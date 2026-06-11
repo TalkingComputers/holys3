@@ -146,7 +146,22 @@ struct S3Request<'a> {
     canonical_query: &'a str,
     range: Option<(u64, u64)>,
     body: Option<&'a [u8]>,
+    /// Conditional write: `Some(Some(etag))` = If-Match, `Some(None)` =
+    /// If-None-Match: * (must not exist), `None` = unconditional.
+    precondition: Option<Option<&'a str>>,
 }
+
+/// Typed marker for a failed conditional write (HTTP 412/409).
+#[derive(Debug)]
+pub(crate) struct PreconditionFailed;
+
+impl std::fmt::Display for PreconditionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("conditional write precondition failed")
+    }
+}
+
+impl std::error::Error for PreconditionFailed {}
 
 enum Outcome {
     Success(StatusCode, Option<String>, Vec<u8>),
@@ -376,6 +391,11 @@ impl S3Client {
                 builder = builder.timeout(upload_deadline(body.len()));
             }
         }
+        match req.precondition {
+            Some(Some(etag)) => builder = builder.header("if-match", etag),
+            Some(None) => builder = builder.header("if-none-match", "*"),
+            None => {}
+        }
         let response = match builder.send().await {
             Ok(response) => response,
             Err(err) if err.is_builder() => return Outcome::Fatal(err.into()),
@@ -396,6 +416,11 @@ impl S3Client {
         match status {
             StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS => Outcome::Throttle,
             StatusCode::NOT_FOUND => Outcome::NotFound,
+            // 412 = precondition failed; 409 = S3's concurrent-conditional
+            // conflict. Both mean: another writer won, do not retry blindly.
+            StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => {
+                Outcome::Fatal(anyhow::Error::new(PreconditionFailed))
+            }
             StatusCode::REQUEST_TIMEOUT => {
                 Outcome::Transient(anyhow::anyhow!("HTTP {status} for {host}{path}"))
             }
@@ -490,6 +515,7 @@ impl S3Client {
             canonical_query: "",
             range,
             body: None,
+            precondition: None,
         };
         let started = Notify::new();
         let primary = self.send_resilient(&req, Some(&started));
@@ -683,6 +709,7 @@ impl S3Client {
             canonical_query: "",
             range: None,
             body: Some(body),
+            precondition: None,
         };
         self.send_resilient(&req, None)
             .await?
@@ -704,6 +731,7 @@ impl S3Client {
                     canonical_query: &initiate,
                     range: None,
                     body: None,
+                    precondition: None,
                 },
                 None,
             )
@@ -740,6 +768,7 @@ impl S3Client {
                     canonical_query: &query,
                     range: None,
                     body: Some(complete_body.as_bytes()),
+                    precondition: None,
                 },
                 None,
             )
@@ -788,6 +817,7 @@ impl S3Client {
                             canonical_query: &query,
                             range: None,
                             body: Some(chunk),
+                            precondition: None,
                         },
                         None,
                     )
@@ -818,9 +848,56 @@ impl S3Client {
             canonical_query: &query,
             range: None,
             body: None,
+            precondition: None,
         };
         if self.send_resilient(&req, None).await.is_err() {
             eprintln!("warning: failed to abort multipart upload of s3://{bucket}/{key}");
+        }
+    }
+
+    /// Fetch one object plus its `ETag` (the version token for `put_if`).
+    pub fn get_with_version(&self, bucket: &str, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+        let req = S3Request {
+            method: "GET",
+            bucket,
+            key: Some(key),
+            canonical_query: "",
+            range: None,
+            body: None,
+            precondition: None,
+        };
+        match self.0.rt.block_on(self.send_resilient(&req, None))? {
+            None => Ok(None),
+            Some((_, etag, bytes)) => {
+                let etag = etag.with_context(|| format!("GET s3://{bucket}/{key}: no ETag"))?;
+                Ok(Some((bytes, etag)))
+            }
+        }
+    }
+
+    /// Conditional PUT (compare-and-swap): `Some(etag)` = overwrite only if
+    /// unchanged, `None` = create only if absent. Returns false when another
+    /// writer won the race.
+    pub fn put_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        expected: Option<&str>,
+    ) -> Result<bool> {
+        let req = S3Request {
+            method: "PUT",
+            bucket,
+            key: Some(key),
+            canonical_query: "",
+            range: None,
+            body: Some(body),
+            precondition: Some(expected),
+        };
+        match self.0.rt.block_on(self.send_resilient(&req, None)) {
+            Ok(_) => Ok(true),
+            Err(err) if err.root_cause().is::<PreconditionFailed>() => Ok(false),
+            Err(err) => Err(err),
         }
     }
 
@@ -834,6 +911,7 @@ impl S3Client {
             canonical_query: "",
             range: None,
             body: None,
+            precondition: None,
         };
         self.0.rt.block_on(self.send_resilient(&req, None))?;
         Ok(())
@@ -872,6 +950,7 @@ impl S3Client {
                     canonical_query: &canonical_query,
                     range: None,
                     body: None,
+                    precondition: None,
                 };
                 let (_, _, bytes) = self
                     .send_resilient(&req, None)

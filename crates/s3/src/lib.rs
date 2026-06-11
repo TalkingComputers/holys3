@@ -228,6 +228,16 @@ impl BlobStore for S3BlobStore {
     fn delete(&self, name: &str) -> anyhow::Result<()> {
         self.client.delete(&self.bucket, &self.build_key(name))
     }
+
+    fn get_versioned(&self, name: &str) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+        self.client
+            .get_with_version(&self.bucket, &self.build_key(name))
+    }
+
+    fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> anyhow::Result<bool> {
+        self.client
+            .put_if(&self.bucket, &self.build_key(name), bytes, expected)
+    }
 }
 
 /// Corpus over a fixed S3 object list — the index BUILD side.
@@ -235,6 +245,7 @@ pub struct S3Corpus {
     client: S3Client,
     bucket: String,
     docs: Vec<(DocId, String)>,
+    sizes: Vec<u64>,
 }
 
 impl S3Corpus {
@@ -244,15 +255,21 @@ impl S3Corpus {
             .enumerate()
             .map(|(i, o)| (i as DocId, o.key.clone()))
             .collect();
+        let sizes = objects.iter().map(|o| o.size).collect();
         S3Corpus {
             client,
             bucket,
             docs,
+            sizes,
         }
     }
 }
 
 impl Corpus for S3Corpus {
+    fn sizes(&self) -> &[u64] {
+        &self.sizes
+    }
+
     fn docs(&self) -> &[(DocId, String)] {
         &self.docs
     }
