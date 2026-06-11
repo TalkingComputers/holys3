@@ -39,27 +39,60 @@ fn side_query(seq: &regex_syntax::hir::literal::Seq, strategy: Strategy) -> Opti
     }
 }
 
-/// Every match must START with one of the prefix literals AND END with one
-/// of the suffix literals, so both sides' grams are necessary conditions —
-/// `foo.*bar` constrains on `foo` grams AND `bar` grams, not `foo` alone.
-/// (Inexact literals still appear verbatim inside every match, which is all
-/// the gram constraint needs; candidates remain a strict superset.)
-pub fn plan(pattern: &str, strategy: Strategy) -> anyhow::Result<Query> {
+/// Gram constraints of one HIR node: every match must START with one of its
+/// prefix literals AND END with one of its suffix literals, so both sides'
+/// grams are necessary conditions — `foo.*bar` constrains on `foo` grams AND
+/// `bar` grams. Where the ends are unconstrained, required INNER literals
+/// still constrain (Cox-style): each concat element's text appears in every
+/// match, so `.*ERROR.*` plans `ERROR` grams instead of a full scan; an
+/// alternation is necessarily one of its branches; a repetition's body
+/// appears whenever `min >= 1`. (Inexact literals still appear verbatim
+/// inside every match, which is all the gram constraint needs; candidates
+/// remain a strict superset.)
+fn hir_query(hir: &regex_syntax::hir::Hir, strategy: Strategy) -> Query {
     use regex_syntax::hir::literal::{ExtractKind, Extractor};
-    let hir = regex_syntax::parse(pattern)?;
-    let mut sides: Vec<Query> = [
-        Extractor::new().extract(&hir),
-        Extractor::new().kind(ExtractKind::Suffix).extract(&hir),
+    use regex_syntax::hir::HirKind;
+    let mut parts: Vec<Query> = [
+        Extractor::new().extract(hir),
+        Extractor::new().kind(ExtractKind::Suffix).extract(hir),
     ]
     .iter()
     .filter_map(|seq| side_query(seq, strategy))
     .collect();
-    sides.dedup();
-    match sides.len() {
-        0 => Ok(Query::All),
-        1 => Ok(sides.swap_remove(0)),
-        _ => Ok(Query::And(sides)),
+    match hir.kind() {
+        HirKind::Concat(children) => {
+            parts.extend(children.iter().map(|child| hir_query(child, strategy)));
+        }
+        HirKind::Alternation(alternatives) => {
+            let branches: Vec<Query> = alternatives
+                .iter()
+                .map(|alt| hir_query(alt, strategy))
+                .collect();
+            if !branches.contains(&Query::All) {
+                parts.push(Query::Or(branches));
+            }
+        }
+        HirKind::Capture(capture) => parts.push(hir_query(&capture.sub, strategy)),
+        HirKind::Repetition(rep) if rep.min >= 1 => {
+            parts.push(hir_query(&rep.sub, strategy));
+        }
+        _ => {}
     }
+    let mut unique: Vec<Query> = Vec::new();
+    for part in parts {
+        if part != Query::All && !unique.contains(&part) {
+            unique.push(part);
+        }
+    }
+    match unique.len() {
+        0 => Query::All,
+        1 => unique.swap_remove(0),
+        _ => Query::And(unique),
+    }
+}
+
+pub fn plan(pattern: &str, strategy: Strategy) -> anyhow::Result<Query> {
+    Ok(hir_query(&regex_syntax::parse(pattern)?, strategy))
 }
 
 #[cfg(test)]
@@ -127,5 +160,36 @@ mod tests {
             grams.contains(&b"tot".to_vec()),
             "suffix constraint dropped"
         );
+    }
+
+    #[test]
+    fn inner_literal_constrains_unanchored_pattern() {
+        // both ends are unconstrained, but ERROR appears in every match
+        let q = plan(".*ERROR.*", Strategy::Trigram).unwrap();
+        assert_ne!(q, Query::All, ".*ERROR.* must not scan everything");
+        assert!(grams_of(&q).contains(&b"ERR".to_vec()));
+    }
+
+    #[test]
+    fn inner_alternation_constrains() {
+        // every match contains quick or lazy
+        let q = plan(".*(quick|lazy).*", Strategy::Trigram).unwrap();
+        assert_ne!(q, Query::All);
+        let grams = grams_of(&q);
+        assert!(grams.contains(&b"qui".to_vec()));
+        assert!(grams.contains(&b"laz".to_vec()));
+    }
+
+    #[test]
+    fn optional_inner_literal_stays_all() {
+        // (ERROR)? may match zero times: its grams are NOT necessary
+        assert_eq!(plan(".*(ERROR)?.*", Strategy::Trigram).unwrap(), Query::All);
+    }
+
+    #[test]
+    fn repeated_inner_literal_constrains() {
+        // (ERROR)+ appears at least once
+        let q = plan(".*(ERROR)+.*", Strategy::Trigram).unwrap();
+        assert!(grams_of(&q).contains(&b"ERR".to_vec()));
     }
 }

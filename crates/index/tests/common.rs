@@ -13,6 +13,10 @@ pub(crate) const PATTERNS: &[&str] = &[
     "zzzznotpresent",
     "ab",
     "second line",
+    ".*quick.*",
+    ".*(quick|world).*",
+    ".*(quick)+.*",
+    ".*(zzzznotpresent)?.*",
 ];
 
 fn bodies() -> Vec<Vec<u8>> {
