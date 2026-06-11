@@ -39,6 +39,8 @@ allow = [
     "Unlicense",
     "OpenSSL",
     "CDLA-Permissive-2.0",
+    # libbz2-rs-sys: the bzip2 library's own BSD-style permissive license
+    "bzip2-1.0.6",
 ]
 exceptions = []
 
