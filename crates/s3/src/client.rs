@@ -24,6 +24,39 @@ const SMALL_READ_MAX: u64 = 4 * 1024 * 1024;
 /// round trip costs more than transferring the gap bytes.
 const RANGE_COALESCE_GAP: u64 = 512 * 1024;
 
+/// Bodies above one part upload as concurrent multipart parts: single PUTs
+/// of GB-scale blobs time out on slow uplinks and cap at 5 GiB anyway.
+const MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
+/// Parts in flight at once. Uploads are uplink-bound, not request-bound:
+/// more concurrency just slows every part toward its deadline.
+const MULTIPART_CONCURRENCY: usize = 4;
+/// Request bodies at or above this use the upload client + deadline.
+const UPLOAD_BODY_THRESHOLD: usize = 1024 * 1024;
+
+/// `SigV4` canonical query string: sorted keys, both halves percent-encoded.
+fn canonical_query(params: &mut Vec<(&str, String)>) -> String {
+    params.sort_by(|a, b| a.0.cmp(b.0));
+    params
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                encode_query_component(k),
+                encode_query_component(v)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// First text content of `<element>` in an S3 XML response body.
+fn xml_text(body: &[u8], element: &str) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let start = text.find(&format!("<{element}>"))? + element.len() + 2;
+    let end = start + text[start..].find(&format!("</{element}>"))?;
+    Some(text[start..end].to_owned())
+}
+
 /// Where an input range landed after coalescing: (merged index, byte start).
 type Placement = (usize, usize);
 
@@ -59,6 +92,24 @@ fn build_http(pool_max_idle: usize) -> reqwest::Result<reqwest::Client> {
         .connect_timeout(Duration::from_secs(3))
         .read_timeout(Duration::from_secs(20))
         .build()
+}
+
+/// Client for large uploads: the server legitimately sends nothing while a
+/// multi-MB body is in flight, so a read timeout would kill every slow-uplink
+/// part. Robustness comes from `upload_deadline` per request instead.
+fn build_upload_http() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(MULTIPART_CONCURRENCY)
+        .pool_idle_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .http1_only()
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+}
+
+/// Total deadline for one upload request: a 256 KiB/s floor plus headroom.
+fn upload_deadline(body_len: usize) -> Duration {
+    Duration::from_secs(60 + (body_len / (256 * 1024)) as u64)
 }
 
 /// Timestamp helper: returns (`amz_date`, `date`).
@@ -98,7 +149,7 @@ struct S3Request<'a> {
 }
 
 enum Outcome {
-    Success(StatusCode, Vec<u8>),
+    Success(StatusCode, Option<String>, Vec<u8>),
     Throttle,
     NotFound,
     Transient(anyhow::Error),
@@ -169,6 +220,7 @@ struct ClientInner {
     cfg: FetchConfig,
     http: reqwest::Client,
     retry_http: reqwest::Client,
+    upload_http: reqwest::Client,
     limiter: AimdLimiter,
     hedges: HedgeBudget,
     rt: tokio::runtime::Runtime,
@@ -209,6 +261,7 @@ impl S3Client {
         Ok(S3Client(Arc::new(ClientInner {
             http: build_http(cfg.cap)?,
             retry_http: build_http(0)?,
+            upload_http: build_upload_http()?,
             limiter: AimdLimiter::new(cfg.start, cfg.cap),
             hedges: HedgeBudget::new(cfg.hedge_tokens),
             region,
@@ -302,8 +355,15 @@ impl S3Client {
             "UNSIGNED-PAYLOAD",
         );
         let url = self.request_url(&host, &path, req.canonical_query);
+        let http = if req.body.is_some_and(|b| b.len() >= UPLOAD_BODY_THRESHOLD) {
+            &self.0.upload_http
+        } else {
+            http
+        };
         let builder = match req.method {
             "PUT" => http.put(url),
+            "POST" => http.post(url),
+            "DELETE" => http.delete(url),
             _ => http.get(url),
         };
         let mut builder = apply_signed(builder, &signed, &host, creds.session_token.as_deref());
@@ -312,6 +372,9 @@ impl S3Client {
         }
         if let Some(body) = req.body {
             builder = builder.body(body.to_vec());
+            if body.len() >= UPLOAD_BODY_THRESHOLD {
+                builder = builder.timeout(upload_deadline(body.len()));
+            }
         }
         let response = match builder.send().await {
             Ok(response) => response,
@@ -320,8 +383,13 @@ impl S3Client {
         };
         let status = response.status();
         if status.is_success() {
+            let etag = response
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
             return match response.bytes().await {
-                Ok(bytes) => Outcome::Success(status, bytes.to_vec()),
+                Ok(bytes) => Outcome::Success(status, etag, bytes.to_vec()),
                 Err(err) => Outcome::Transient(err.into()),
             };
         }
@@ -345,7 +413,7 @@ impl S3Client {
         &self,
         req: &S3Request<'_>,
         on_permit: Option<&Notify>,
-    ) -> Result<Option<(StatusCode, Vec<u8>)>> {
+    ) -> Result<Option<(StatusCode, Option<String>, Vec<u8>)>> {
         let label = || {
             format!(
                 "{} s3://{}/{}",
@@ -368,9 +436,9 @@ impl S3Client {
             let outcome = self.attempt(req, http).await;
             drop(permit);
             let error = match outcome {
-                Outcome::Success(status, bytes) => {
+                Outcome::Success(status, etag, bytes) => {
                     self.0.limiter.on_success();
-                    return Ok(Some((status, bytes)));
+                    return Ok(Some((status, etag, bytes)));
                 }
                 Outcome::NotFound => return Ok(None),
                 Outcome::Fatal(err) => return Err(err.context(label())),
@@ -447,7 +515,7 @@ impl S3Client {
                 }
             }
         };
-        let Some((status, bytes)) = result? else {
+        let Some((status, _, bytes)) = result? else {
             return Ok(None);
         };
         if let Some((start, end)) = range {
@@ -605,6 +673,9 @@ impl S3Client {
     }
 
     async fn put_async(&self, bucket: &str, key: &str, body: &[u8]) -> Result<()> {
+        if body.len() > MULTIPART_PART_SIZE {
+            return self.put_multipart(bucket, key, body).await;
+        }
         let req = S3Request {
             method: "PUT",
             bucket,
@@ -617,6 +688,140 @@ impl S3Client {
             .await?
             .with_context(|| format!("PUT s3://{bucket}/{key} returned HTTP 404"))?;
         Ok(())
+    }
+
+    /// Multipart upload for bodies over one part size: parts upload
+    /// concurrently through the same retry engine, and any failure aborts
+    /// the upload server-side before returning the error.
+    async fn put_multipart(&self, bucket: &str, key: &str, body: &[u8]) -> Result<()> {
+        let initiate = canonical_query(&mut vec![("uploads", String::new())]);
+        let (_, _, init_body) = self
+            .send_resilient(
+                &S3Request {
+                    method: "POST",
+                    bucket,
+                    key: Some(key),
+                    canonical_query: &initiate,
+                    range: None,
+                    body: None,
+                },
+                None,
+            )
+            .await?
+            .with_context(|| format!("initiate multipart s3://{bucket}/{key}: HTTP 404"))?;
+        let upload_id = xml_text(&init_body, "UploadId")
+            .with_context(|| format!("initiate multipart s3://{bucket}/{key}: no UploadId"))?;
+
+        let parts = self.upload_parts(bucket, key, &upload_id, body).await;
+        let parts = match parts {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.abort_multipart(bucket, key, &upload_id).await;
+                return Err(err);
+            }
+        };
+
+        let mut complete_body = String::from(
+            r#"<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+        );
+        for (number, etag) in &parts {
+            complete_body.push_str(&format!(
+                "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+            ));
+        }
+        complete_body.push_str("</CompleteMultipartUpload>");
+        let query = canonical_query(&mut vec![("uploadId", upload_id.clone())]);
+        let completed = self
+            .send_resilient(
+                &S3Request {
+                    method: "POST",
+                    bucket,
+                    key: Some(key),
+                    canonical_query: &query,
+                    range: None,
+                    body: Some(complete_body.as_bytes()),
+                },
+                None,
+            )
+            .await;
+        match completed {
+            // S3 can return 200 OK with an error document inside; only a
+            // body naming our key (CompleteMultipartUploadResult) is success.
+            Ok(Some((_, _, response))) if !response.windows(7).any(|w| w == b"<Error>") => Ok(()),
+            Ok(Some((_, _, response))) => {
+                self.abort_multipart(bucket, key, &upload_id).await;
+                anyhow::bail!(
+                    "complete multipart s3://{bucket}/{key} returned an error document: {}",
+                    String::from_utf8_lossy(&response[..response.len().min(300)])
+                )
+            }
+            Ok(None) => {
+                anyhow::bail!("complete multipart s3://{bucket}/{key}: HTTP 404")
+            }
+            Err(err) => {
+                self.abort_multipart(bucket, key, &upload_id).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn upload_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        body: &[u8],
+    ) -> Result<Vec<(usize, String)>> {
+        let mut uploads = stream::iter(body.chunks(MULTIPART_PART_SIZE).enumerate().map(
+            |(i, chunk)| async move {
+                let number = i + 1;
+                let query = canonical_query(&mut vec![
+                    ("partNumber", number.to_string()),
+                    ("uploadId", upload_id.to_owned()),
+                ]);
+                let (_, etag, _) = self
+                    .send_resilient(
+                        &S3Request {
+                            method: "PUT",
+                            bucket,
+                            key: Some(key),
+                            canonical_query: &query,
+                            range: None,
+                            body: Some(chunk),
+                        },
+                        None,
+                    )
+                    .await?
+                    .with_context(|| format!("upload part {number} of s3://{bucket}/{key}"))?;
+                let etag =
+                    etag.with_context(|| format!("part {number} of s3://{bucket}/{key}: no ETag"))?;
+                Ok::<_, anyhow::Error>((number, etag))
+            },
+        ))
+        .buffer_unordered(MULTIPART_CONCURRENCY);
+        let mut parts = Vec::new();
+        while let Some(result) = uploads.next().await {
+            parts.push(result?);
+        }
+        parts.sort_unstable_by_key(|(number, _)| *number);
+        Ok(parts)
+    }
+
+    /// Best-effort: a leaked multipart upload only costs storage until the
+    /// bucket lifecycle cleans it, never correctness.
+    async fn abort_multipart(&self, bucket: &str, key: &str, upload_id: &str) {
+        let query = canonical_query(&mut vec![("uploadId", upload_id.to_owned())]);
+        let req = S3Request {
+            method: "DELETE",
+            bucket,
+            key: Some(key),
+            canonical_query: &query,
+            range: None,
+            body: None,
+        };
+        if self.send_resilient(&req, None).await.is_err() {
+            eprintln!("warning: failed to abort multipart upload of s3://{bucket}/{key}");
+        }
     }
 
     /// Upload many objects concurrently; first failure aborts the rest.
@@ -644,18 +849,7 @@ impl S3Client {
                 if let Some(t) = &token {
                     params.push(("continuation-token", t.clone()));
                 }
-                params.sort_by(|a, b| a.0.cmp(b.0));
-                let canonical_query = params
-                    .iter()
-                    .map(|(k, v)| {
-                        format!(
-                            "{}={}",
-                            encode_query_component(k),
-                            encode_query_component(v)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("&");
+                let canonical_query = canonical_query(&mut params);
                 let req = S3Request {
                     method: "GET",
                     bucket,
@@ -664,7 +858,7 @@ impl S3Client {
                     range: None,
                     body: None,
                 };
-                let (_, bytes) = self
+                let (_, _, bytes) = self
                     .send_resilient(&req, None)
                     .await?
                     .with_context(|| format!("list s3://{bucket}: bucket not found"))?;
