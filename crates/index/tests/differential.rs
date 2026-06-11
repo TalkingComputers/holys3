@@ -1,12 +1,16 @@
 mod common;
 
-use common::{corpus, gzipped_corpus, PATTERNS};
+use common::{corpus, encoded_corpus, gzipped_corpus, PATTERNS};
 use holys3_core::{scan_matching_docs, Corpus};
 use holys3_index::{build_to_dir, search_collect, MmapIndexReader};
 
 #[test]
 fn index_equals_scan_for_many_patterns() {
-    for (label, c) in [("plain", corpus()), ("gzipped", gzipped_corpus())] {
+    for (label, c) in [
+        ("plain", corpus()),
+        ("gzipped", gzipped_corpus()),
+        ("encoded", encoded_corpus()),
+    ] {
         for strategy in [
             holys3_core::Strategy::Trigram,
             holys3_core::Strategy::Sparse,

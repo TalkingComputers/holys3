@@ -1,6 +1,6 @@
 mod common;
 
-use common::{corpus, decoded_corpus, gzipped_corpus, PATTERNS};
+use common::{corpus, decoded_corpus, encoded_corpus, gzipped_corpus, PATTERNS};
 use holys3_core::{
     scan_matching_docs, testutil::MemCorpus, Corpus, LocalBlobStore, MatchOptions, Strategy,
 };
@@ -12,7 +12,11 @@ use holys3_index::{
 /// decompressed bodies for both strategies and both corpora.
 #[test]
 fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
-    for (label, c) in [("plain", corpus()), ("gzipped", gzipped_corpus())] {
+    for (label, c) in [
+        ("plain", corpus()),
+        ("gzipped", gzipped_corpus()),
+        ("encoded", encoded_corpus()),
+    ] {
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
             eprintln!("differential_store corpus={label} strategy={strategy:?}");
             let store_dir = tempfile::tempdir()?;

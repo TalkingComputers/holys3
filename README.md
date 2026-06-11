@@ -15,11 +15,11 @@ Indexed regex search for local files and private S3 buckets.
 
 ## Why
 
-S3 has no native grep. holys3 builds a compact index next to the data, uses it to narrow candidate objects, then verifies matches with Rust regexes over the original bytes. Gzip and zstd objects (ALB, CloudTrail, CloudFront, VPC Flow Logs, Vector/Fluentd sinks) are decompressed transparently at both index and search time, and searches can be scoped by key prefix, key regex, or the timestamps embedded in log keys.
+S3 has no native grep. holys3 builds a compact index next to the data, uses it to narrow candidate objects, then verifies matches with Rust regexes over the original bytes. Compressed objects — gzip, zstd, bzip2, xz, snappy (framed), lz4 (ALB, CloudTrail, CloudFront, VPC Flow Logs, Vector/Fluentd/Kafka sinks) — are decompressed transparently at both index and search time; Parquet and Avro objects are searched as a JSON-Lines projection (one row per line). Format detection is by magic bytes only, never file extensions. Searches can be scoped by key prefix, key regex, glob, or the timestamps embedded in log keys.
 
 Use holys3 when:
 
-- You need regex search over many text objects in a private S3 bucket — including gzipped logs.
+- You need regex search over many objects in a private S3 bucket — text, compressed logs, or Parquet/Avro row data.
 - You want the index stored in the same bucket, under `.holys3/`.
 - You want candidate narrowing without trusting the index as the answer.
 

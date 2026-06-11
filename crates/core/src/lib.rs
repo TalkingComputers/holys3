@@ -13,59 +13,226 @@ pub enum Codec {
     Raw,
     Gzip,
     Zstd,
+    Bzip2,
+    SnappyFrame,
+    Lz4Frame,
+    /// `lz4 -l` output (magic 02 21 4c 18): detected so it fails loudly
+    /// instead of being grepped as compressed bytes; not decodable here.
+    Lz4Legacy,
+    Xz,
+    /// Columnar file; decoded as a JSON Lines projection (one row per line).
+    Parquet,
+    /// Avro Object Container File; decoded as JSON Lines (one record per line).
+    Avro,
 }
 
-/// Detect compression by magic bytes; key extensions are not trusted.
-/// Gzip requires the deflate method byte (1f 8b 08) — the only method the
-/// format defines. Zstd covers both regular frames (28 b5 2f fd) and
-/// skippable frames (5? 2a 4d 18), which may legally come first.
+/// Snappy framing format stream identifier (`framing_format.txt` section 4.1).
+const SNAPPY_FRAME_MAGIC: [u8; 10] = [0xff, 0x06, 0x00, 0x00, b's', b'N', b'a', b'P', b'p', b'Y'];
+
+/// Skippable frame (5? 2a 4d 18): byte-identical between zstd and lz4 BY
+/// DESIGN, so frames at the start identify nothing. Returns the offset of
+/// the first non-skippable byte, or `None` when a frame header lies or runs
+/// past EOF (not a valid frame flow).
+fn skip_skippable_frames(bytes: &[u8]) -> Option<usize> {
+    let mut at = 0usize;
+    while let Some(rest) = bytes.get(at..) {
+        if rest.len() >= 8 && rest[0] & 0xf0 == 0x50 && rest[1..4] == [0x2a, 0x4d, 0x18] {
+            let size = u32::from_le_bytes(rest[4..8].try_into().expect("4 bytes")) as usize;
+            match at.checked_add(8 + size) {
+                Some(next) if next <= bytes.len() => at = next,
+                _ => return None,
+            }
+        } else {
+            break;
+        }
+    }
+    Some(at)
+}
+
+/// Detect format by magic bytes; key extensions are not trusted. Every check
+/// is an exact byte comparison from the format's official spec — an object
+/// either matches a magic or it is raw bytes.
+///
+/// - gzip: 1f 8b 08 (deflate is the only method the format defines)
+/// - zstd: 28 b5 2f fd
+/// - bzip2: `BZh` + level `1`..`9` + block magic 0x314159265359 OR
+///   end-of-stream magic 0x177245385090 (empty input) — the 6-byte tail is
+///   what makes a text file starting with literal `BZh1` undetectable as bzip2
+/// - snappy framing format: ff 06 00 00 "sNaPpY" (raw snappy has no magic at
+///   all and is deliberately unsupported as an object format)
+/// - lz4 frame: 04 22 4d 18; legacy frame 02 21 4c 18 detected as unsupported
+/// - xz: fd 37 7a 58 5a 00
+/// - parquet: `PAR1` leading AND trailing (the header alone is printable
+///   ASCII and could open a text file)
+/// - avro object container: `Obj` 01
+///
+/// Skippable frames are shared between zstd and lz4: identity comes from the
+/// first non-skippable frame after them.
 pub fn detect_codec(bytes: &[u8]) -> Codec {
+    let Some(at) = skip_skippable_frames(bytes) else {
+        return Codec::Raw;
+    };
+    if at > 0 {
+        // After skippable frames only zstd/lz4 frames are legal; a flow of
+        // ONLY skippable frames decodes to empty under both — zstd wins.
+        let rest = &bytes[at..];
+        return if rest.is_empty() || rest.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            Codec::Zstd
+        } else if rest.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+            Codec::Lz4Frame
+        } else {
+            Codec::Raw
+        };
+    }
     if bytes.starts_with(&[0x1f, 0x8b, 0x08]) {
         Codec::Gzip
-    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
-        || (bytes.len() >= 4
-            && bytes[0] & 0xf0 == 0x50
-            && bytes[1] == 0x2a
-            && bytes[2] == 0x4d
-            && bytes[3] == 0x18)
-    {
+    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         Codec::Zstd
+    } else if is_bzip2(bytes) {
+        Codec::Bzip2
+    } else if bytes.starts_with(&SNAPPY_FRAME_MAGIC) {
+        Codec::SnappyFrame
+    } else if bytes.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+        Codec::Lz4Frame
+    } else if bytes.starts_with(&[0x02, 0x21, 0x4c, 0x18]) {
+        Codec::Lz4Legacy
+    } else if bytes.starts_with(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) {
+        Codec::Xz
+    } else if bytes.len() >= 12 && bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1") {
+        Codec::Parquet
+    } else if bytes.starts_with(&[b'O', b'b', b'j', 0x01]) {
+        Codec::Avro
     } else {
         Codec::Raw
     }
 }
 
-/// Transparently decompress an object body. Gzip uses `MultiGzDecoder`
-/// because AWS log deliveries (ALB, `CloudTrail`, `CloudFront`) concatenate
-/// gzip members; a single-member decoder silently truncates them. A decode
-/// error after some members already decoded (trailing padding or a truncated
-/// tail) salvages the decoded text with a warning — for grep, partial
-/// coverage beats dropping the object.
+fn is_bzip2(bytes: &[u8]) -> bool {
+    bytes.len() >= 10
+        && bytes.starts_with(b"BZh")
+        && (0x31..=0x39).contains(&bytes[3])
+        && (bytes[4..10] == [0x31, 0x41, 0x59, 0x26, 0x53, 0x59]
+            || bytes[4..10] == [0x17, 0x72, 0x45, 0x38, 0x50, 0x90])
+}
+
+/// Drain a streaming decoder with trailing-garbage salvage: AWS log
+/// deliveries concatenate members and sometimes pad, so a decode error after
+/// some bytes already decoded keeps the decoded text with a warning — for
+/// grep, partial coverage beats dropping the object.
+fn read_salvaging(key: &str, label: &str, reader: &mut dyn std::io::Read) -> AnyhowResult<Vec<u8>> {
+    let mut out = Vec::new();
+    match reader.read_to_end(&mut out) {
+        Ok(_) => Ok(out),
+        Err(err) if !out.is_empty() => {
+            eprintln!(
+                "warning: {key}: {label} stream ends in garbage ({err}); \
+                 searching the {} bytes that decoded",
+                out.len()
+            );
+            Ok(out)
+        }
+        Err(err) => {
+            Err(anyhow::Error::new(err).context(format!("{label} decode failed for {key}")))
+        }
+    }
+}
+
+/// One row per line, schema column order, explicit nulls, RFC3339 timestamps,
+/// hex binary — arrow-json's documented deterministic rendering.
+fn parquet_to_json_lines(key: &str, bytes: Vec<u8>) -> AnyhowResult<Vec<u8>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let context = || format!("parquet decode failed for {key}");
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+        .with_context(context)?
+        .build()
+        .with_context(context)?;
+    let mut writer = arrow_json::writer::WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<_, arrow_json::writer::LineDelimited>(Vec::new());
+    for batch in reader {
+        writer
+            .write(&batch.with_context(context)?)
+            .with_context(context)?;
+    }
+    writer.finish().with_context(context)?;
+    Ok(writer.into_inner())
+}
+
+/// One record per line via the crate's own Value -> JSON conversion.
+fn avro_to_json_lines(key: &str, bytes: &[u8]) -> AnyhowResult<Vec<u8>> {
+    let context = || format!("avro decode failed for {key}");
+    let reader = apache_avro::Reader::new(bytes).with_context(context)?;
+    let mut out = Vec::new();
+    for value in reader {
+        let json =
+            serde_json::Value::try_from(value.with_context(context)?).with_context(context)?;
+        out.extend_from_slice(json.to_string().as_bytes());
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+/// Transparently decode an object body into searchable text. Compressed
+/// objects decompress (multi-member/multi-stream concatenations included);
+/// columnar/container formats project to JSON Lines so the same bytes are
+/// indexed and verified. Detection is by magic bytes only.
 pub fn decode_body(key: &str, bytes: Vec<u8>) -> AnyhowResult<Vec<u8>> {
     match detect_codec(&bytes) {
         Codec::Raw => Ok(bytes),
-        Codec::Gzip => {
+        Codec::Gzip => read_salvaging(
+            key,
+            "gzip",
+            &mut flate2::read::MultiGzDecoder::new(bytes.as_slice()),
+        ),
+        Codec::Zstd => zstd::stream::decode_all(bytes.as_slice())
+            .with_context(|| format!("zstd decode failed for {key}")),
+        Codec::Bzip2 => read_salvaging(
+            key,
+            "bzip2",
+            &mut bzip2::read::MultiBzDecoder::new(bytes.as_slice()),
+        ),
+        Codec::SnappyFrame => read_salvaging(
+            key,
+            "snappy",
+            &mut snap::read::FrameDecoder::new(bytes.as_slice()),
+        ),
+        Codec::Lz4Frame => {
+            // identity may sit after skippable frames the decoder won't skip
+            let at = skip_skippable_frames(&bytes).expect("validated by detect_codec");
+            let mut decoder = lz4_flex::frame::FrameDecoder::new(&bytes[at..]);
             let mut out = Vec::new();
-            match std::io::Read::read_to_end(
-                &mut flate2::read::MultiGzDecoder::new(bytes.as_slice()),
-                &mut out,
-            ) {
-                Ok(_) => Ok(out),
-                Err(err) if !out.is_empty() => {
-                    eprintln!(
-                        "warning: {key}: gzip stream ends in garbage ({err}); \
-                         searching the {} bytes that decoded",
-                        out.len()
-                    );
-                    Ok(out)
-                }
-                Err(err) => {
-                    Err(anyhow::Error::new(err).context(format!("gzip decode failed for {key}")))
+            loop {
+                // each call decodes one frame; Ok(0) = input exhausted
+                match std::io::Read::read_to_end(&mut decoder, &mut out) {
+                    Ok(0) => return Ok(out),
+                    Ok(_) => {}
+                    Err(err) if !out.is_empty() => {
+                        eprintln!(
+                            "warning: {key}: lz4 stream ends in garbage ({err}); \
+                             searching the {} bytes that decoded",
+                            out.len()
+                        );
+                        return Ok(out);
+                    }
+                    Err(err) => {
+                        return Err(
+                            anyhow::Error::new(err).context(format!("lz4 decode failed for {key}"))
+                        )
+                    }
                 }
             }
         }
-        Codec::Zstd => zstd::stream::decode_all(bytes.as_slice())
-            .with_context(|| format!("zstd decode failed for {key}")),
+        Codec::Lz4Legacy => anyhow::bail!(
+            "{key} is an lz4 LEGACY frame (`lz4 -l` output), which holys3 does \
+             not decode; re-compress with the default lz4 frame format"
+        ),
+        Codec::Xz => read_salvaging(
+            key,
+            "xz",
+            &mut liblzma::read::XzDecoder::new_multi_decoder(bytes.as_slice()),
+        ),
+        Codec::Parquet => parquet_to_json_lines(key, bytes),
+        Codec::Avro => avro_to_json_lines(key, &bytes),
     }
 }
 
@@ -290,6 +457,79 @@ pub mod testutil {
                 consume(idx, self.bodies[*id as usize].clone())?;
             }
             Ok(())
+        }
+    }
+
+    /// Format fixtures for differential tests: each encoder produces real
+    /// bytes of its format so engine-vs-oracle equality covers every codec.
+    pub mod encode {
+        use std::io::Write;
+
+        pub fn gzip(data: &[u8]) -> Vec<u8> {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        }
+
+        pub fn zstd(data: &[u8]) -> Vec<u8> {
+            zstd::stream::encode_all(data, 0).unwrap()
+        }
+
+        pub fn bzip2(data: &[u8]) -> Vec<u8> {
+            let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        }
+
+        pub fn snappy_frame(data: &[u8]) -> Vec<u8> {
+            let mut enc = snap::write::FrameEncoder::new(Vec::new());
+            enc.write_all(data).unwrap();
+            enc.into_inner().unwrap()
+        }
+
+        pub fn lz4_frame(data: &[u8]) -> Vec<u8> {
+            let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        }
+
+        pub fn xz(data: &[u8]) -> Vec<u8> {
+            let mut enc = liblzma::write::XzEncoder::new(Vec::new(), 6);
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        }
+
+        /// One string column `line`, one row per input line: the JSON Lines
+        /// projection contains each input line verbatim inside its row.
+        pub fn parquet_of_lines(lines: &[&str]) -> Vec<u8> {
+            use arrow_array::{ArrayRef, RecordBatch, StringArray};
+            use std::sync::Arc;
+            let batch = RecordBatch::try_from_iter(vec![(
+                "line",
+                Arc::new(StringArray::from(lines.to_vec())) as ArrayRef,
+            )])
+            .unwrap();
+            let mut buf = Vec::new();
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            buf
+        }
+
+        /// One record per input line, schema {line: string}.
+        pub fn avro_of_lines(lines: &[&str]) -> Vec<u8> {
+            let schema = apache_avro::Schema::parse_str(
+                r#"{"type":"record","name":"row","fields":[{"name":"line","type":"string"}]}"#,
+            )
+            .unwrap();
+            let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+            for line in lines {
+                let mut record = apache_avro::types::Record::new(&schema).unwrap();
+                record.put("line", *line);
+                writer.append(record).unwrap();
+            }
+            writer.into_inner().unwrap()
         }
     }
 }
@@ -827,6 +1067,192 @@ mod corpus_tests {
         let truncated = gz(b"data")[..6].to_vec();
         let err = decode_body("bad.gz", truncated).unwrap_err();
         assert!(err.to_string().contains("bad.gz"));
+    }
+
+    #[test]
+    fn decode_body_bzip2_including_multistream_and_empty() {
+        use std::io::Write;
+        let bz = |data: &[u8]| {
+            let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        };
+        assert_eq!(detect_codec(&bz(b"hello bzip2")), Codec::Bzip2);
+        assert_eq!(
+            decode_body("k.bz2", bz(b"hello bzip2")).unwrap(),
+            b"hello bzip2"
+        );
+        // bunzip2 semantics: concatenated streams decode to concatenated text
+        let mut multi = bz(b"stream one\n");
+        multi.extend(bz(b"stream two\n"));
+        assert_eq!(
+            decode_body("k.bz2", multi).unwrap(),
+            b"stream one\nstream two\n"
+        );
+        // empty input uses the END-OF-STREAM magic, not the block magic
+        let empty = bz(b"");
+        assert_eq!(detect_codec(&empty), Codec::Bzip2);
+        assert_eq!(decode_body("k.bz2", empty).unwrap(), b"");
+    }
+
+    #[test]
+    fn decode_body_snappy_frame_including_concat() {
+        use std::io::Write;
+        let sz = |data: &[u8]| {
+            let mut enc = snap::write::FrameEncoder::new(Vec::new());
+            enc.write_all(data).unwrap();
+            enc.into_inner().unwrap()
+        };
+        assert_eq!(detect_codec(&sz(b"snappy framed body")), Codec::SnappyFrame);
+        assert_eq!(
+            decode_body("k.sz", sz(b"snappy framed body")).unwrap(),
+            b"snappy framed body"
+        );
+        // the framing spec's concat mechanism: repeated stream identifiers
+        let mut multi = sz(b"part one\n");
+        multi.extend(sz(b"part two\n"));
+        assert_eq!(decode_body("k.sz", multi).unwrap(), b"part one\npart two\n");
+    }
+
+    #[test]
+    fn decode_body_lz4_frame_including_concat_and_skippable() {
+        use std::io::Write;
+        let lz = |data: &[u8]| {
+            let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        };
+        assert_eq!(detect_codec(&lz(b"lz4 frame body")), Codec::Lz4Frame);
+        assert_eq!(
+            decode_body("k.lz4", lz(b"lz4 frame body")).unwrap(),
+            b"lz4 frame body"
+        );
+        // lz4cat semantics: concatenated frames decode in order
+        let mut multi = lz(b"frame one\n");
+        multi.extend(lz(b"frame two\n"));
+        assert_eq!(
+            decode_body("k.lz4", multi).unwrap(),
+            b"frame one\nframe two\n"
+        );
+        // a leading skippable frame (magic shared with zstd) must dispatch to
+        // lz4 because the first REAL frame is lz4
+        let mut skippable = vec![0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 0xaa, 0xbb, 0xcc];
+        skippable.extend(lz(b"after skippable"));
+        assert_eq!(detect_codec(&skippable), Codec::Lz4Frame);
+        assert_eq!(decode_body("k.lz4", skippable).unwrap(), b"after skippable");
+    }
+
+    #[test]
+    fn decode_body_xz_including_multistream() {
+        use std::io::Write;
+        let xz = |data: &[u8]| {
+            let mut enc = liblzma::write::XzEncoder::new(Vec::new(), 6);
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        };
+        assert_eq!(detect_codec(&xz(b"xz body")), Codec::Xz);
+        assert_eq!(decode_body("k.xz", xz(b"xz body")).unwrap(), b"xz body");
+        let mut multi = xz(b"stream a\n");
+        multi.extend(xz(b"stream b\n"));
+        assert_eq!(decode_body("k.xz", multi).unwrap(), b"stream a\nstream b\n");
+    }
+
+    #[test]
+    fn skippable_frames_dispatch_between_zstd_and_lz4() {
+        let skippable = |payload: &[u8]| {
+            let mut frame = vec![0x5a, 0x2a, 0x4d, 0x18];
+            frame.extend(u32::try_from(payload.len()).unwrap().to_le_bytes());
+            frame.extend(payload);
+            frame
+        };
+        // skippable then zstd frame -> zstd, and decodes
+        let mut to_zstd = skippable(b"meta");
+        to_zstd.extend(zstd::stream::encode_all(&b"zstd after skip"[..], 0).unwrap());
+        assert_eq!(detect_codec(&to_zstd), Codec::Zstd);
+        assert_eq!(decode_body("k", to_zstd).unwrap(), b"zstd after skip");
+        // only skippable frames -> empty content under either format
+        assert_eq!(detect_codec(&skippable(b"junkmeta")), Codec::Zstd);
+        assert_eq!(decode_body("k", skippable(b"junkmeta")).unwrap(), b"");
+        // skippable then garbage -> raw bytes, untouched
+        let mut to_raw = skippable(b"x");
+        to_raw.extend(b"not a frame");
+        assert_eq!(detect_codec(&to_raw), Codec::Raw);
+        // truncated skippable header -> raw
+        assert_eq!(
+            detect_codec(&[0x50, 0x2a, 0x4d, 0x18, 0xff, 0xff, 0xff, 0xff]),
+            Codec::Raw
+        );
+    }
+
+    #[test]
+    fn printable_magics_do_not_shadow_text() {
+        // bzip2's "BZh1" prefix is printable; the 6-byte block magic decides
+        assert_eq!(
+            detect_codec(b"BZh1 is a chess move, not a codec"),
+            Codec::Raw
+        );
+        assert_eq!(detect_codec(b"BZh0123456789"), Codec::Raw); // '0' invalid level
+                                                                // parquet needs PAR1 at BOTH ends
+        assert_eq!(detect_codec(b"PAR1 some text file"), Codec::Raw);
+        assert_eq!(detect_codec(b"PAR1tinyPAR1"), Codec::Parquet); // 12 bytes, both ends
+        assert!(decode_body("fake.parquet", b"PAR1tinyPAR1".to_vec()).is_err());
+        // loud, not garbage
+    }
+
+    #[test]
+    fn lz4_legacy_fails_loudly() {
+        let err = decode_body("old.lz4", vec![0x02, 0x21, 0x4c, 0x18, 0, 0, 0, 0]).unwrap_err();
+        assert!(err.to_string().contains("LEGACY"));
+    }
+
+    #[test]
+    fn decode_body_parquet_projects_rows_as_json_lines() {
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use std::sync::Arc;
+        let batch = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+            (
+                "msg",
+                Arc::new(StringArray::from(vec![Some("needle in parquet"), None])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        assert_eq!(detect_codec(&buf), Codec::Parquet);
+        let text = decode_body("k.parquet", buf).unwrap();
+        // explicit nulls keep every row the same shape
+        assert_eq!(
+            text,
+            b"{\"id\":1,\"msg\":\"needle in parquet\"}\n{\"id\":2,\"msg\":null}\n"
+        );
+    }
+
+    #[test]
+    fn decode_body_avro_projects_records_as_json_lines() {
+        use apache_avro::types::Record;
+        let schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"log","fields":[
+                {"name":"id","type":"long"},{"name":"msg","type":"string"}]}"#,
+        )
+        .unwrap();
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        for (id, msg) in [(1i64, "needle in avro"), (2, "hay")] {
+            let mut record = Record::new(&schema).unwrap();
+            record.put("id", id);
+            record.put("msg", msg);
+            writer.append(record).unwrap();
+        }
+        let buf = writer.into_inner().unwrap();
+        assert_eq!(detect_codec(&buf), Codec::Avro);
+        let text = decode_body("k.avro", buf).unwrap();
+        assert_eq!(
+            text,
+            b"{\"id\":1,\"msg\":\"needle in avro\"}\n{\"id\":2,\"msg\":\"hay\"}\n"
+        );
     }
 
     #[test]

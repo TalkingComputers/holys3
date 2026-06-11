@@ -69,6 +69,34 @@ pub(crate) fn gzipped_corpus() -> MemCorpus {
     MemCorpus::new(docs_for(&bodies), bodies)
 }
 
+/// Same corpus with a different format per doc — every supported codec plus
+/// parquet and avro projections carrying the same searchable text.
+pub(crate) fn encoded_corpus() -> MemCorpus {
+    use holys3_core::testutil::encode;
+    let mut bodies: Vec<Vec<u8>> = bodies()
+        .into_iter()
+        .enumerate()
+        .map(|(i, body)| match i % 7 {
+            0 => body,
+            1 => encode::gzip(&body),
+            2 => encode::zstd(&body),
+            3 => encode::bzip2(&body),
+            4 => encode::snappy_frame(&body),
+            5 => encode::lz4_frame(&body),
+            _ => encode::xz(&body),
+        })
+        .collect();
+    bodies.push(encode::parquet_of_lines(&[
+        "the quick brown fox in parquet",
+        "hello world from a parquet row",
+    ]));
+    bodies.push(encode::avro_of_lines(&[
+        "EMAIL: avro@example.com",
+        "second line with world in avro",
+    ]));
+    MemCorpus::new(docs_for(&bodies), bodies)
+}
+
 /// The corpus as plain text: what searches must behave as if they saw.
 pub(crate) fn decoded_corpus(c: &dyn Corpus) -> MemCorpus {
     let docs = c.docs().to_vec();
