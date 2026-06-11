@@ -230,6 +230,11 @@ fn open_source(target: Target, connect: &ConnectArgs) -> Result<Source> {
                 connect.region.is_none() && connect.endpoint.is_none(),
                 "--region/--endpoint only apply to s3:// targets"
             );
+            anyhow::ensure!(
+                dir.is_dir(),
+                "local target {} is not a directory",
+                dir.display()
+            );
             Ok(Source::Local(dir))
         }
         Target::S3 { bucket, prefix } => {
@@ -397,6 +402,7 @@ fn execute_search(
 /// Returns whether anything matched (drives the exit code).
 fn run_search(args: SearchArgs) -> Result<bool> {
     let (patterns, target_raw) = split_pattern_target(args.args, args.regexp)?;
+    patterns::reject_line_terminators(&patterns)?;
     let insensitive = patterns::is_insensitive(args.ignore_case, args.smart_case, &patterns);
     let pattern =
         patterns::compose_pattern(&patterns, args.fixed_strings, args.word_regexp, insensitive);
@@ -411,12 +417,14 @@ fn run_search(args: SearchArgs) -> Result<bool> {
 
     let standard_mode =
         !args.quiet && !args.json && !args.files_with_matches && !args.count && !args.count_matches;
+    // standard output AND --json render context (rg emits context messages
+    // on the JSON wire too); count/quiet/-l modes do not
+    let renders_context = standard_mode || args.json;
     let before = args.before_context.or(args.context).unwrap_or(0);
     let after = args.after_context.or(args.context).unwrap_or(0);
     let options = MatchOptions {
-        // context renders only in standard mode (rg count/quiet behavior)
-        before_context: if standard_mode { before } else { 0 },
-        after_context: if standard_mode { after } else { 0 },
+        before_context: if renders_context { before } else { 0 },
+        after_context: if renders_context { after } else { 0 },
         max_count: args.max_count,
     };
 

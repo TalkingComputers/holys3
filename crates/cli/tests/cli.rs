@@ -259,6 +259,74 @@ fn color_control() {
 }
 
 #[test]
+fn anchors_match_at_line_boundaries() {
+    // rg semantics: ^/$ anchor at every line, not just the object edges
+    let c = corpus();
+    let out = search_pattern(&c, "^tail").arg("-l").output().unwrap();
+    assert_eq!(sorted_lines(&out.stdout), vec![key(&c, "alpha.log")]);
+    let out = search_pattern(&c, "ERROR line$")
+        .arg("-l")
+        .output()
+        .unwrap();
+    assert_eq!(sorted_lines(&out.stdout), vec![key(&c, "alpha.log")]);
+    search_pattern(&c, "^nowhere$").assert().code(1);
+}
+
+#[test]
+fn max_count_zero_yields_nothing_in_every_mode() {
+    let c = corpus();
+    for flags in [
+        vec!["-m", "0"],
+        vec!["-m", "0", "-l"],
+        vec!["-m", "0", "-q"],
+        vec!["-m", "0", "-c"],
+    ] {
+        let out = search(&c).args(&flags).output().unwrap();
+        assert!(out.stdout.is_empty(), "stdout not empty for {flags:?}");
+        assert_eq!(out.status.code(), Some(1), "exit code for {flags:?}");
+    }
+}
+
+#[test]
+fn json_emits_context_messages() {
+    let c = corpus();
+    let out = search_pattern(&c, "another")
+        .args(["--json", "-C", "1"])
+        .output()
+        .unwrap();
+    let types: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert!(
+        types.contains(&"context".to_owned()),
+        "no context messages: {types:?}"
+    );
+}
+
+#[test]
+fn nonexistent_local_target_errors() {
+    let c = corpus();
+    let mut cmd = holys3();
+    cmd.arg("ERROR")
+        .arg("/definitely/not/a/real/dir")
+        .arg("--index")
+        .arg(c.index.path());
+    cmd.assert().code(2);
+}
+
+#[test]
+fn literal_newline_in_pattern_is_rejected() {
+    let c = corpus();
+    search_pattern(&c, "ERROR\ntail").assert().code(2);
+}
+
+#[test]
 fn broken_pipe_is_not_an_error() {
     let c = corpus();
     let assert = search(&c).assert();

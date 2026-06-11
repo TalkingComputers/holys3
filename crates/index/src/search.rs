@@ -96,6 +96,16 @@ pub fn search_streaming(
     options: MatchOptions,
     sink: &dyn MatchSink,
 ) -> Result<SearchStats> {
+    if options.max_count == Some(0) {
+        // rg -m0: zero matching lines per doc means zero results everywhere,
+        // including sinks that never look at match positions
+        return Ok(SearchStats {
+            hits: Vec::new(),
+            candidates: 0,
+            total_docs: reader.total_docs(),
+            bytes_fetched: 0,
+        });
+    }
     let q = holys3_query::plan(pattern, reader.strategy())?;
     let mut keys = reader.candidate_keys(&q, scope.prefix)?;
     keys.retain(|key| scope.admits(key));

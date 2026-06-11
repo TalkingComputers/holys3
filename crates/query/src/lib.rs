@@ -92,7 +92,13 @@ fn hir_query(hir: &regex_syntax::hir::Hir, strategy: Strategy) -> Query {
 }
 
 pub fn plan(pattern: &str, strategy: Strategy) -> anyhow::Result<Query> {
-    Ok(hir_query(&regex_syntax::parse(pattern)?, strategy))
+    // utf8(false) matches the verifier (regex::bytes): patterns like
+    // (?-u)\xff are valid there and must be plannable, not rejected
+    let hir = regex_syntax::ParserBuilder::new()
+        .utf8(false)
+        .build()
+        .parse(pattern)?;
+    Ok(hir_query(&hir, strategy))
 }
 
 #[cfg(test)]

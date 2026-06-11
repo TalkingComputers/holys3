@@ -34,11 +34,26 @@ pub(crate) fn compose_pattern(
             .collect::<Vec<_>>()
             .join("|")
     };
+    // (?m): rg matches line-by-line, so ^ and $ anchor at EVERY line
+    // boundary, not just the start and end of the object
     if insensitive {
-        format!("(?i){joined}")
+        format!("(?mi){joined}")
     } else {
-        joined
+        format!("(?m){joined}")
     }
+}
+
+/// rg rejects literal line terminators in patterns: a match can never span
+/// the line-oriented engine's unit of output, so the result would silently
+/// truncate at the first line.
+pub(crate) fn reject_line_terminators(patterns: &[String]) -> anyhow::Result<()> {
+    for pattern in patterns {
+        anyhow::ensure!(
+            !pattern.contains('\n'),
+            "the literal '\\n' is not allowed in a regex"
+        );
+    }
+    Ok(())
 }
 
 /// Resolve the -i/-S/-s trio (clap guarantees at most one is set).
@@ -91,19 +106,22 @@ mod tests {
 
     #[test]
     fn compose_matrix() {
-        assert_eq!(compose_pattern(&one("a.b"), true, false, false), r"a\.b");
+        assert_eq!(
+            compose_pattern(&one("a.b"), true, false, false),
+            r"(?m)a\.b"
+        );
         assert_eq!(
             compose_pattern(&one("foo"), false, true, false),
-            r"\b(?:foo)\b"
+            r"(?m)\b(?:foo)\b"
         );
         assert_eq!(
             compose_pattern(&["a".into(), "b".into()], false, false, false),
-            "(?:a)|(?:b)"
+            "(?m)(?:a)|(?:b)"
         );
-        assert_eq!(compose_pattern(&one("foo"), false, false, true), "(?i)foo");
+        assert_eq!(compose_pattern(&one("foo"), false, false, true), "(?mi)foo");
         assert_eq!(
             compose_pattern(&["a.".into(), "b".into()], true, true, true),
-            r"(?i)(?:\b(?:a\.)\b)|(?:\b(?:b)\b)"
+            r"(?mi)(?:\b(?:a\.)\b)|(?:\b(?:b)\b)"
         );
     }
 
