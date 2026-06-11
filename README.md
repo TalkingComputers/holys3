@@ -39,19 +39,24 @@ cargo install holys3
 
 ## Quickstart
 
+The CLI follows ripgrep: `holys3 PATTERN TARGET`, where TARGET is
+`s3://bucket[/prefix]` or a local path.
+
 Local directory:
 
 ```sh
-holys3 index --local-dir ./fixtures --out holys3.idxdir --strategy trigram
-holys3 search 'TODO|FIXME' --local-dir ./fixtures --index holys3.idxdir --stats
+holys3 index ./fixtures --out holys3.idxdir
+holys3 'TODO|FIXME' ./fixtures --index holys3.idxdir
 holys3 stats --index holys3.idxdir
 ```
 
 S3 bucket (with an `aws sso login` session — holys3 reads SSO profiles directly):
 
 ```sh
-AWS_PROFILE=my-sso-profile holys3 index --bucket my-log-bucket --region us-east-2 --strategy trigram
-AWS_PROFILE=my-sso-profile holys3 search 'TODO|FIXME' --bucket my-log-bucket --region us-east-2 --stats
+AWS_PROFILE=my-sso-profile holys3 index s3://my-log-bucket/prod --region us-east-2
+AWS_PROFILE=my-sso-profile holys3 'ERROR' s3://my-log-bucket/prod --region us-east-2
+holys3 -i 'timeout' s3://my-log-bucket -g '*.gz' -C2 --since 6h       # rg flags work
+holys3 'req-[0-9a-f]+' s3://my-log-bucket --json | jq .               # rg JSON wire format
 ```
 
 or with static credentials:
@@ -60,51 +65,54 @@ or with static credentials:
 AWS_ACCESS_KEY_ID=<access-key> \
 AWS_SECRET_ACCESS_KEY=<secret-key> \
 AWS_SESSION_TOKEN=<session-token> \
-holys3 search 'TODO|FIXME' --bucket my-log-bucket --region us-east-2 --stats
+holys3 'TODO|FIXME' s3://my-log-bucket --region us-east-2
 ```
 
 ## Usage
 
 ```text
-holys3 index (--local-dir <LOCAL_DIR> | --bucket <BUCKET>) [--prefix <PREFIX>] [--region <REGION>] [--endpoint <URL>] [--concurrency <N>] [--out <OUT>] [--strategy trigram|sparse]
-holys3 search (--local-dir <LOCAL_DIR> | --bucket <BUCKET>) [--prefix <PREFIX>] [--region <REGION>] [--endpoint <URL>] [--concurrency <N>] [--index <INDEX>] [--key-prefix <P>] [--key-regex <RE>] [--since <T>] [--until <T>] [--files-only] [--stats] <PATTERN>
-holys3 stats [--index <INDEX>]
+holys3 PATTERN TARGET [FLAGS]            search (TARGET = s3://bucket[/prefix] or a local path)
+holys3 -e PAT [-e PAT ...] TARGET        multiple patterns (OR), like rg
+holys3 index TARGET [--strategy trigram|sparse] [--rebuild] [--out <DIR>]
+holys3 stats [--index <DIR>]
 ```
+
+Search flags follow ripgrep exactly where the concept maps:
+
+- `-i` / `-S` / `-s` case handling, `-F` fixed strings, `-w` word boundaries
+- `-l` files with matches, `-c` count lines, `--count-matches`, `-m NUM` max per object
+- `-A`/`-B`/`-C NUM` context lines with rg's `-`/`--` separators
+- `-n`/`-N` line numbers, `--column`, `--heading`/`--no-heading` (tty defaults match rg)
+- `-g GLOB` include/`!`exclude key globs (gitignore-style, last match wins)
+- `-q` quiet, `--color WHEN`, `--json` (rg-compatible JSON Lines wire format)
+- exit codes: 0 match, 1 no match, 2 error
+
+holys3-specific: `--key-prefix`, `--key-regex`, `--since`/`--until` (key-embedded
+timestamps), `--stats`, `--region`, `--endpoint`, `--concurrency`, `--index`.
 
 ### `index`
 
-Builds an index for either a local directory or an S3 bucket prefix.
+Builds or incrementally updates the index for TARGET.
 
-- `--local-dir <LOCAL_DIR>`: directory to index.
-- `--bucket <BUCKET>`: S3 bucket to index.
-- `--prefix <PREFIX>`: S3 prefix with directory semantics (`logs` matches `logs/...`, never `logs-old/...`). Defaults to empty.
-- `--region <REGION>`: AWS region. If omitted, `AWS_REGION` is required.
-- `--endpoint <URL>`: S3-compatible endpoint (MinIO, R2, ...). Defaults to AWS.
-- `--concurrency <N>`: peak S3 fetch concurrency. Defaults to 750.
-- `--out <OUT>`: local index directory. Defaults to `holys3.idxdir`.
-- `--strategy trigram|sparse`: index strategy. Defaults to `trigram`.
-
-For S3, the index is written in-bucket under `.holys3/` or `<prefix>/.holys3/` as content-addressed segments. Index runs are incremental: only new or changed objects are fetched and indexed, deletions take effect immediately, and a run against an unchanged bucket costs one listing and nothing else. Small segments merge automatically to keep per-query overhead flat.
+- `s3://bucket[/prefix]`: the index is written in-bucket under `.holys3/` or `<prefix>/.holys3/` as content-addressed segments. Index runs are incremental: only new or changed objects are fetched and indexed, deletions take effect immediately, and a run against an unchanged bucket costs one listing and nothing else. Small segments merge automatically; large index blobs upload as concurrent multipart parts.
+- Local directory: the index is written to `--out` (default `holys3.idxdir`).
+- `--strategy trigram|sparse` picks the gram strategy; `--rebuild` ignores any existing index.
+- `--region` (or `AWS_REGION`), `--endpoint` for S3-compatible stores (MinIO, R2), `--concurrency` for fetch parallelism.
 
 ### `search`
 
 Searches with a prebuilt index and verifies matches against the original bytes.
+Results stream per object as verification completes (unordered across objects,
+like rg's parallel mode). Objects deleted between indexing and searching are
+skipped with a warning; gzip/zstd bodies are decompressed transparently; output
+is pipe-friendly (`holys3 ... | head` terminates cleanly).
 
-- `<PATTERN>`: Rust regex pattern.
-- `--local-dir <LOCAL_DIR>`: local directory to read candidates from.
-- `--bucket <BUCKET>`: S3 bucket to read candidates from.
-- `--prefix <PREFIX>`: S3 prefix with directory semantics. Defaults to empty.
-- `--region <REGION>`: AWS region. If omitted, `AWS_REGION` is required.
-- `--endpoint <URL>`: S3-compatible endpoint (MinIO, R2, ...). Defaults to AWS.
-- `--concurrency <N>`: peak S3 fetch concurrency. Defaults to 750.
-- `--index <INDEX>`: local index directory. Defaults to `holys3.idxdir`.
-- `--key-prefix <P>`: only search objects whose key starts with `P`.
-- `--key-regex <RE>`: only search objects whose key matches `RE`.
-- `--since <T>` / `--until <T>`: only search objects whose key-embedded timestamp overlaps the window. `T` is `2026-06-09`, `2026-06-09T14:30[:00][Z]`, or relative like `6h` / `2d` (ago, UTC). Recognized key shapes: `2026/06/09[/14]` paths, `year=2026/month=06/day=09[/hour=14]`, `dt=`/`date=2026-06-09`, ALB/CloudTrail filename stamps (`20260609T2300Z`), and CloudFront/S3-access-log dashed stamps (`2026-06-09-23`). Keys without a recognizable timestamp are searched anyway (with a note on stderr).
-- `--files-only`: print only matching file or object keys (early-exit per object).
-- `--stats`: print candidate and index statistics to stderr.
-
-Results stream per object as verification completes (unordered across objects, like grep over many files). Objects deleted between indexing and searching are skipped with a warning, and gzip/zstd bodies are decompressed transparently. Output is pipe-friendly (`holys3 search ... | head` terminates cleanly).
+`--since <T>` / `--until <T>` scope by the timestamps embedded in keys. `T` is
+`2026-06-09`, `2026-06-09T14:30[:00][Z]`, or relative like `6h` / `2d` (ago, UTC).
+Recognized key shapes: `2026/06/09[/14]` paths, `year=2026/month=06/day=09[/hour=14]`,
+`dt=`/`date=2026-06-09`, ALB/CloudTrail filename stamps (`20260609T2300Z`), and
+CloudFront/S3-access-log dashed stamps (`2026-06-09-23`). Keys without a
+recognizable timestamp are searched anyway (with a note on stderr).
 
 ### `stats`
 

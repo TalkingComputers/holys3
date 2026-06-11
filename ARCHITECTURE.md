@@ -10,19 +10,19 @@ The main boundary is IO. `holys3-core`, `holys3-query`, `holys3-index`, and `hol
 
 ### Index pipeline
 
-`holys3 index --local-dir ...` walks a local directory, assigns document ids, extracts grams for the selected strategy, writes `terms.fst`, `postings.bin`, and `manifest.bin` to `--out`, and exits.
+`holys3 index <DIR>` walks a local directory, assigns document ids, extracts grams for the selected strategy, writes `terms.fst`, `postings.bin`, and `manifest.bin` to `--out`, and exits.
 
-`holys3 index --bucket ...` lists S3 objects under `--prefix`, filters out `.holys3/`, computes a build id from object keys and etags, builds the same index bytes, writes them under `.holys3/builds/<build-id>/`, and updates `.holys3/CURRENT`.
+`holys3 index s3://bucket[/prefix]` lists the prefix, filters out `.holys3/`, diffs (key, etag) pairs against the union of existing segment doc tables, builds ONE new content-addressed segment over the changes (tombstoning superseded docs), optionally merges small adjacent segments, and atomically swaps `.holys3/segments.bin`. Large segment blobs upload as concurrent multipart parts.
 
 ### Search pipeline
 
-`holys3 search --local-dir ... --index ... <PATTERN>` opens the local index, plans a trigram or sparse query from the regex, reads candidate ids, fetches local files, and prints verified matches or matching files.
+`holys3 <PATTERN> <DIR> --index ...` opens the local index, plans a gram query from the regex (prefix, suffix, AND inner literals), reads candidate ids, fetches local files, and renders rg-style verified results.
 
-`holys3 search --bucket ... <PATTERN>` opens the in-bucket index through the S3 blob store, caches small index metadata locally, reads postings with ranged GETs, fetches candidate objects, and prints only regex-verified results.
+`holys3 <PATTERN> s3://bucket[/prefix]` opens the in-bucket segmented index through the S3 blob store, caches immutable segment blobs locally, reads posting blocks with coalesced ranged GETs, fetches candidate objects concurrently, and renders only regex-verified results (rg-compatible output, JSON wire format, context lines, globs).
 
 ## Code Map
 
-`crates/core` defines `DocId`, `Strategy`, gram extraction, the `Corpus` and `BlobStore` IO traits, local blob storage for tests, regex match rendering, and the scan oracle. Architectural Invariant: core must not perform network IO or know about S3.
+`crates/core` defines `DocId`, `Strategy`, gram extraction, the `Corpus` and `BlobStore` IO traits, local blob storage for tests, the line-oriented `grep_doc` match engine, and the scan oracle. Architectural Invariant: core must not perform network IO or know about S3.
 
 `crates/query` turns a regex pattern into a gram query using regex-syntax literal extraction. It chooses candidate constraints, not matches. Architectural Invariant: query must not read corpus bytes, fetch indexes, or decide final answers.
 
@@ -50,7 +50,7 @@ Fallible boundaries return `anyhow::Result`. Format checks use explicit validati
 
 ### The index lives in the bucket
 
-For S3, index data is written under `.holys3/` or `<prefix>/.holys3/` in the same bucket namespace as the searched objects. The search path reads `.holys3/CURRENT`, opens that build, then uses ranged GETs against postings data to find candidates.
+For S3, index data is written under `.holys3/` or `<prefix>/.holys3/` in the same bucket namespace as the searched objects. The search path reads `.holys3/segments.bin` (the root pointer), opens each live segment, then uses coalesced ranged GETs against postings data to find candidates.
 
 ### Planned trait seams (not yet implemented)
 
