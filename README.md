@@ -175,19 +175,21 @@ incremental too, and `--rebuild` re-ingests everything.
 us-east-2 over the public internet (per-object RTT dominates; in-region is
 far lower). Reproduce with `make bench-s3`.
 
-| scenario      | pattern                     | hits | candidates/total | p50 ms | seq p50 ms |               speedup |
-| ------------- | --------------------------- | ---: | ---------------: | -----: | ---------: | --------------------: |
-| no_match      | `UNMATCHABLE_TOKEN`         |    0 |           0/1000 |      0 |          0 | index fetches nothing |
-| QAll          | `.*`                        | 1000 |        1000/1000 |   1288 |      66828 |                 51.9x |
-| short_literal | `needle`                    |  500 |         500/1000 |    702 |      34825 |                 49.6x |
-| alternation   | `alpha\|beta`               |  314 |         314/1000 |    467 |      22267 |                 47.6x |
-| long_literal  | `longliteralbenchmarktoken` |  334 |         334/1000 |    547 |      23593 |                 43.1x |
-| anchored      | `^ANCHOR_START`             |   91 |          91/1000 |    214 |       5832 |                 27.2x |
-| dot_star_gap  | `(?s)needle.*alpha`         |  100 |         100/1000 |    299 |       7699 |                 25.7x |
+| scenario | pattern | hits | candidates/total | p50 ms | seq p50 ms | speedup |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| no_match | `UNMATCHABLE_TOKEN` | 0 | 0/1000 | 0 | 0 | index fetches nothing |
+| QAll | `.*` | 1000 | 1000/1000 | 2566 | 110239 | 43.0x |
+| short_literal | `needle` | 500 | 500/1000 | 1501 | 54688 | 36.4x |
+| alternation | `alpha\|beta` | 314 | 314/1000 | 1088 | 35729 | 32.8x |
+| anchored | `^ANCHOR_START` | 91 | 91/1000 | 390 | 10204 | 26.1x |
+| long_literal | `longliteralbenchmarktoken` | 334 | 334/1000 | 1810 | 37891 | 20.9x |
+| dot_star_gap | `(?s)needle.*alpha` | 100 | 100/1000 | 1135 | 10984 | 9.7x |
 
-At 100K objects the same needle queries hold at ~1.5 s with exact candidate
-counts (the planted-needle suite returns precisely 1/5/100 matching objects
-out of 100,000).
+Absolute latencies vary with the network (per-object RTT dominates from a
+laptop; in-region EC2 is far lower) — the prune ratios and hits are the
+stable part. At 100K objects the same needle queries return exact candidate
+sets (the planted-needle suite returns precisely 1/5/100 matching objects
+out of 100,000) in ~1.5 s.
 
 **Continuous (CI)** — regenerated on every push against a local MinIO
 (`make bench-minio`); tracks regressions rather than headline latency.
