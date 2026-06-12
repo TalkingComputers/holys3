@@ -7,7 +7,7 @@ mod scope;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use holys3_core::{Corpus, MatchOptions, Strategy};
 use holys3_index::{
@@ -415,7 +415,8 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         args.fixed_strings,
         args.word_regexp,
         insensitive,
-    ))?;
+    ))
+    .with_context(|| format!("invalid pattern {:?}", patterns.join("|")))?;
     let globs = globs::build_glob_filter(&args.glob)?;
     let scope = Scope::from_args(
         args.key_prefix,
