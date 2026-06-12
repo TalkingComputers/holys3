@@ -584,7 +584,7 @@ fn main() -> std::process::ExitCode {
 /// short hash so `a/b` vs `a__b` prefixes (or the same bucket name on two
 /// endpoints) can never share state.
 fn build_cache_dir(endpoint: Option<&str>, bucket: &str, prefix: &str) -> Result<PathBuf> {
-    let mut path = read_cache_home(std::env::var("XDG_CACHE_HOME"), std::env::var("HOME"))?;
+    let mut path = cache_home()?;
     path.push("holys3");
     let scope = format!("{}\0{bucket}\0{prefix}", endpoint.unwrap_or(""));
     path.push(format!(
@@ -605,7 +605,7 @@ fn local_cache_dir(index_dir: &Path) -> Result<PathBuf> {
             index_dir.display()
         )
     })?;
-    let mut path = read_cache_home(std::env::var("XDG_CACHE_HOME"), std::env::var("HOME"))?;
+    let mut path = cache_home()?;
     path.push("holys3");
     path.push(format!(
         "local-{:016x}",
@@ -619,13 +619,24 @@ fn open_local_reader(index_dir: &Path) -> Result<SegmentedReader> {
     SegmentedReader::open(Box::new(LocalBlobStore::new(index_dir)), &cache_dir)
 }
 
+fn cache_home() -> Result<PathBuf> {
+    read_cache_home(
+        std::env::var("XDG_CACHE_HOME"),
+        // HOME on unix; USERPROFILE is the Windows equivalent
+        std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")),
+    )
+}
+
 fn read_cache_home(
     xdg_cache_home: std::result::Result<String, std::env::VarError>,
     home: std::result::Result<String, std::env::VarError>,
 ) -> Result<PathBuf> {
     match xdg_cache_home {
         Ok(path) => Ok(PathBuf::from(path)),
-        Err(std::env::VarError::NotPresent) => Ok(PathBuf::from(home?).join(".cache")),
+        Err(std::env::VarError::NotPresent) => Ok(PathBuf::from(home.map_err(|_| {
+            anyhow::anyhow!("neither XDG_CACHE_HOME, HOME, nor USERPROFILE is set")
+        })?)
+        .join(".cache")),
         Err(err) => Err(err.into()),
     }
 }
