@@ -48,16 +48,12 @@ impl Scope {
         }))
     }
 
-    /// Object-level filter: a key passes when it satisfies prefix/regex and
-    /// its embedded time RANGE overlaps [since, until]. Keys with no
-    /// recognizable timestamp are kept (and counted) — object filtering must
-    /// never silently hide data.
+    /// Object-level filter: a key passes when it satisfies regex/globs and
+    /// its embedded time RANGE overlaps [since, until]. The key prefix is
+    /// NOT checked here — `KeyScope::admits` owns it, via `key_prefix()`.
+    /// Keys with no recognizable timestamp are kept (and counted) — object
+    /// filtering must never silently hide data.
     pub(crate) fn matches(&self, key: &str) -> bool {
-        if let Some(prefix) = &self.key_prefix {
-            if !key.starts_with(prefix.as_str()) {
-                return false;
-            }
-        }
         if let Some(re) = &self.key_regex {
             if !re.is_match(key) {
                 return false;
@@ -424,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_and_regex_filters_compose() {
+    fn prefix_is_exposed_not_enforced_and_regex_filters() {
         let scope = Scope::from_args(
             Some("prod/".into()),
             Some(r"\.gz$".into()),
@@ -434,8 +430,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert_eq!(scope.key_prefix(), Some("prod/"));
         assert!(scope.matches("prod/a.gz"));
-        assert!(!scope.matches("dev/a.gz"));
+        // prefix enforcement lives in KeyScope::admits, not here
+        assert!(scope.matches("dev/a.gz"));
         assert!(!scope.matches("prod/a.txt"));
     }
 

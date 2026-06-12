@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use holys3_core::{decode_body, testutil::MemCorpus, Corpus, DocId};
+use holys3_core::{decode_body, testutil::MemCorpus, Corpus};
 use std::io::Write;
 
 pub(crate) const PATTERNS: &[&str] = &[
@@ -32,15 +32,13 @@ fn bodies() -> Vec<Vec<u8>> {
     bodies.into_iter().map(|b| b.to_vec()).collect()
 }
 
-fn docs_for(bodies: &[Vec<u8>]) -> Vec<(DocId, String)> {
-    (0..bodies.len())
-        .map(|i| (i as DocId, format!("doc{i}")))
-        .collect()
+fn keys_for(bodies: &[Vec<u8>]) -> Vec<String> {
+    (0..bodies.len()).map(|i| format!("doc{i}")).collect()
 }
 
 pub(crate) fn corpus() -> MemCorpus {
     let bodies = bodies();
-    MemCorpus::new(docs_for(&bodies), bodies)
+    MemCorpus::new(keys_for(&bodies), bodies)
 }
 
 fn gzip(data: &[u8]) -> Vec<u8> {
@@ -66,7 +64,7 @@ pub(crate) fn gzipped_corpus() -> MemCorpus {
             _ => gzip(&body),
         })
         .collect::<Vec<_>>();
-    MemCorpus::new(docs_for(&bodies), bodies)
+    MemCorpus::new(keys_for(&bodies), bodies)
 }
 
 /// Same corpus with a different format per doc — every supported codec plus
@@ -94,15 +92,17 @@ pub(crate) fn encoded_corpus() -> MemCorpus {
         "EMAIL: avro@example.com",
         "second line with world in avro",
     ]));
-    MemCorpus::new(docs_for(&bodies), bodies)
+    MemCorpus::new(keys_for(&bodies), bodies)
 }
 
 /// The corpus as plain text: what searches must behave as if they saw.
 pub(crate) fn decoded_corpus(c: &dyn Corpus) -> MemCorpus {
-    let docs = c.docs().to_vec();
-    let bodies = docs
+    let keys: Vec<String> = c.docs().iter().map(|doc| doc.key.clone()).collect();
+    let bodies = c
+        .docs()
         .iter()
-        .map(|&(id, ref key)| decode_body(key, c.fetch(id).unwrap()).unwrap())
+        .enumerate()
+        .map(|(idx, doc)| decode_body(&doc.key, c.fetch(idx).unwrap()).unwrap())
         .collect();
-    MemCorpus::new(docs, bodies)
+    MemCorpus::new(keys, bodies)
 }

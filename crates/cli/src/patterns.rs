@@ -1,29 +1,40 @@
 //! Pattern composition: rg-style -e/-F/-w/-i/-S transforms applied BEFORE
 //! the gram planner and the verifier, so both see the identical final regex.
 
-/// `-F` escapes, `-w` wraps in word boundaries, multiple patterns OR, `-i`
-/// prepends `(?i)`. The result may be an invalid regex — `Regex::new`/`plan`
-/// report that with the real error.
-pub(crate) fn compose_pattern(
+/// THE pattern entry point: escapes (`-F`), resolves case (`-i`/`-S`),
+/// composes (`-w`, multi-pattern OR, `(?m)`), and sanitizes line terminators
+/// — in that order, so the mandatory sanitize step cannot be skipped at a
+/// call site. Smart case analyzes the escaped forms, so `-F -S 'foo('`
+/// stays insensitive like rg.
+pub(crate) fn build_pattern(
     patterns: &[String],
     fixed_strings: bool,
     word_regexp: bool,
-    insensitive: bool,
-) -> String {
+    ignore_case: bool,
+    smart_case: bool,
+) -> anyhow::Result<String> {
+    let patterns: Vec<String> = if fixed_strings {
+        patterns.iter().map(|p| regex::escape(p)).collect()
+    } else {
+        patterns.to_vec()
+    };
+    let insensitive = ignore_case || (smart_case && smart_case_insensitive(&patterns));
+    sanitize_line_terminators(&compose_pattern(&patterns, word_regexp, insensitive))
+}
+
+/// `-w` wraps in word boundaries, multiple patterns OR, `-i` prepends
+/// `(?i)`. The result may be an invalid regex — the sanitize parse reports
+/// that with the real error.
+fn compose_pattern(patterns: &[String], word_regexp: bool, insensitive: bool) -> String {
     let transformed: Vec<String> = patterns
         .iter()
         .map(|p| {
-            let p = if fixed_strings {
-                regex::escape(p)
-            } else {
-                p.clone()
-            };
             if word_regexp {
                 // rg uses HALF word boundaries: full \b mis-anchors when the
                 // pattern's first/last char is a non-word char (`foo(`, `->`)
                 format!(r"\b{{start-half}}(?:{p})\b{{end-half}}")
             } else {
-                p
+                p.clone()
             }
         })
         .collect();
@@ -50,7 +61,7 @@ pub(crate) fn compose_pattern(
 /// `[^x]` and `(?s).` line-oriented — a class spanning \n would swallow
 /// following lines into one phantom match), then reject any literal \n
 /// left (a match can never span the line-oriented unit of output).
-pub(crate) fn sanitize_line_terminators(pattern: &str) -> anyhow::Result<String> {
+fn sanitize_line_terminators(pattern: &str) -> anyhow::Result<String> {
     use regex_syntax::hir::{Class, Hir, HirKind, Literal};
     fn strip(hir: &Hir) -> anyhow::Result<Hir> {
         Ok(match hir.kind() {
@@ -106,20 +117,10 @@ pub(crate) fn sanitize_line_terminators(pattern: &str) -> anyhow::Result<String>
     Ok(strip(&hir)?.to_string())
 }
 
-/// Resolve the -i/-S/-s trio (clap guarantees at most one is set).
-pub(crate) fn is_insensitive(ignore_case: bool, smart_case: bool, patterns: &[String]) -> bool {
-    if ignore_case {
-        return true;
-    }
-    if smart_case {
-        return smart_case_insensitive(patterns);
-    }
-    false
-}
-
 /// rg smart case: insensitive iff the patterns contain at least one literal
 /// character and none of the literal characters are uppercase. Classes like
-/// `\pL` are not literals.
+/// `\pL` are not literals. An unparseable raw pattern is "not lowercase" —
+/// the sanitize parse surfaces the real error.
 fn smart_case_insensitive(patterns: &[String]) -> bool {
     let mut literals = Vec::new();
     for pattern in patterns {
@@ -156,23 +157,31 @@ mod tests {
 
     #[test]
     fn compose_matrix() {
+        assert_eq!(compose_pattern(&one(r"a\.b"), false, false), r"(?m)a\.b");
         assert_eq!(
-            compose_pattern(&one("a.b"), true, false, false),
-            r"(?m)a\.b"
-        );
-        assert_eq!(
-            compose_pattern(&one("foo"), false, true, false),
+            compose_pattern(&one("foo"), true, false),
             r"(?m)\b{start-half}(?:foo)\b{end-half}"
         );
         assert_eq!(
-            compose_pattern(&["a".into(), "b".into()], false, false, false),
+            compose_pattern(&["a".into(), "b".into()], false, false),
             "(?m)(?:a)|(?:b)"
         );
-        assert_eq!(compose_pattern(&one("foo"), false, false, true), "(?mi)foo");
+        assert_eq!(compose_pattern(&one("foo"), false, true), "(?mi)foo");
         assert_eq!(
-            compose_pattern(&["a.".into(), "b".into()], true, true, true),
+            compose_pattern(&[r"a\.".into(), "b".into()], true, true),
             r"(?mi)(?:\b{start-half}(?:a\.)\b{end-half})|(?:\b{start-half}(?:b)\b{end-half})"
         );
+    }
+
+    #[test]
+    fn build_pattern_escapes_fixed_strings() {
+        let re = |p: &str, fixed: bool| {
+            regex::bytes::Regex::new(&build_pattern(&one(p), fixed, false, false, false).unwrap())
+                .unwrap()
+        };
+        assert!(re("a.b", true).is_match(b"a.b"));
+        assert!(!re("a.b", true).is_match(b"axb"));
+        assert!(re("a.b", false).is_match(b"axb"));
     }
 
     #[test]
@@ -197,13 +206,25 @@ mod tests {
 
     #[test]
     fn smart_case_rules() {
-        assert!(is_insensitive(false, true, &one("foo")));
-        assert!(!is_insensitive(false, true, &one("Foo")));
-        assert!(is_insensitive(false, true, &one(r"foo\pL")));
-        assert!(!is_insensitive(false, true, &one(r"Foo\pL")));
-        assert!(!is_insensitive(false, true, &one(r"\d+"))); // no literals
-        assert!(!is_insensitive(false, true, &one("(")));
-        assert!(is_insensitive(true, false, &one("FOO")));
-        assert!(!is_insensitive(false, false, &one("foo")));
+        assert!(smart_case_insensitive(&one("foo")));
+        assert!(!smart_case_insensitive(&one("Foo")));
+        assert!(smart_case_insensitive(&one(r"foo\pL")));
+        assert!(!smart_case_insensitive(&one(r"Foo\pL")));
+        assert!(!smart_case_insensitive(&one(r"\d+"))); // no literals
+        assert!(!smart_case_insensitive(&one("(")));
+        // an unparseable raw pattern errors out of build_pattern
+        assert!(build_pattern(&one("("), false, false, false, true).is_err());
+    }
+
+    #[test]
+    fn fixed_strings_smart_case_analyzes_escaped_pattern() {
+        // rg parity: `rg -F -S 'foo('` matches `FOO(`
+        let re = |p: &str| {
+            regex::bytes::Regex::new(&build_pattern(&one(p), true, false, false, true).unwrap())
+                .unwrap()
+        };
+        assert!(re("foo(").is_match(b"FOO("));
+        assert!(re("Foo(").is_match(b"Foo("));
+        assert!(!re("Foo(").is_match(b"FOO("));
     }
 }

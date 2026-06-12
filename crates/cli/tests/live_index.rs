@@ -1,9 +1,7 @@
 use holys3_core::{DocFetcher, Strategy};
 use holys3_index::{search_collect, update_index, SegmentedReader};
 use holys3_s3::resolve_credentials;
-use holys3_s3::{
-    is_index_key, FetchConfig, ObjectMeta, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
-};
+use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus, S3Fetcher};
 
 #[test]
 fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
@@ -21,7 +19,7 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
         .list(&bucket, "")?
         .into_iter()
         .filter(|object| !is_index_key("", &object.key))
-        .map(|object| (object.key, object.etag))
+        .map(|object| (object.key, object.etag, object.size))
         .collect::<Vec<_>>();
     let store = S3BlobStore::new(client.clone(), bucket.clone(), String::new());
     let cache_dir = tempfile::tempdir()?;
@@ -33,19 +31,11 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
         Strategy::Trigram,
         &listing,
         false,
-        &|keys| {
-            let objects = keys
-                .iter()
-                .map(|key| ObjectMeta {
-                    key: key.clone(),
-                    etag: String::new(),
-                    size: 0,
-                })
-                .collect::<Vec<_>>();
+        &|shard| {
             Ok(Box::new(S3Corpus::new(
                 factory_client.clone(),
                 factory_bucket.clone(),
-                &objects,
+                shard,
             )))
         },
     )?;

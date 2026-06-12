@@ -1,7 +1,7 @@
 use anyhow::{Context, Result as AnyhowResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Codec {
+pub(crate) enum Codec {
     Raw,
     Gzip,
     Zstd,
@@ -60,7 +60,7 @@ fn skip_skippable_frames(bytes: &[u8]) -> Option<usize> {
 ///
 /// Skippable frames are shared between zstd and lz4: identity comes from the
 /// first non-skippable frame after them.
-pub fn detect_codec(bytes: &[u8]) -> Codec {
+pub(crate) fn detect_codec(bytes: &[u8]) -> Codec {
     let Some(at) = skip_skippable_frames(bytes) else {
         return Codec::Raw;
     };

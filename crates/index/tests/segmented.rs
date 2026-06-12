@@ -30,31 +30,27 @@ impl Bucket {
         self.objects.remove(key);
     }
 
-    fn listing(&self) -> Vec<(String, String)> {
+    fn listing(&self) -> Vec<(String, String, u64)> {
         self.objects
             .iter()
             .map(|(key, body)| {
                 (
                     key.clone(),
                     format!("{:016x}", holys3_core::hash_ngram(body)),
+                    body.len() as u64,
                 )
             })
             .collect()
     }
 
-    fn corpus_over(&self, keys: &[String]) -> MemCorpus {
-        let docs = keys
-            .iter()
-            .enumerate()
-            .map(|(i, key)| (i as u32, key.clone()))
-            .collect();
+    fn corpus_over(&self, listing: &[(String, String, u64)]) -> MemCorpus {
+        let keys: Vec<String> = listing.iter().map(|(key, _, _)| key.clone()).collect();
         let bodies = keys.iter().map(|key| self.objects[key].clone()).collect();
-        MemCorpus::new(docs, bodies)
+        MemCorpus::new(keys, bodies)
     }
 
     fn full_corpus(&self) -> MemCorpus {
-        let keys: Vec<String> = self.objects.keys().cloned().collect();
-        self.corpus_over(&keys)
+        self.corpus_over(&self.listing())
     }
 }
 
@@ -79,8 +75,8 @@ impl DocFetcher for BucketFetcher<'_> {
 fn reindex(bucket: &Bucket, store_dir: &Path, cache_dir: &Path, strategy: Strategy) -> Result<()> {
     let store = LocalBlobStore::new(store_dir);
     let listing = bucket.listing();
-    update_index(&store, cache_dir, strategy, &listing, false, &|keys| {
-        Ok(Box::new(bucket.corpus_over(keys)))
+    update_index(&store, cache_dir, strategy, &listing, false, &|shard| {
+        Ok(Box::new(bucket.corpus_over(shard)))
     })?;
     Ok(())
 }
@@ -96,12 +92,14 @@ fn assert_matches_oracle(
 ) -> Result<()> {
     let reader = SegmentedReader::open(Box::new(LocalBlobStore::new(store_dir)), cache_dir)?;
     let full = bucket.full_corpus();
+    let keys: Vec<String> = full.docs().iter().map(|doc| doc.key.clone()).collect();
     let decoded_bodies: Vec<Vec<u8>> = full
         .docs()
         .iter()
-        .map(|(id, key)| decode_body(key, full.fetch(*id).expect("fetch")).expect("decode"))
+        .enumerate()
+        .map(|(idx, doc)| decode_body(&doc.key, full.fetch(idx).expect("fetch")).expect("decode"))
         .collect();
-    let decoded = MemCorpus::new(full.docs().to_vec(), decoded_bodies);
+    let decoded = MemCorpus::new(keys, decoded_bodies);
     for pattern in patterns {
         let fetcher = BucketFetcher(bucket);
         let hits = search_collect(&reader, &fetcher, pattern)?.1.hits;
@@ -212,7 +210,7 @@ fn lifecycle_add_modify_delete_readd() -> Result<()> {
         Strategy::Trigram,
         &listing,
         false,
-        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     assert!(report.up_to_date, "run6 should be a no-op");
     assert_matches_oracle(
@@ -363,7 +361,7 @@ fn corrupt_cache_self_heals_and_stale_segments_evict() -> Result<()> {
 }
 
 #[test]
-fn undecodable_objects_tombstone_and_converge() -> Result<()> {
+fn undecodable_objects_marked_failed_and_converge() -> Result<()> {
     let store_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let mut bucket = Bucket::default();
@@ -387,9 +385,9 @@ fn undecodable_objects_tombstone_and_converge() -> Result<()> {
         Strategy::Trigram,
         &listing,
         false,
-        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
-    assert!(report.up_to_date, "tombstoned object must not loop");
+    assert!(report.up_to_date, "failed-marked object must not loop");
 
     // Replacing the bad object with decodable content picks it up.
     bucket.put("bad.gz", b"needle recovered");
@@ -404,7 +402,7 @@ fn undecodable_objects_tombstone_and_converge() -> Result<()> {
         store_dir.path(),
         cache_dir.path(),
         &["needle", "recovered"],
-        "tombstone-recovery",
+        "failed-doc-recovery",
     )?;
     Ok(())
 }
@@ -431,7 +429,7 @@ fn rebuild_flag_reingests_from_scratch() -> Result<()> {
         Strategy::Trigram,
         &listing,
         true,
-        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     assert!(!report.up_to_date);
     assert_eq!(report.added, 2, "rebuild re-ingests everything");
@@ -502,7 +500,7 @@ fn unreferenced_segment_blobs_are_garbage_collected() -> Result<()> {
         Strategy::Trigram,
         &listing,
         true,
-        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     // dirs may linger empty on local fs; what matters is blob count: exactly
     // one live segment's worth of files (terms + postings + docs)
@@ -613,7 +611,7 @@ fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
         Strategy::Trigram,
         &listing,
         false,
-        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )
     .expect_err("losing writer must error");
     assert!(
@@ -656,7 +654,7 @@ fn same_run_compacted_newborns_are_garbage_collected() -> Result<()> {
         Strategy::Trigram,
         &bucket.listing(),
         false,
-        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     let dirs_on_disk = std::fs::read_dir(store_dir.path().join("segments"))?
         .filter(|e| {
@@ -744,7 +742,7 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
         Strategy::Trigram,
         &listing,
         false,
-        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     );
     assert!(
         result.is_err(),

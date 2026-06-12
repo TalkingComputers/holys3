@@ -14,7 +14,7 @@
 //!
 //! `holys3 index` becomes a diff: list the bucket, compare (key, etag)
 //! against the union of segment doc tables, build ONE new segment over the
-//! changes, tombstone superseded entries, and atomically swap segments.bin.
+//! changes, mark superseded entries dead, and atomically swap segments.bin.
 
 use crate::{candidates_with, INDEX_FORMAT};
 use anyhow::{Context, Result};
@@ -33,20 +33,6 @@ const SEGMENT_DOC_CAP: usize = 4_000_000;
 const SEGMENT_COUNT_TARGET: usize = 8;
 /// Never merge segments whose combined postings exceed this many bytes.
 const MERGE_POSTINGS_CAP: u64 = 256 * 1024 * 1024;
-
-/// Prefix marking docs that contributed no grams (vanished mid-build or
-/// undecodable). The failed etag rides along so the diff retries the doc
-/// only when the OBJECT changes — a permanently undecodable object cannot
-/// force a refetch every run. NUL never appears in real S3 etags.
-const TOMBSTONE_PREFIX: char = '\u{0}';
-
-fn tombstone(etag: &str) -> String {
-    format!("{TOMBSTONE_PREFIX}{etag}")
-}
-
-fn is_tombstone(etag: &str) -> bool {
-    etag.starts_with(TOMBSTONE_PREFIX)
-}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SegmentMeta {
@@ -120,7 +106,18 @@ fn load_segment_list(store: &dyn BlobStore) -> Result<(RootState, Option<String>
     }
 }
 
-type DocsTable = Vec<(String, String)>;
+/// One doc-table entry. `failed` marks docs that contributed no grams
+/// (vanished mid-build or undecodable); the etag rides along so the diff
+/// retries the doc only when the OBJECT changes — a permanently undecodable
+/// object cannot force a refetch every run.
+#[derive(Serialize, Deserialize, Clone)]
+struct DocEntry {
+    key: String,
+    etag: String,
+    failed: bool,
+}
+
+type DocsTable = Vec<DocEntry>;
 
 fn parse_docs(bytes: &[u8]) -> Result<DocsTable> {
     postcard::from_bytes(bytes).context("segment docs.bin unreadable")
@@ -180,17 +177,18 @@ pub struct UpdateReport {
     pub up_to_date: bool,
 }
 
-/// Builds a fetchable corpus over the given keys (ids = positions).
-pub type CorpusFactory<'a> = dyn Fn(&[String]) -> Result<Box<dyn Corpus>> + 'a;
+/// Builds a fetchable corpus over the given listing slice ((key, etag, size)
+/// triples; ids = positions).
+pub type CorpusFactory<'a> = dyn Fn(&[(String, String, u64)]) -> Result<Box<dyn Corpus>> + 'a;
 
 /// Incrementally update the segmented index to match `listing`
-/// ((key, etag) pairs). `make_corpus` builds a fetchable corpus over a given
-/// subset of keys, with ids equal to positions in the slice.
+/// ((key, etag, size) triples). `make_corpus` builds a fetchable corpus over
+/// a given listing slice, with ids equal to positions in the slice.
 pub fn update_index(
     store: &dyn BlobStore,
     cache_dir: &Path,
     strategy: Strategy,
-    listing: &[(String, String)],
+    listing: &[(String, String, u64)],
     rebuild: bool,
     make_corpus: &CorpusFactory<'_>,
 ) -> Result<UpdateReport> {
@@ -240,39 +238,35 @@ pub fn update_index(
         )?)?);
         dead_sets.push(load_dead(store, cache_dir, meta)?);
     }
-    let mut live: HashMap<&str, (usize, u32, &str)> = HashMap::new();
+    let mut live: HashMap<&str, (usize, u32, &DocEntry)> = HashMap::new();
     for (seg_idx, (table, dead)) in tables.iter().zip(&dead_sets).enumerate() {
-        for (local_id, (key, etag)) in table.iter().enumerate() {
+        for (local_id, entry) in table.iter().enumerate() {
             let local_id = local_id as u32;
             if dead.binary_search(&local_id).is_ok() {
                 continue;
             }
             // Later segments overwrite earlier entries for the same key.
-            live.insert(key.as_str(), (seg_idx, local_id, etag.as_str()));
+            live.insert(entry.key.as_str(), (seg_idx, local_id, entry));
         }
     }
 
-    let mut to_add: Vec<(String, String)> = listing
+    let mut to_add: Vec<(String, String, u64)> = listing
         .iter()
-        .filter(|(key, etag)| {
-            live.get(key.as_str()).is_none_or(|(_, _, indexed_etag)| {
-                *indexed_etag != etag.as_str() && *indexed_etag != tombstone(etag)
-            })
+        .filter(|(key, etag, _)| {
+            live.get(key.as_str())
+                .is_none_or(|(_, _, entry)| entry.etag != *etag)
         })
         .cloned()
         .collect();
     to_add.sort_unstable();
     let listed: HashMap<&str, &str> = listing
         .iter()
-        .map(|(key, etag)| (key.as_str(), etag.as_str()))
+        .map(|(key, etag, _)| (key.as_str(), etag.as_str()))
         .collect();
     let mut newly_dead: Vec<(usize, u32)> = live
         .iter()
-        .filter(|(key, (_, _, etag))| match listed.get(*key) {
-            Some(listed_etag) => {
-                let current: &str = etag;
-                current != *listed_etag && current != tombstone(listed_etag)
-            }
+        .filter(|(key, (_, _, entry))| match listed.get(*key) {
+            Some(listed_etag) => entry.etag != **listed_etag,
             None => true,
         })
         .map(|(_, &(seg_idx, local_id, _))| (seg_idx, local_id))
@@ -294,7 +288,7 @@ pub fn update_index(
     let added = to_add.len();
     let removed = newly_dead.len();
 
-    // Fold new tombstones into per-segment dead sets, then drop fully-dead
+    // Fold the new deaths into per-segment dead sets, then drop fully-dead
     // segments (collect_garbage deletes their blobs after the root swap).
     let mut metas = existing;
     for group in newly_dead.chunk_by(|a, b| a.0 == b.0) {
@@ -318,8 +312,7 @@ pub fn update_index(
 
     // Build the new segment(s) over the changes, capped.
     for shard in to_add.chunks(SEGMENT_DOC_CAP) {
-        let keys: Vec<String> = shard.iter().map(|(key, _)| key.clone()).collect();
-        let corpus = make_corpus(&keys)?;
+        let corpus = make_corpus(shard)?;
         let (meta, _) = write_segment(store, corpus.as_ref(), strategy, shard)?;
         // newborns are GC candidates too: a segment born and compacted away
         // in the SAME run would otherwise be in neither before nor after
@@ -389,13 +382,11 @@ fn collect_garbage(store: &dyn BlobStore, before: &[SegmentMeta], after: &[Segme
     }
 }
 
-fn live_doc_count(live: &HashMap<&str, (usize, u32, &str)>) -> usize {
-    live.values()
-        .filter(|(_, _, etag)| !is_tombstone(etag))
-        .count()
+fn live_doc_count(live: &HashMap<&str, (usize, u32, &DocEntry)>) -> usize {
+    live.values().filter(|(_, _, entry)| !entry.failed).count()
 }
 
-/// Live (non-tombstoned) doc count over the final segment set.
+/// Live (non-failed) doc count over the final segment set.
 fn live_after_update(
     store: &dyn BlobStore,
     cache_dir: &Path,
@@ -413,8 +404,8 @@ fn live_after_update(
         total += docs
             .iter()
             .enumerate()
-            .filter(|(local_id, (_, etag))| {
-                dead.binary_search(&(*local_id as u32)).is_err() && !is_tombstone(etag)
+            .filter(|(local_id, entry)| {
+                dead.binary_search(&(*local_id as u32)).is_err() && !entry.failed
             })
             .count();
     }
@@ -446,19 +437,26 @@ fn write_dead(store: &dyn BlobStore, meta: &mut SegmentMeta, dead: &[u32]) -> Re
     Ok(())
 }
 
-/// Build and PUT one segment over `docs` ((key, listing-etag) pairs, sorted
-/// by key; corpus ids = positions). Returns its meta and the doc table.
+/// Build and PUT one segment over `docs` ((key, listing-etag, size) triples,
+/// sorted by key; corpus ids = positions). Returns its meta and the doc
+/// table.
 fn write_segment(
     store: &dyn BlobStore,
     corpus: &dyn Corpus,
     strategy: Strategy,
-    docs: &[(String, String)],
+    docs: &[(String, String, u64)],
 ) -> Result<(SegmentMeta, DocsTable)> {
     let (fst_bytes, postings_buf, ungrammed) = crate::build_index_bytes(corpus, strategy)?;
-    let mut table: DocsTable = docs.to_vec();
+    let mut table: DocsTable = docs
+        .iter()
+        .map(|(key, etag, _)| DocEntry {
+            key: key.clone(),
+            etag: etag.clone(),
+            failed: false,
+        })
+        .collect();
     for id in &ungrammed {
-        let etag = table[*id as usize].1.clone();
-        table[*id as usize].1 = tombstone(&etag);
+        table[*id as usize].failed = true;
     }
     put_segment_blobs(store, &fst_bytes, &postings_buf, &table)
 }
@@ -483,8 +481,8 @@ fn put_segment_blobs(
         terms_fst_len: fst_bytes.len() as u64,
         postings_len: postings_buf.len() as u64,
         docs_len: docs_bytes.len() as u64,
-        min_key: table[0].0.clone(),
-        max_key: table[table.len() - 1].0.clone(),
+        min_key: table[0].key.clone(),
+        max_key: table[table.len() - 1].key.clone(),
         dead_hash: String::new(),
         dead_len: 0,
     };
@@ -532,7 +530,7 @@ fn merge_segments(
 ) -> Result<SegmentMeta> {
     let mut table: DocsTable = Vec::new();
     let mut remaps: Vec<Vec<Option<u32>>> = Vec::with_capacity(victims.len());
-    let mut entries: Vec<(String, String, usize, u32)> = Vec::new();
+    let mut entries: Vec<(DocEntry, usize, u32)> = Vec::new();
     for (seg_idx, (meta, dead)) in victims.iter().enumerate() {
         let docs = parse_docs(&cached_blob(
             store,
@@ -542,16 +540,18 @@ fn merge_segments(
             meta.docs_len,
         )?)?;
         remaps.push(vec![None; docs.len()]);
-        for (local_id, (key, etag)) in docs.into_iter().enumerate() {
+        for (local_id, entry) in docs.into_iter().enumerate() {
             if dead.binary_search(&(local_id as u32)).is_err() {
-                entries.push((key, etag, seg_idx, local_id as u32));
+                entries.push((entry, seg_idx, local_id as u32));
             }
         }
     }
-    entries.sort_unstable();
-    for (new_id, (key, etag, seg_idx, old_id)) in entries.into_iter().enumerate() {
+    // Live keys are unique across the merged segments (a re-added key kills
+    // the older entry), so sorting by key alone is total.
+    entries.sort_unstable_by(|(a, _, _), (b, _, _)| a.key.cmp(&b.key));
+    for (new_id, (entry, seg_idx, old_id)) in entries.into_iter().enumerate() {
         remaps[seg_idx][old_id as usize] = Some(new_id as u32);
-        table.push((key, etag));
+        table.push(entry);
     }
 
     let mut postings: std::collections::BTreeMap<Vec<u8>, Vec<DocId>> =
@@ -756,14 +756,6 @@ impl crate::IndexReader for SegmentedReader {
                     })
                     .collect()
             })?;
-            if let Some(&bad) = ids.iter().find(|&&id| id >= segment.meta.doc_count) {
-                anyhow::bail!(
-                    "posting block of segment {} references doc {bad} >= doc_count {}; \
-                     the index is corrupt — run `holys3 index --rebuild`",
-                    segment.meta.seg_id,
-                    segment.meta.doc_count
-                );
-            }
             let live: Vec<DocId> = ids
                 .into_iter()
                 .filter(|id| segment.dead.binary_search(id).is_err())
@@ -773,14 +765,8 @@ impl crate::IndexReader for SegmentedReader {
             }
             let docs = self.segment_docs(segment)?;
             keys.extend(live.into_iter().filter_map(|id| {
-                let (key, etag) = &docs[id as usize];
-                if is_tombstone(etag) {
-                    return None;
-                }
-                if key_prefix.is_some_and(|prefix| !key.starts_with(prefix)) {
-                    return None;
-                }
-                Some(key.clone())
+                let entry = &docs[id as usize];
+                (!entry.failed).then(|| entry.key.clone())
             }));
         }
         Ok(keys)

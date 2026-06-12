@@ -12,10 +12,11 @@ pub use segment::{update_index, CorpusFactory, SegmentedReader, UpdateReport};
 
 use anyhow::{Context, Result};
 use eval::Selection;
-use holys3_core::{decode_body, grams_index, Corpus, DocFetcher, DocId, Strategy};
+use holys3_core::{decode_body, grams_index, Corpus, Doc, DocFetcher, DocId, Strategy};
 use holys3_query::Query;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// Docs are fetched and gram-extracted in chunks bounded BOTH by doc count
@@ -24,25 +25,25 @@ use std::path::{Path, PathBuf};
 const BUILD_FETCH_CHUNK: usize = 1024;
 const BUILD_FETCH_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Greedy chunk boundaries over `docs()` order respecting both caps; a
+/// Greedy chunk boundaries over `docs()` positions respecting both caps; a
 /// single over-budget doc still forms its own chunk.
-fn build_chunks<'a>(ids: &'a [DocId], sizes: &'a [u64]) -> impl Iterator<Item = &'a [DocId]> {
+fn build_chunks(docs: &[Doc]) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut start = 0usize;
     std::iter::from_fn(move || {
-        if start >= ids.len() {
+        if start >= docs.len() {
             return None;
         }
         let mut end = start;
         let mut bytes = 0u64;
-        while end < ids.len() && end - start < BUILD_FETCH_CHUNK {
-            let size = sizes[ids[end] as usize];
+        while end < docs.len() && end - start < BUILD_FETCH_CHUNK {
+            let size = docs[end].size;
             if end > start && bytes + size > BUILD_FETCH_BYTES {
                 break;
             }
             bytes += size;
             end += 1;
         }
-        let chunk = &ids[start..end];
+        let chunk = start..end;
         start = end;
         Some(chunk)
     })
@@ -51,7 +52,7 @@ fn build_chunks<'a>(ids: &'a [DocId], sizes: &'a [u64]) -> impl Iterator<Item = 
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 4;
+const INDEX_FORMAT: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -74,7 +75,8 @@ pub trait IndexReader {
     fn total_docs(&self) -> usize;
     /// Candidate object keys: a superset of the docs that can match.
     /// `key_prefix` lets implementations prune whole index regions before
-    /// any fetch; the engine re-applies it per key regardless.
+    /// any fetch; candidates MAY include keys outside the prefix — the
+    /// engine filters.
     fn candidate_keys(&self, q: &Query, key_prefix: Option<&str>) -> Result<Vec<String>>;
     fn stats(&self) -> IndexStats;
 }
@@ -237,45 +239,40 @@ pub(crate) fn candidates_with<D: AsRef<[u8]>>(
 
 /// Build terms.fst + postings.bin over the corpus. Also returns the ids of
 /// docs that contributed NO grams because they vanished mid-build (404) or
-/// failed to decompress — segment writers tombstone their etags so the next
-/// incremental run retries them.
+/// failed to decompress — segment writers mark them failed so the next
+/// incremental run retries them only when the object changes.
 fn build_index_bytes(
     corpus: &dyn Corpus,
     strategy: Strategy,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<DocId>)> {
     let mut postings: BTreeMap<Vec<u8>, Vec<DocId>> = BTreeMap::new();
-    let doc_keys = corpus.docs();
-    let ids = doc_keys.iter().map(|&(id, _)| id).collect::<Vec<_>>();
+    let docs = corpus.docs();
     let mut ungrammed: Vec<DocId> = Vec::new();
-    for chunk in build_chunks(&ids, corpus.sizes()) {
-        let fetched = corpus.fetch_many(chunk)?;
+    for chunk in build_chunks(docs) {
+        let fetched = corpus.fetch_many(chunk.clone())?;
         let mut seen = vec![false; chunk.len()];
-        let base = chunk[0];
-        let docs = fetched
+        let grammed = fetched
             .into_par_iter()
-            .filter_map(
-                |(id, bytes)| match decode_body(&doc_keys[id as usize].1, bytes) {
-                    Ok(text) => Some((id, grams_index(&text, strategy))),
-                    Err(err) => {
-                        eprintln!("warning: {err:#}; object excluded from index");
-                        None
-                    }
-                },
-            )
+            .filter_map(|(idx, bytes)| match decode_body(&docs[idx].key, bytes) {
+                Ok(text) => Some((idx, grams_index(&text, strategy))),
+                Err(err) => {
+                    eprintln!("warning: {err:#}; object excluded from index");
+                    None
+                }
+            })
             .collect::<Vec<_>>();
-        for (id, _) in &docs {
-            seen[(id - base) as usize] = true;
+        for (idx, _) in &grammed {
+            seen[idx - chunk.start] = true;
         }
         ungrammed.extend(
             chunk
-                .iter()
                 .zip(&seen)
                 .filter(|(_, seen)| !**seen)
-                .map(|(&id, _)| id),
+                .map(|(idx, _)| idx as DocId),
         );
-        for (id, grams) in docs {
+        for (idx, grams) in grammed {
             for gram in grams {
-                postings.entry(gram).or_default().push(id);
+                postings.entry(gram).or_default().push(idx as DocId);
             }
         }
     }
@@ -285,7 +282,7 @@ fn build_index_bytes(
             ungrammed.len()
         );
     }
-    let (fst_bytes, postings_buf) = serialize_postings(postings, doc_keys.len() as u32)?;
+    let (fst_bytes, postings_buf) = serialize_postings(postings, docs.len() as u32)?;
     ungrammed.sort_unstable();
     Ok((fst_bytes, postings_buf, ungrammed))
 }
@@ -318,9 +315,8 @@ pub(crate) fn serialize_postings(
 }
 
 pub struct LocalCorpus {
-    docs: Vec<(DocId, String)>,
+    docs: Vec<Doc>,
     paths: Vec<PathBuf>,
-    sizes: Vec<u64>,
 }
 
 impl LocalCorpus {
@@ -350,62 +346,64 @@ impl LocalCorpus {
         let key_of = |p: &PathBuf| p.to_string_lossy().into_owned();
         let docs = paths
             .iter()
-            .enumerate()
-            .map(|(i, p)| (i as DocId, key_of(p)))
-            .collect();
-        let sizes = paths
-            .iter()
-            .map(|p| Ok(std::fs::metadata(p)?.len()))
-            .collect::<Result<Vec<u64>>>()?;
-        Ok(LocalCorpus { docs, paths, sizes })
+            .map(|p| {
+                Ok(Doc {
+                    key: key_of(p),
+                    size: std::fs::metadata(p)?.len(),
+                })
+            })
+            .collect::<Result<Vec<Doc>>>()?;
+        Ok(LocalCorpus { docs, paths })
     }
 
-    /// Corpus over exactly `keys` (full file paths; ids = positions): the
-    /// changed subset an incremental index run fetches.
-    pub fn from_keys(keys: &[String]) -> Result<LocalCorpus> {
-        let paths: Vec<PathBuf> = keys.iter().map(PathBuf::from).collect();
-        let docs = keys
+    /// Corpus over exactly the listed files ((key, etag, size) triples; keys
+    /// are full paths; ids = positions): the changed subset an incremental
+    /// index run fetches.
+    pub fn from_listing(listing: &[(String, String, u64)]) -> LocalCorpus {
+        let docs = listing
             .iter()
-            .enumerate()
-            .map(|(i, key)| (i as DocId, key.clone()))
+            .map(|(key, _, size)| Doc {
+                key: key.clone(),
+                size: *size,
+            })
             .collect();
-        let sizes = paths
+        let paths = listing
             .iter()
-            .map(|p| Ok(std::fs::metadata(p)?.len()))
-            .collect::<Result<Vec<u64>>>()?;
-        Ok(LocalCorpus { docs, paths, sizes })
+            .map(|(key, _, _)| PathBuf::from(key))
+            .collect();
+        LocalCorpus { docs, paths }
     }
 
-    /// (key, etag) listing of the walked files. Etags are synthesized as
-    /// `{size}-{mtime_ns}` — the standard freshness heuristic for local
-    /// files, and never NUL-prefixed, so they can't collide with tombstones.
-    pub fn listing(&self) -> Result<Vec<(String, String)>> {
+    /// (key, etag, size) listing of the walked files. Etags are synthesized
+    /// as `{size}-{mtime_ns}` — the standard freshness heuristic for local
+    /// files.
+    pub fn listing(&self) -> Result<Vec<(String, String, u64)>> {
         self.docs
             .iter()
             .zip(&self.paths)
-            .map(|((_, key), path)| {
+            .map(|(doc, path)| {
                 let meta = std::fs::metadata(path)?;
                 let mtime = meta
                     .modified()?
                     .duration_since(std::time::UNIX_EPOCH)
                     .context("file mtime before the unix epoch")?;
-                Ok((key.clone(), format!("{}-{}", meta.len(), mtime.as_nanos())))
+                Ok((
+                    doc.key.clone(),
+                    format!("{}-{}", meta.len(), mtime.as_nanos()),
+                    meta.len(),
+                ))
             })
             .collect()
     }
 }
 
 impl Corpus for LocalCorpus {
-    fn sizes(&self) -> &[u64] {
-        &self.sizes
-    }
-
-    fn docs(&self) -> &[(DocId, String)] {
+    fn docs(&self) -> &[Doc] {
         &self.docs
     }
 
-    fn fetch(&self, id: DocId) -> Result<Vec<u8>> {
-        Ok(std::fs::read(&self.paths[id as usize])?)
+    fn fetch(&self, idx: usize) -> Result<Vec<u8>> {
+        Ok(std::fs::read(&self.paths[idx])?)
     }
 }
 
@@ -437,10 +435,10 @@ mod tests {
     ) -> (tempfile::TempDir, tempfile::TempDir, SegmentedReader) {
         let store_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
-        let listing: Vec<(String, String)> = c
+        let listing: Vec<(String, String, u64)> = c
             .docs()
             .iter()
-            .map(|(_, key)| (key.clone(), format!("etag-{key}")))
+            .map(|doc| (doc.key.clone(), format!("etag-{}", doc.key), doc.size))
             .collect();
         update_index(
             &LocalBlobStore::new(store_dir.path()),
@@ -448,24 +446,20 @@ mod tests {
             strategy,
             &listing,
             false,
-            &|keys| {
-                let docs = keys
-                    .iter()
-                    .enumerate()
-                    .map(|(i, key)| (i as DocId, key.clone()))
-                    .collect();
+            &|shard| {
+                let keys: Vec<String> = shard.iter().map(|(key, _, _)| key.clone()).collect();
                 let bodies = keys
                     .iter()
                     .map(|key| {
-                        let (id, _) = c
+                        let idx = c
                             .docs()
                             .iter()
-                            .find(|(_, k)| k == key)
+                            .position(|doc| doc.key == *key)
                             .expect("listed key exists");
-                        c.fetch(*id)
+                        c.fetch(idx)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Ok(Box::new(MemCorpus::new(docs, bodies)))
+                Ok(Box::new(MemCorpus::new(keys, bodies)))
             },
         )
         .unwrap();
@@ -531,7 +525,7 @@ mod tests {
     #[test]
     fn candidate_superset_then_verify() {
         let c = MemCorpus::new(
-            vec![(0, "x".into()), (1, "y".into())],
+            vec!["x".into(), "y".into()],
             vec![b"world".to_vec(), b"word".to_vec()],
         );
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
@@ -546,7 +540,7 @@ mod tests {
 
     #[test]
     fn all_returns_every_doc() {
-        let c = MemCorpus::new(vec![(0, "x".into())], vec![b"abcdef".to_vec()]);
+        let c = MemCorpus::new(vec!["x".into()], vec![b"abcdef".to_vec()]);
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
             let (_s, _c, r) = build_tmp(&c, strategy);
             assert_eq!(r.candidate_keys(&Query::All, None).unwrap(), vec!["x"]);
@@ -556,7 +550,7 @@ mod tests {
     #[test]
     fn search_collect_returns_verified_matches_and_stats() {
         let c = MemCorpus::new(
-            vec![(0, "x".into()), (1, "y".into())],
+            vec!["x".into(), "y".into()],
             vec![b"abc world".to_vec(), b"nomatch".to_vec()],
         );
         let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
@@ -583,7 +577,7 @@ mod tests {
     #[test]
     fn files_only_streaming_matches_full_search() {
         let c = MemCorpus::new(
-            vec![(0, "x".into()), (1, "y".into()), (2, "z".into())],
+            vec!["x".into(), "y".into(), "z".into()],
             vec![
                 b"abc world".to_vec(),
                 b"nomatch".to_vec(),
@@ -608,7 +602,7 @@ mod tests {
     #[test]
     fn key_filter_prunes_before_fetch() {
         let c = MemCorpus::new(
-            vec![(0, "logs/a".into()), (1, "other/b".into())],
+            vec!["logs/a".into(), "other/b".into()],
             vec![b"abc world".to_vec(), b"abc world".to_vec()],
         );
         let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
@@ -634,7 +628,7 @@ mod tests {
         let mut multi = gz(b"first line\n");
         multi.extend(gz(b"needle in second member\n"));
         let c = MemCorpus::new(
-            vec![(0, "a.log.gz".into()), (1, "b.log".into())],
+            vec!["a.log.gz".into(), "b.log".into()],
             vec![multi, b"plain needle\n".to_vec()],
         );
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
@@ -660,11 +654,11 @@ mod tests {
             }
         }
 
-        let docs = (0..100u32).map(|i| (i, format!("doc{i}"))).collect();
+        let keys = (0..100u32).map(|i| format!("doc{i}")).collect();
         let bodies = (0..100u32)
             .map(|i| format!("needle {i}").into_bytes())
             .collect();
-        let c = MemCorpus::new(docs, bodies);
+        let c = MemCorpus::new(keys, bodies);
         let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
         let stats = search_streaming(
             &r,

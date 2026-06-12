@@ -25,7 +25,7 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
             let listing = c
                 .docs()
                 .iter()
-                .map(|(_, key)| (key.clone(), format!("etag-{key}")))
+                .map(|doc| (doc.key.clone(), format!("etag-{}", doc.key), doc.size))
                 .collect::<Vec<_>>();
             update_index(
                 &store,
@@ -33,24 +33,20 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
                 strategy,
                 &listing,
                 false,
-                &|keys| {
-                    let docs = keys
-                        .iter()
-                        .enumerate()
-                        .map(|(i, key)| (i as u32, key.clone()))
-                        .collect();
+                &|shard| {
+                    let keys: Vec<String> = shard.iter().map(|(key, _, _)| key.clone()).collect();
                     let bodies = keys
                         .iter()
                         .map(|key| {
-                            let (id, _) = c
+                            let idx = c
                                 .docs()
                                 .iter()
-                                .find(|(_, k)| k == key)
+                                .position(|doc| doc.key == *key)
                                 .expect("listed key exists");
-                            c.fetch(*id)
+                            c.fetch(idx)
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
-                    Ok(Box::new(MemCorpus::new(docs, bodies)))
+                    Ok(Box::new(MemCorpus::new(keys, bodies)))
                 },
             )?;
             let reader = SegmentedReader::open(

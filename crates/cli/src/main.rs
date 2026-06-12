@@ -302,11 +302,11 @@ fn build_local(dir: &Path, out: &Path, strategy: Strategy, rebuild: bool) -> Res
     let mut listing = corpus.listing()?;
     // The index itself must never be indexed (the local analogue of the S3
     // path filtering `.holys3/`), or every run would re-ingest the last one.
-    listing.retain(|(key, _)| !Path::new(key).starts_with(&out_canonical));
+    listing.retain(|(key, _, _)| !Path::new(key).starts_with(&out_canonical));
     let store = LocalBlobStore::new(out);
     let cache_dir = local_cache_dir(out)?;
-    let report = update_index(&store, &cache_dir, strategy, &listing, rebuild, &|keys| {
-        Ok(Box::new(LocalCorpus::from_keys(keys)?))
+    let report = update_index(&store, &cache_dir, strategy, &listing, rebuild, &|shard| {
+        Ok(Box::new(LocalCorpus::from_listing(shard)))
     })?;
     if report.up_to_date {
         eprintln!(
@@ -339,34 +339,21 @@ fn list_user_objects(src: &S3Source) -> Result<Vec<ObjectMeta>> {
 }
 
 fn build_s3(src: S3Source, strategy: Strategy, rebuild: bool) -> Result<()> {
-    let objects = list_user_objects(&src)?;
-    // Real sizes let the build bound its fetch chunks by bytes, not just
-    // doc count — a bucket of huge objects must not OOM the indexer.
-    let size_of: std::collections::HashMap<&str, u64> = objects
-        .iter()
-        .map(|object| (object.key.as_str(), object.size))
-        .collect();
-    let listing = objects
-        .iter()
-        .map(|object| (object.key.clone(), object.etag.clone()))
+    // Real sizes ride the listing so the build bounds its fetch chunks by
+    // bytes, not just doc count — a bucket of huge objects must not OOM.
+    let listing = list_user_objects(&src)?
+        .into_iter()
+        .map(|object| (object.key, object.etag, object.size))
         .collect::<Vec<_>>();
     let cache_dir = build_cache_dir(src.endpoint.as_deref(), &src.bucket, &src.prefix)?;
     let store = S3BlobStore::new(src.client.clone(), src.bucket.clone(), src.prefix.clone());
     let client = src.client.clone();
     let bucket = src.bucket.clone();
-    let report = update_index(&store, &cache_dir, strategy, &listing, rebuild, &|keys| {
-        let objects = keys
-            .iter()
-            .map(|key| ObjectMeta {
-                key: key.clone(),
-                etag: String::new(),
-                size: size_of.get(key.as_str()).copied().unwrap_or(0),
-            })
-            .collect::<Vec<_>>();
+    let report = update_index(&store, &cache_dir, strategy, &listing, rebuild, &|shard| {
         Ok(Box::new(S3Corpus::new(
             client.clone(),
             bucket.clone(),
-            &objects,
+            shard,
         )))
     })?;
     let namespace = build_index_namespace(&src.prefix);
@@ -438,13 +425,13 @@ fn execute_search(
 /// Returns whether anything matched (drives the exit code).
 fn run_search(args: SearchArgs) -> Result<bool> {
     let (patterns, target_raw) = split_pattern_target(args.args, args.regexp)?;
-    let insensitive = patterns::is_insensitive(args.ignore_case, args.smart_case, &patterns);
-    let pattern = patterns::sanitize_line_terminators(&patterns::compose_pattern(
+    let pattern = patterns::build_pattern(
         &patterns,
         args.fixed_strings,
         args.word_regexp,
-        insensitive,
-    ))
+        args.ignore_case,
+        args.smart_case,
+    )
     .with_context(|| format!("invalid pattern {:?}", patterns.join("|")))?;
     let globs = globs::build_glob_filter(&args.glob)?;
     let scope = Scope::from_args(

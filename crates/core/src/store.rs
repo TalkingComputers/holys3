@@ -1,25 +1,31 @@
 use crate::grams::hash_ngram;
 use crate::grep::has_line_match;
-use crate::DocId;
 use anyhow::Result as AnyhowResult;
+use std::ops::Range;
 use std::path::PathBuf;
+
+/// One document in a corpus; its id is its position in `Corpus::docs()`.
+pub struct Doc {
+    /// Object key / file path.
+    pub key: String,
+    /// Compressed/raw byte size, bounding the build's per-chunk fetch
+    /// memory; 0 = unknown.
+    pub size: u64,
+}
 
 /// A source of documents for INDEX BUILDS, which need full enumeration.
 /// Implemented by a local dir (tests) and S3 (prod).
 pub trait Corpus {
-    /// All document ids with their keys (object key / file path).
-    fn docs(&self) -> &[(DocId, String)];
-    /// Compressed/raw byte size per doc, aligned with `docs()`. Bounds the
-    /// build's per-chunk fetch memory; 0 = unknown.
-    fn sizes(&self) -> &[u64];
-    /// Fetch the full bytes of one document.
-    fn fetch(&self, id: DocId) -> AnyhowResult<Vec<u8>>;
-    /// Fetch many docs concurrently. Result order is NOT guaranteed; each item
-    /// carries its `DocId`. Implementations may return fewer docs than
-    /// requested when a doc vanished between indexing and fetching.
-    /// Default = sequential, fail-fast.
-    fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, Vec<u8>)>> {
-        ids.iter().map(|&id| Ok((id, self.fetch(id)?))).collect()
+    /// All documents; a doc's id is its position in this slice.
+    fn docs(&self) -> &[Doc];
+    /// Fetch the full bytes of one document by position.
+    fn fetch(&self, idx: usize) -> AnyhowResult<Vec<u8>>;
+    /// Fetch a contiguous run of docs concurrently. Result order is NOT
+    /// guaranteed; each item carries its position. Implementations may
+    /// return fewer docs than requested when a doc vanished between
+    /// indexing and fetching. Default = sequential, fail-fast.
+    fn fetch_many(&self, docs: Range<usize>) -> AnyhowResult<Vec<(usize, Vec<u8>)>> {
+        docs.map(|idx| Ok((idx, self.fetch(idx)?))).collect()
     }
 }
 
@@ -164,10 +170,10 @@ pub fn scan_matching_docs(
     re: &regex::bytes::Regex,
 ) -> AnyhowResult<Vec<String>> {
     let mut hits = Vec::new();
-    for (id, key) in corpus.docs() {
-        let bytes = corpus.fetch(*id)?;
+    for (idx, doc) in corpus.docs().iter().enumerate() {
+        let bytes = corpus.fetch(idx)?;
         if has_line_match(&bytes, re) {
-            hits.push(key.clone());
+            hits.push(doc.key.clone());
         }
     }
     hits.sort_unstable();
@@ -183,7 +189,7 @@ mod tests {
     #[test]
     fn scan_finds_matching_docs() {
         let c = MemCorpus::new(
-            vec![(0, "a".into()), (1, "b".into())],
+            vec!["a".into(), "b".into()],
             vec![b"hello world".to_vec(), b"nothing here".to_vec()],
         );
         let re = regex::bytes::Regex::new("world").unwrap();
@@ -218,7 +224,7 @@ mod tests {
         use crate::testutil::MemCorpus;
         use crate::DocFetcher;
         let c = MemCorpus::new(
-            vec![(0, "a".into()), (1, "b".into())],
+            vec!["a".into(), "b".into()],
             vec![b"one".to_vec(), b"two".to_vec()],
         );
         let keys = vec!["b".to_owned(), "a".to_owned()];
@@ -234,20 +240,16 @@ mod tests {
     #[test]
     fn fetch_many_aborts_on_first_error() {
         struct BrokenCorpus {
-            docs: Vec<(DocId, String)>,
+            docs: Vec<Doc>,
         }
 
         impl Corpus for BrokenCorpus {
-            fn sizes(&self) -> &[u64] {
-                &[2, 2]
-            }
-
-            fn docs(&self) -> &[(DocId, String)] {
+            fn docs(&self) -> &[Doc] {
                 &self.docs
             }
 
-            fn fetch(&self, id: DocId) -> AnyhowResult<Vec<u8>> {
-                if id == 1 {
+            fn fetch(&self, idx: usize) -> AnyhowResult<Vec<u8>> {
+                if idx == 1 {
                     anyhow::bail!("broken");
                 }
                 Ok(b"ok".to_vec())
@@ -255,8 +257,17 @@ mod tests {
         }
 
         let corpus = BrokenCorpus {
-            docs: vec![(0, "a".into()), (1, "b".into())],
+            docs: vec![
+                Doc {
+                    key: "a".into(),
+                    size: 2,
+                },
+                Doc {
+                    key: "b".into(),
+                    size: 2,
+                },
+            ],
         };
-        assert!(corpus.fetch_many(&[0, 1]).is_err());
+        assert!(corpus.fetch_many(0..2).is_err());
     }
 }

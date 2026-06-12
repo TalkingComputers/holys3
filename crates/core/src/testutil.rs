@@ -1,34 +1,33 @@
-use super::{Corpus, DocId};
+use super::{Corpus, Doc};
 use anyhow::Result;
 
 pub struct MemCorpus {
-    docs: Vec<(DocId, String)>,
+    docs: Vec<Doc>,
     bodies: Vec<Vec<u8>>,
-    sizes: Vec<u64>,
 }
 
 impl MemCorpus {
-    pub fn new(docs: Vec<(DocId, String)>, bodies: Vec<Vec<u8>>) -> MemCorpus {
-        let sizes = bodies.iter().map(|b| b.len() as u64).collect();
-        MemCorpus {
-            docs,
-            bodies,
-            sizes,
-        }
+    pub fn new(keys: Vec<String>, bodies: Vec<Vec<u8>>) -> MemCorpus {
+        assert_eq!(keys.len(), bodies.len());
+        let docs = keys
+            .into_iter()
+            .zip(&bodies)
+            .map(|(key, body)| Doc {
+                key,
+                size: body.len() as u64,
+            })
+            .collect();
+        MemCorpus { docs, bodies }
     }
 }
 
 impl Corpus for MemCorpus {
-    fn sizes(&self) -> &[u64] {
-        &self.sizes
-    }
-
-    fn docs(&self) -> &[(DocId, String)] {
+    fn docs(&self) -> &[Doc] {
         &self.docs
     }
 
-    fn fetch(&self, id: DocId) -> Result<Vec<u8>> {
-        Ok(self.bodies[id as usize].clone())
+    fn fetch(&self, idx: usize) -> Result<Vec<u8>> {
+        Ok(self.bodies[idx].clone())
     }
 }
 
@@ -39,12 +38,12 @@ impl crate::DocFetcher for MemCorpus {
         consume: &mut dyn FnMut(usize, Vec<u8>) -> Result<()>,
     ) -> Result<()> {
         for (idx, key) in keys.iter().enumerate() {
-            let (id, _) = self
+            let pos = self
                 .docs
                 .iter()
-                .find(|(_, k)| k == key)
+                .position(|doc| doc.key == *key)
                 .ok_or_else(|| anyhow::anyhow!("unknown key {key}"))?;
-            consume(idx, self.bodies[*id as usize].clone())?;
+            consume(idx, self.bodies[pos].clone())?;
         }
         Ok(())
     }

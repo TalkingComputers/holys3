@@ -50,7 +50,6 @@ pub fn grep_doc(bytes: &[u8], re: &regex::bytes::Regex, options: MatchOptions) -
     let mut ring: VecDeque<(u64, usize, usize)> = VecDeque::new();
     let mut line_no: u64 = 0;
     let mut pos = 0usize;
-    let mut last_emitted: u64 = 0;
     let mut after_remaining = 0usize;
     let mut matched_lines: u64 = 0;
     let mut done = false;
@@ -69,10 +68,9 @@ pub fn grep_doc(bytes: &[u8], re: &regex::bytes::Regex, options: MatchOptions) -
             });
         }
         if !subs.is_empty() && !done {
+            // ring never holds an emitted line: pushes require
+            // after_remaining == 0 and every match drains fully
             while let Some((l, s, e)) = ring.pop_front() {
-                if l <= last_emitted {
-                    continue;
-                }
                 out.push(LineEvent {
                     line: l,
                     kind: LineKind::Context,
@@ -88,7 +86,6 @@ pub fn grep_doc(bytes: &[u8], re: &regex::bytes::Regex, options: MatchOptions) -
                 text: bytes[pos..span_end].to_vec(),
                 submatches: subs,
             });
-            last_emitted = line_no;
             matched_lines += 1;
             after_remaining = options.after_context;
             if options.max_count == Some(matched_lines) {
@@ -102,7 +99,6 @@ pub fn grep_doc(bytes: &[u8], re: &regex::bytes::Regex, options: MatchOptions) -
                 text: bytes[pos..span_end].to_vec(),
                 submatches: subs,
             });
-            last_emitted = line_no;
             after_remaining -= 1;
         } else if options.before_context > 0 {
             if ring.len() == options.before_context {

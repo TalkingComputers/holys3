@@ -6,8 +6,9 @@ pub mod fetch;
 mod sso;
 
 use anyhow::Context;
-use holys3_core::{BlobStore, Corpus, DocFetcher, DocId};
+use holys3_core::{BlobStore, Corpus, Doc, DocFetcher, DocId};
 use holys3_sigv4::Credentials;
+use std::ops::Range;
 
 pub use client::S3Client;
 pub use fetch::FetchConfig;
@@ -244,38 +245,33 @@ impl BlobStore for S3BlobStore {
 pub struct S3Corpus {
     client: S3Client,
     bucket: String,
-    docs: Vec<(DocId, String)>,
-    sizes: Vec<u64>,
+    docs: Vec<Doc>,
 }
 
 impl S3Corpus {
-    pub fn new(client: S3Client, bucket: String, objects: &[ObjectMeta]) -> S3Corpus {
-        let docs = objects
+    pub fn new(client: S3Client, bucket: String, listing: &[(String, String, u64)]) -> S3Corpus {
+        let docs = listing
             .iter()
-            .enumerate()
-            .map(|(i, o)| (i as DocId, o.key.clone()))
+            .map(|(key, _, size)| Doc {
+                key: key.clone(),
+                size: *size,
+            })
             .collect();
-        let sizes = objects.iter().map(|o| o.size).collect();
         S3Corpus {
             client,
             bucket,
             docs,
-            sizes,
         }
     }
 }
 
 impl Corpus for S3Corpus {
-    fn sizes(&self) -> &[u64] {
-        &self.sizes
-    }
-
-    fn docs(&self) -> &[(DocId, String)] {
+    fn docs(&self) -> &[Doc] {
         &self.docs
     }
 
-    fn fetch(&self, id: DocId) -> anyhow::Result<Vec<u8>> {
-        let key = &self.docs[id as usize].1;
+    fn fetch(&self, idx: usize) -> anyhow::Result<Vec<u8>> {
+        let key = &self.docs[idx].key;
         self.client
             .get(&self.bucket, key)?
             .with_context(|| format!("s3://{}/{key} not found", self.bucket))
@@ -283,27 +279,26 @@ impl Corpus for S3Corpus {
 
     /// Concurrent batch fetch. Objects deleted since listing (404) are
     /// skipped with a warning.
-    fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, Vec<u8>)>> {
-        let keys = ids
-            .iter()
-            .map(|&id| (id, self.docs[id as usize].1.clone()))
+    fn fetch_many(&self, docs: Range<usize>) -> anyhow::Result<Vec<(usize, Vec<u8>)>> {
+        let keys = docs
+            .map(|idx| (idx as DocId, self.docs[idx].key.clone()))
             .collect::<Vec<_>>();
-        let mut docs = Vec::with_capacity(keys.len());
+        let mut fetched = Vec::with_capacity(keys.len());
         self.client
-            .get_each(&self.bucket, keys, &mut |id, bytes| match bytes {
+            .get_each(&self.bucket, keys, &mut |idx, bytes| match bytes {
                 Some(bytes) => {
-                    docs.push((id, bytes));
+                    fetched.push((idx as usize, bytes));
                     Ok(())
                 }
                 None => {
                     eprintln!(
                         "warning: s3://{}/{} vanished since listing; skipping",
-                        self.bucket, self.docs[id as usize].1
+                        self.bucket, self.docs[idx as usize].key
                     );
                     Ok(())
                 }
             })?;
-        Ok(docs)
+        Ok(fetched)
     }
 }
 

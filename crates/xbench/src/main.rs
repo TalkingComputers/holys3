@@ -184,7 +184,7 @@ fn upload_dir(manifest: &SeedManifest) -> Result<()> {
         Strategy::Trigram,
         &listing,
         false,
-        &|keys| Ok(Box::new(LocalCorpus::from_keys(keys)?)),
+        &|shard| Ok(Box::new(LocalCorpus::from_listing(shard))),
     )?;
     println!("{}", local_index_dir().display());
     Ok(())
@@ -226,7 +226,7 @@ fn upload_s3(manifest: &SeedManifest) -> Result<()> {
     );
     let listing = objects
         .iter()
-        .map(|object| (object.key.clone(), object.etag.clone()))
+        .map(|object| (object.key.clone(), object.etag.clone(), object.size))
         .collect::<Vec<_>>();
     let cache_dir = reports_dir().join("s3-cache");
     let store = S3BlobStore::new(
@@ -242,19 +242,11 @@ fn upload_s3(manifest: &SeedManifest) -> Result<()> {
         Strategy::Trigram,
         &listing,
         false,
-        &|keys| {
-            let objects = keys
-                .iter()
-                .map(|key| holys3_s3::ObjectMeta {
-                    key: key.clone(),
-                    etag: String::new(),
-                    size: 0,
-                })
-                .collect::<Vec<_>>();
+        &|shard| {
             Ok(Box::new(S3Corpus::new(
                 client.clone(),
                 bucket.clone(),
-                &objects,
+                shard,
             )))
         },
     )?;

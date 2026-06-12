@@ -9,17 +9,17 @@ use std::hint::black_box;
 const SAMPLE: &[u8] = include_bytes!("fixtures/sample.txt");
 
 fn mem_corpus() -> MemCorpus {
-    let mut docs = Vec::new();
+    let mut keys = Vec::new();
     let mut bodies = Vec::new();
     for id in 0..64_u32 {
-        docs.push((id, format!("object-{id:06}.log")));
+        keys.push(format!("object-{id:06}.log"));
         let mut body = SAMPLE.to_vec();
         body.extend_from_slice(
             format!("\nobject_id={id} ERROR42 timeout handleClick\n").as_bytes(),
         );
         bodies.push(body);
     }
-    MemCorpus::new(docs, bodies)
+    MemCorpus::new(keys, bodies)
 }
 
 fn bench_grams(c: &mut Criterion) {
@@ -56,10 +56,10 @@ fn bench_index_reader(c: &mut Criterion) {
     let store_dir = tempfile::tempdir().expect("benchmark setup failed");
     let store = LocalBlobStore::new(store_dir.path());
     let cache_dir = tempfile::tempdir().expect("benchmark setup failed");
-    let listing: Vec<(String, String)> = corpus
+    let listing: Vec<(String, String, u64)> = corpus
         .docs()
         .iter()
-        .map(|(_, key)| (key.clone(), format!("etag-{key}")))
+        .map(|doc| (doc.key.clone(), format!("etag-{}", doc.key), doc.size))
         .collect();
     update_index(
         &store,
@@ -67,24 +67,20 @@ fn bench_index_reader(c: &mut Criterion) {
         Strategy::Sparse,
         &listing,
         false,
-        &|keys| {
-            let docs = keys
-                .iter()
-                .enumerate()
-                .map(|(i, key)| (i as u32, key.clone()))
-                .collect();
+        &|shard| {
+            let keys: Vec<String> = shard.iter().map(|(key, _, _)| key.clone()).collect();
             let bodies = keys
                 .iter()
                 .map(|key| {
-                    let (id, _) = corpus
+                    let idx = corpus
                         .docs()
                         .iter()
-                        .find(|(_, k)| k == key)
+                        .position(|doc| doc.key == *key)
                         .expect("listed key exists");
-                    corpus.fetch(*id)
+                    corpus.fetch(idx)
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            Ok(Box::new(MemCorpus::new(docs, bodies)))
+            Ok(Box::new(MemCorpus::new(keys, bodies)))
         },
     )
     .expect("benchmark setup failed");
