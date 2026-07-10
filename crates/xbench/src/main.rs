@@ -10,9 +10,10 @@ use gen::{
     doc_path, latest_run_path, local_index_dir, objects_dir, read_manifest, remove_dir,
     reports_dir, write_seed, SeedManifest,
 };
-use holys3_core::{Corpus, DocFetcher, LocalBlobStore, Strategy};
+use holys3_core::{DocFetcher, LocalBlobStore, Strategy};
 use holys3_index::{
-    search_collect, update_index, IndexReader, LocalCorpus, LocalFetcher, SegmentedReader,
+    search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, LocalFetcher, NullSink,
+    SegmentedReader,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, s3_client_from_env, S3BlobStore, S3Client, S3Corpus,
@@ -161,23 +162,21 @@ fn main() -> Result<()> {
 }
 
 fn upload(target: UploadTarget) -> Result<()> {
-    let manifest = read_manifest()?;
     match target {
-        UploadTarget::Dir => upload_dir(&manifest),
-        UploadTarget::S3 => upload_s3(&manifest),
+        UploadTarget::Dir => upload_dir(),
+        UploadTarget::S3 => upload_s3(&read_manifest()?),
     }
 }
 
-fn upload_dir(manifest: &SeedManifest) -> Result<()> {
+fn upload_dir() -> Result<()> {
     remove_dir(&local_index_dir())?;
     std::fs::create_dir_all(local_index_dir())?;
+    let listing_started = Instant::now();
     let corpus = LocalCorpus::new(&objects_dir())?;
-    anyhow::ensure!(
-        corpus.docs().len() == manifest.docs.len(),
-        "seed manifest mismatch"
-    );
     let listing = corpus.listing()?;
+    let listing_ms = listing_started.elapsed().as_secs_f64() * 1000.0;
     let store = LocalBlobStore::new(local_index_dir());
+    let build_started = Instant::now();
     update_index(
         &store,
         &dir_cache_dir(),
@@ -186,6 +185,8 @@ fn upload_dir(manifest: &SeedManifest) -> Result<()> {
         false,
         &|shard| Ok(Box::new(LocalCorpus::from_listing(shard))),
     )?;
+    let build_ms = build_started.elapsed().as_secs_f64() * 1000.0;
+    println!("listing_ms={listing_ms:.3} build_ms={build_ms:.3}");
     println!("{}", local_index_dir().display());
     Ok(())
 }
@@ -290,10 +291,12 @@ fn run_dir(
         Box::new(LocalBlobStore::new(local_index_dir())),
         &dir_cache_dir(),
     )?;
+    let fetcher = LocalFetcher::new(concurrency)?;
+    let single_fetcher = LocalFetcher::new(1)?;
     let results = run_all(
         &reader,
-        &LocalFetcher,
-        &LocalFetcher,
+        &fetcher,
+        &single_fetcher,
         &scenarios,
         manifest,
         iterations,
@@ -464,7 +467,14 @@ fn measure_search(
     pattern: &str,
 ) -> Result<SearchMeasurement> {
     let start = Instant::now();
-    let (_, stats) = search_collect(reader, fetcher, pattern)?;
+    let stats = search_streaming(
+        reader,
+        fetcher,
+        pattern,
+        KeyScope::default(),
+        holys3_core::MatchOptions::default(),
+        &NullSink,
+    )?;
     Ok(SearchMeasurement {
         elapsed: start.elapsed(),
         hits: stats.hits,

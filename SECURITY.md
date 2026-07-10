@@ -14,3 +14,11 @@ Include:
 - minimal reproduction steps without real secrets.
 
 Never include AWS access keys, secret keys, session tokens, or private object contents in a report.
+
+## Release Integrity
+
+Every release archive has a SHA-256 checksum and a GitHub build-provenance attestation. Verify a downloaded archive with:
+
+```console
+$ gh attestation verify -R TalkingComputers/holys3 holys3-<target>.tar.gz
+```

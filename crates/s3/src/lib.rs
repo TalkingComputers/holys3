@@ -1,15 +1,19 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! S3 client, blob store, and corpus implementations.
 
+mod cache;
 mod client;
 pub mod fetch;
 mod sso;
 
 use anyhow::Context;
-use holys3_core::{BlobStore, Corpus, Doc, DocFetcher, DocId};
+use holys3_core::{
+    decode_requested, BlobStore, Corpus, DocAddress, DocFetcher, DocId, SourceObject,
+};
 use holys3_sigv4::Credentials;
 use std::ops::Range;
 
+pub use cache::{CacheKey, ObjectCache, ObjectCacheConfig};
 pub use client::S3Client;
 pub use fetch::FetchConfig;
 
@@ -23,7 +27,36 @@ pub fn build_fetch_config(concurrency: usize) -> FetchConfig {
 }
 
 pub fn region_from_env() -> anyhow::Result<String> {
-    std::env::var("AWS_REGION").context("provide --region or set AWS_REGION")
+    let region = std::env::var("AWS_REGION");
+    let default_region = std::env::var("AWS_DEFAULT_REGION");
+    let has_environment = !matches!(&region, Err(std::env::VarError::NotPresent))
+        || !matches!(&default_region, Err(std::env::VarError::NotPresent));
+    let profile_region = if has_environment {
+        None
+    } else {
+        holys3_sigv4::region_from_config()?
+    };
+    read_region(region, default_region, profile_region)
+}
+
+fn read_region(
+    region: Result<String, std::env::VarError>,
+    default_region: Result<String, std::env::VarError>,
+    profile_region: Option<String>,
+) -> anyhow::Result<String> {
+    let region = match region {
+        Ok(region) => region,
+        Err(std::env::VarError::NotPresent) => match default_region {
+            Ok(region) => region,
+            Err(std::env::VarError::NotPresent) => profile_region.context(
+                "provide --region, set AWS_REGION/AWS_DEFAULT_REGION, or configure region in the active AWS profile",
+            )?,
+            Err(error) => return Err(error.into()),
+        },
+        Err(err) => return Err(err.into()),
+    };
+    anyhow::ensure!(!region.is_empty(), "AWS region is empty");
+    Ok(region)
 }
 
 /// Credentials plus the instant they stop working (None = static, never).
@@ -32,11 +65,16 @@ pub struct ResolvedCredentials {
     pub expires_at: Option<time::OffsetDateTime>,
 }
 
-/// Credential chain in botocore precedence order: env vars, then the active
-/// profile's IAM Identity Center (SSO) config, then static keys in
-/// ~/.aws/credentials.
+/// Credential chain in standardized precedence order: env vars, static keys
+/// in ~/.aws/credentials, then the active profile's IAM Identity Center config.
 pub fn resolve_credentials() -> anyhow::Result<ResolvedCredentials> {
-    if let Some(credentials) = holys3_sigv4::from_env() {
+    if let Some(credentials) = holys3_sigv4::from_env()? {
+        return Ok(ResolvedCredentials {
+            credentials,
+            expires_at: None,
+        });
+    }
+    if let Some(credentials) = holys3_sigv4::resolve_static()? {
         return Ok(ResolvedCredentials {
             credentials,
             expires_at: None,
@@ -47,12 +85,6 @@ pub fn resolve_credentials() -> anyhow::Result<ResolvedCredentials> {
         return Ok(ResolvedCredentials {
             credentials,
             expires_at: Some(expires_at),
-        });
-    }
-    if let Some(credentials) = holys3_sigv4::resolve_static()? {
-        return Ok(ResolvedCredentials {
-            credentials,
-            expires_at: None,
         });
     }
     let profile = holys3_sigv4::profile_name()?;
@@ -85,6 +117,15 @@ pub struct ObjectMeta {
     pub size: u64,
 }
 
+fn read_xml_element(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    name: quick_xml::name::QName<'_>,
+) -> anyhow::Result<String> {
+    let text = reader.read_text(name)?;
+    let decoded = text.xml10_content()?;
+    Ok(quick_xml::escape::unescape(&decoded)?.into_owned())
+}
+
 /// Parse one `ListObjectsV2` XML page: returns (`objects`, `next_continuation_token`).
 pub fn parse_list_v2(xml: &str) -> anyhow::Result<(Vec<ObjectMeta>, Option<String>)> {
     use quick_xml::events::Event;
@@ -92,48 +133,163 @@ pub fn parse_list_v2(xml: &str) -> anyhow::Result<(Vec<ObjectMeta>, Option<Strin
     let mut reader = Reader::from_str(xml);
     let mut objs = Vec::new();
     let mut next = None;
-    let (mut key, mut etag, mut size) = (String::new(), String::new(), 0u64);
-    let mut cur = String::new();
+    let mut encoding = None;
+    let (mut key, mut etag, mut size) = (None, None, None);
+    let mut truncated: Option<bool> = None;
     let mut in_contents = false;
+    let mut root_open = false;
+    let mut root_closed = false;
     loop {
         match reader.read_event()? {
             Event::Start(e) => {
-                cur = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                if cur == "Contents" {
-                    in_contents = true;
-                    key.clear();
-                    etag.clear();
-                    size = 0;
+                let name = e.local_name();
+                if name.as_ref() != b"ListBucketResult" {
+                    anyhow::ensure!(root_open && !root_closed, "invalid ListObjectsV2 document");
                 }
-            }
-            Event::Text(t) => {
-                let txt = t.xml10_content()?.into_owned();
-                match cur.as_str() {
-                    "Key" if in_contents => key = txt,
-                    "ETag" if in_contents => etag = txt.trim_matches('"').to_owned(),
-                    "Size" if in_contents => {
-                        size = txt.parse().context("invalid Size in ListObjectsV2")?;
+                match name.as_ref() {
+                    b"ListBucketResult" => {
+                        anyhow::ensure!(!root_open && !root_closed, "invalid ListObjectsV2 root");
+                        root_open = true;
                     }
-                    "NextContinuationToken" => next = Some(txt),
+                    b"Contents" => {
+                        anyhow::ensure!(
+                            root_open && !in_contents,
+                            "invalid ListObjectsV2 Contents"
+                        );
+                        in_contents = true;
+                        key = None;
+                        etag = None;
+                        size = None;
+                    }
+                    b"Key" if in_contents => {
+                        key = Some(read_xml_element(&mut reader, e.name())?);
+                    }
+                    b"ETag" if in_contents => {
+                        etag = Some(read_xml_element(&mut reader, e.name())?);
+                    }
+                    b"Size" if in_contents => {
+                        size = Some(
+                            read_xml_element(&mut reader, e.name())?
+                                .parse()
+                                .context("invalid Size in ListObjectsV2")?,
+                        );
+                    }
+                    b"NextContinuationToken" => {
+                        next = Some(read_xml_element(&mut reader, e.name())?);
+                    }
+                    b"EncodingType" => {
+                        encoding = Some(read_xml_element(&mut reader, e.name())?);
+                    }
+                    b"IsTruncated" => {
+                        truncated = Some(
+                            read_xml_element(&mut reader, e.name())?
+                                .parse()
+                                .context("invalid IsTruncated in ListObjectsV2")?,
+                        );
+                    }
                     _ => {}
                 }
             }
-            Event::End(e) => {
-                if String::from_utf8_lossy(e.name().as_ref()) == "Contents" {
+            Event::End(e) => match e.local_name().as_ref() {
+                b"Contents" => {
+                    anyhow::ensure!(in_contents, "invalid ListObjectsV2 Contents");
                     in_contents = false;
                     objs.push(ObjectMeta {
-                        key: key.clone(),
-                        etag: etag.clone(),
-                        size,
+                        key: key
+                            .take()
+                            .context("Contents missing Key in ListObjectsV2")?,
+                        etag: etag
+                            .take()
+                            .context("Contents missing ETag in ListObjectsV2")?,
+                        size: size
+                            .take()
+                            .context("Contents missing Size in ListObjectsV2")?,
                     });
                 }
-                cur.clear();
+                b"ListBucketResult" => {
+                    anyhow::ensure!(root_open && !in_contents, "invalid ListObjectsV2 root");
+                    root_open = false;
+                    root_closed = true;
+                }
+                _ => {}
+            },
+            Event::Eof => {
+                anyhow::ensure!(
+                    root_closed && !root_open,
+                    "incomplete ListObjectsV2 response"
+                );
+                break;
             }
-            Event::Eof => break,
+            Event::Empty(_) if !root_open || root_closed => {
+                anyhow::bail!("invalid ListObjectsV2 document")
+            }
+            Event::Text(text) if !root_open || root_closed => {
+                let bytes: &[u8] = text.as_ref();
+                anyhow::ensure!(
+                    bytes.iter().all(u8::is_ascii_whitespace),
+                    "invalid ListObjectsV2 document"
+                );
+            }
+            Event::CData(_) if !root_open || root_closed => {
+                anyhow::bail!("invalid ListObjectsV2 document")
+            }
             _ => {}
         }
     }
+    match encoding.as_deref() {
+        Some("url") => {
+            for object in &mut objs {
+                object.key = decode_list_key(&object.key)?;
+            }
+        }
+        Some(other) => anyhow::bail!("unsupported ListObjectsV2 EncodingType {other}"),
+        None => {}
+    }
+    let truncated = truncated.context("ListObjectsV2 response missing IsTruncated")?;
+    anyhow::ensure!(
+        !truncated || next.as_ref().is_some_and(|token| !token.is_empty()),
+        "truncated ListObjectsV2 response missing NextContinuationToken"
+    );
+    anyhow::ensure!(
+        truncated || next.is_none(),
+        "untruncated ListObjectsV2 response included NextContinuationToken"
+    );
     Ok((objs, next))
+}
+
+fn decode_list_key(value: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        valid_percent_encoding(value),
+        "ListObjectsV2 returned malformed URL-encoded Key"
+    );
+    let value = if value.contains('+') {
+        std::borrow::Cow::Owned(value.replace('+', " "))
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    };
+    Ok(percent_encoding::percent_decode_str(&value)
+        .decode_utf8()
+        .context("ListObjectsV2 Key is not valid UTF-8")?
+        .into_owned())
+}
+
+fn valid_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if bytes
+                .get(index + 1..index + 3)
+                .is_none_or(|hex| !hex.iter().all(u8::is_ascii_hexdigit))
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
 }
 
 pub fn build_index_key(prefix: &str, name: &str) -> String {
@@ -145,35 +301,29 @@ pub fn build_index_key(prefix: &str, name: &str) -> String {
 }
 
 pub fn build_index_namespace(prefix: &str) -> String {
-    let prefix = normalize_prefix(prefix);
     if prefix.is_empty() {
         ".holys3".into()
     } else {
-        format!("{prefix}/.holys3")
+        format!("{}.holys3", list_prefix(prefix))
     }
-}
-
-pub fn normalize_prefix(prefix: &str) -> String {
-    prefix
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// `ListObjectsV2` prefix with directory semantics: "foo" must not match
 /// sibling keys like "foobar/x".
 pub fn list_prefix(prefix: &str) -> String {
-    let normalized = normalize_prefix(prefix);
-    if normalized.is_empty() {
-        normalized
+    if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_owned()
     } else {
-        format!("{normalized}/")
+        format!("{prefix}/")
     }
 }
 
 pub fn is_index_key(prefix: &str, key: &str) -> bool {
-    key.starts_with(&format!("{}/", build_index_namespace(prefix)))
+    let namespace = build_index_namespace(prefix);
+    key == namespace
+        || key
+            .strip_prefix(&namespace)
+            .is_some_and(|relative| relative.starts_with('/'))
 }
 
 /// Index blob storage under `<prefix>/.holys3/` in the bucket.
@@ -208,6 +358,11 @@ impl S3BlobStore {
 impl BlobStore for S3BlobStore {
     fn put(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.client.put(&self.bucket, &self.build_key(name), bytes)
+    }
+
+    fn put_file(&self, name: &str, path: &std::path::Path) -> anyhow::Result<()> {
+        self.client
+            .put_file(&self.bucket, &self.build_key(name), path)
     }
 
     fn get(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -245,47 +400,55 @@ impl BlobStore for S3BlobStore {
 pub struct S3Corpus {
     client: S3Client,
     bucket: String,
-    docs: Vec<Doc>,
+    sources: Vec<SourceObject>,
 }
 
 impl S3Corpus {
     pub fn new(client: S3Client, bucket: String, listing: &[(String, String, u64)]) -> S3Corpus {
-        let docs = listing
+        let sources = listing
             .iter()
-            .map(|(key, _, size)| Doc {
+            .map(|(key, version, size)| SourceObject {
                 key: key.clone(),
-                size: *size,
+                version: version.clone(),
+                encoded_size: *size,
             })
             .collect();
         S3Corpus {
             client,
             bucket,
-            docs,
+            sources,
         }
     }
 }
 
 impl Corpus for S3Corpus {
-    fn docs(&self) -> &[Doc] {
-        &self.docs
+    fn sources(&self) -> &[SourceObject] {
+        &self.sources
     }
 
-    fn fetch(&self, idx: usize) -> anyhow::Result<Vec<u8>> {
-        let key = &self.docs[idx].key;
+    fn fetch(&self, idx: usize) -> anyhow::Result<bytes::Bytes> {
+        let source = &self.sources[idx];
         self.client
-            .get(&self.bucket, key)?
-            .with_context(|| format!("s3://{}/{key} not found", self.bucket))
+            .get_if_match(&self.bucket, &source.key, &source.version)?
+            .with_context(|| format!("s3://{}/{} not found", self.bucket, source.key))
     }
 
     /// Concurrent batch fetch. Objects deleted since listing (404) are
     /// skipped with a warning.
-    fn fetch_many(&self, docs: Range<usize>) -> anyhow::Result<Vec<(usize, Vec<u8>)>> {
-        let keys = docs
-            .map(|idx| (idx as DocId, self.docs[idx].key.clone()))
-            .collect::<Vec<_>>();
+    fn fetch_many(&self, sources: Range<usize>) -> anyhow::Result<Vec<(usize, bytes::Bytes)>> {
+        let keys = sources
+            .map(|idx| {
+                Ok((
+                    DocId::try_from(idx)?,
+                    self.sources[idx].key.clone(),
+                    self.sources[idx].version.clone(),
+                    self.sources[idx].encoded_size,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let mut fetched = Vec::with_capacity(keys.len());
         self.client
-            .get_each(&self.bucket, keys, &mut |idx, bytes| match bytes {
+            .get_each_if_match(&self.bucket, keys, &mut |idx, bytes| match bytes {
                 Some(bytes) => {
                     fetched.push((idx as usize, bytes));
                     Ok(())
@@ -293,7 +456,7 @@ impl Corpus for S3Corpus {
                 None => {
                     eprintln!(
                         "warning: s3://{}/{} vanished since listing; skipping",
-                        self.bucket, self.docs[idx as usize].key
+                        self.bucket, self.sources[idx as usize].key
                     );
                     Ok(())
                 }
@@ -306,11 +469,33 @@ impl Corpus for S3Corpus {
 pub struct S3Fetcher {
     client: S3Client,
     bucket: String,
+    endpoint: String,
+    cache: Option<ObjectCache>,
 }
 
 impl S3Fetcher {
     pub fn new(client: S3Client, bucket: String) -> S3Fetcher {
-        S3Fetcher { client, bucket }
+        let endpoint = client.endpoint_identity();
+        S3Fetcher {
+            client,
+            bucket,
+            endpoint,
+            cache: None,
+        }
+    }
+
+    pub fn with_cache(
+        client: S3Client,
+        bucket: String,
+        config: ObjectCacheConfig,
+    ) -> anyhow::Result<S3Fetcher> {
+        let endpoint = client.endpoint_identity();
+        Ok(S3Fetcher {
+            client,
+            bucket,
+            endpoint,
+            cache: Some(ObjectCache::open(&config.root, config.cap_bytes)?),
+        })
     }
 }
 
@@ -319,21 +504,88 @@ impl DocFetcher for S3Fetcher {
     /// skipped with a warning — the index entry is stale, not the search.
     fn fetch_each(
         &self,
-        keys: &[String],
-        consume: &mut dyn FnMut(usize, Vec<u8>) -> anyhow::Result<()>,
+        documents: &[DocAddress],
+        consume: &mut dyn FnMut(usize, bytes::Bytes) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let indexed_keys = keys
-            .iter()
-            .enumerate()
-            .map(|(idx, key)| (idx as DocId, key.clone()))
-            .collect::<Vec<_>>();
+        let mut grouped = std::collections::BTreeMap::new();
+        for (idx, document) in documents.iter().enumerate() {
+            grouped
+                .entry((
+                    document.source_key.clone(),
+                    document.source_version.clone(),
+                    document.encoded_size,
+                ))
+                .or_insert_with(Vec::new)
+                .push((idx, document.member_path.clone()));
+        }
+        let groups = grouped.into_iter().collect::<Vec<_>>();
+        let mut indexed_keys = Vec::new();
+        if let Some(cache) = &self.cache {
+            let cache_keys = groups
+                .iter()
+                .map(|((key, version, _), _)| CacheKey {
+                    endpoint: &self.endpoint,
+                    bucket: &self.bucket,
+                    key,
+                    version,
+                })
+                .collect::<Vec<_>>();
+            cache.get_each(
+                &cache_keys,
+                self.client.max_concurrency(),
+                &mut |idx, body| {
+                    let ((key, version, encoded_size), requests) = &groups[idx];
+                    match body {
+                        Some(bytes) => decode_requested(key, requests, bytes, consume),
+                        None => {
+                            indexed_keys.push((
+                                DocId::try_from(idx)?,
+                                key.clone(),
+                                version.clone(),
+                                *encoded_size,
+                            ));
+                            Ok(())
+                        }
+                    }
+                },
+            )?;
+        } else {
+            indexed_keys = groups
+                .iter()
+                .enumerate()
+                .map(|(idx, ((key, version, encoded_size), _))| {
+                    Ok((
+                        DocId::try_from(idx)?,
+                        key.clone(),
+                        version.clone(),
+                        *encoded_size,
+                    ))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+        }
         self.client
-            .get_each(&self.bucket, indexed_keys, &mut |idx, bytes| match bytes {
-                Some(bytes) => consume(idx as usize, bytes),
+            .get_each_if_match(&self.bucket, indexed_keys, &mut |idx, bytes| match bytes {
+                Some(bytes) => {
+                    let ((key, version, _), requests) = &groups[idx as usize];
+                    decode_requested(key, requests, bytes.clone(), consume)?;
+                    if let Some(cache) = &self.cache {
+                        cache.put(
+                            &CacheKey {
+                                endpoint: &self.endpoint,
+                                bucket: &self.bucket,
+                                key,
+                                version,
+                            },
+                            &bytes,
+                        )?;
+                    }
+                    Ok(())
+                }
                 None => {
+                    let ((key, _, _), _) = &groups[idx as usize];
                     eprintln!(
                         "warning: s3://{}/{} vanished since indexing; skipping",
-                        self.bucket, keys[idx as usize]
+                        self.bucket, key
                     );
                     Ok(())
                 }
@@ -344,6 +596,28 @@ impl DocFetcher for S3Fetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use holys3_core::{DocAddress, DocFetcher, SourceEncoding};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn start_body_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let read = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        (format!("http://{address}"), thread)
+    }
 
     #[test]
     fn parse_two_objects_with_token() {
@@ -351,6 +625,7 @@ mod tests {
         <ListBucketResult>
           <Contents><Key>a.txt</Key><Size>10</Size><ETag>"abc"</ETag></Contents>
           <Contents><Key>b/c.log</Key><Size>20</Size><ETag>"def"</ETag></Contents>
+          <IsTruncated>true</IsTruncated>
           <NextContinuationToken>TOK</NextContinuationToken>
         </ListBucketResult>"#;
         let (objs, next) = parse_list_v2(xml).unwrap();
@@ -359,12 +634,12 @@ mod tests {
             vec![
                 ObjectMeta {
                     key: "a.txt".into(),
-                    etag: "abc".into(),
+                    etag: "\"abc\"".into(),
                     size: 10
                 },
                 ObjectMeta {
                     key: "b/c.log".into(),
-                    etag: "def".into(),
+                    etag: "\"def\"".into(),
                     size: 20
                 },
             ]
@@ -373,10 +648,141 @@ mod tests {
     }
 
     #[test]
+    fn grouped_archive_fetches_once_and_warm_cache_avoids_origin() {
+        let body = holys3_core::testutil::encode::zip(&[("a.log", b"alpha"), ("b.log", b"beta")]);
+        let (endpoint, server) = start_body_server(body.clone());
+        let client = S3Client::new(
+            "us-east-1".into(),
+            Credentials {
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                session_token: None,
+            },
+            Some(endpoint),
+            FetchConfig::default(),
+        )
+        .unwrap();
+        let documents = [
+            DocAddress {
+                display_key: "bundle.zip!/a.log".into(),
+                source_key: "bundle.zip".into(),
+                source_version: "\"etag\"".into(),
+                encoded_size: body.len() as u64,
+                encoding: SourceEncoding::Zip,
+                member_path: Some("a.log".into()),
+            },
+            DocAddress {
+                display_key: "bundle.zip!/b.log".into(),
+                source_key: "bundle.zip".into(),
+                source_version: "\"etag\"".into(),
+                encoded_size: body.len() as u64,
+                encoding: SourceEncoding::Zip,
+                member_path: Some("b.log".into()),
+            },
+        ];
+        let cache = tempfile::tempdir().unwrap();
+        let config = ObjectCacheConfig {
+            root: cache.path().to_path_buf(),
+            cap_bytes: 1024 * 1024,
+        };
+        let fetcher =
+            S3Fetcher::with_cache(client.clone(), "bucket".into(), config.clone()).unwrap();
+        let mut first = Vec::new();
+        fetcher
+            .fetch_each(&documents, &mut |idx, bytes| {
+                first.push((idx, bytes));
+                Ok(())
+            })
+            .unwrap();
+        first.sort_unstable_by_key(|(idx, _)| *idx);
+        assert_eq!(
+            first,
+            [
+                (0, bytes::Bytes::from_static(b"alpha")),
+                (1, bytes::Bytes::from_static(b"beta"))
+            ]
+        );
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.contains("if-match: \"etag\"\r\n"), "{request}");
+
+        let fetcher = S3Fetcher::with_cache(client, "bucket".into(), config).unwrap();
+        let mut warm = Vec::new();
+        fetcher
+            .fetch_each(&documents, &mut |idx, bytes| {
+                warm.push((idx, bytes));
+                Ok(())
+            })
+            .unwrap();
+        warm.sort_unstable_by_key(|(idx, _)| *idx);
+        assert_eq!(warm, first);
+    }
+
+    #[test]
+    fn parse_list_v2_unescapes_keys_and_tokens() {
+        let xml = r#"<ListBucketResult><Contents><Key>a&amp;b</Key><Size>1</Size><ETag>&quot;abc&quot;</ETag></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>x&amp;y</NextContinuationToken></ListBucketResult>"#;
+        let (objects, next) = parse_list_v2(xml).unwrap();
+        assert_eq!(objects[0].key, "a&b");
+        assert_eq!(objects[0].etag, "\"abc\"");
+        assert_eq!(next.as_deref(), Some("x&y"));
+    }
+
+    #[test]
+    fn parse_list_v2_decodes_url_encoded_keys_only() {
+        let xml = r#"<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>logs%2Fspace+and%2Bplus%2F%F0%9F%92%BE%25100.log</Key><Size>1</Size><ETag>&quot;abc&quot;</ETag></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>x%2Fy+z</NextContinuationToken></ListBucketResult>"#;
+        let (objects, next) = parse_list_v2(xml).unwrap();
+        assert_eq!(objects[0].key, "logs/space and+plus/💾%100.log");
+        assert_eq!(next.as_deref(), Some("x%2Fy+z"));
+
+        let malformed = r#"<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>bad%2</Key><Size>1</Size><ETag>&quot;abc&quot;</ETag></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#;
+        assert!(parse_list_v2(malformed).is_err());
+    }
+
+    #[test]
     fn parse_list_v2_rejects_invalid_size() {
-        let xml = r#"<ListBucketResult><Contents><Key>a.txt</Key><Size>nope</Size><ETag>"abc"</ETag></Contents></ListBucketResult>"#;
+        let xml = r#"<ListBucketResult><Contents><Key>a.txt</Key><Size>nope</Size><ETag>"abc"</ETag></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#;
         let err = parse_list_v2(xml).unwrap_err();
         assert!(err.to_string().contains("invalid Size in ListObjectsV2"));
+    }
+
+    #[test]
+    fn parse_list_v2_rejects_missing_object_fields() {
+        for (xml, field) in [
+            (
+                r#"<ListBucketResult><Contents><Size>1</Size><ETag>"abc"</ETag></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#,
+                "Key",
+            ),
+            (
+                r#"<ListBucketResult><Contents><Key>a</Key><ETag>"abc"</ETag></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#,
+                "Size",
+            ),
+            (
+                r#"<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#,
+                "ETag",
+            ),
+        ] {
+            let err = parse_list_v2(xml).unwrap_err();
+            assert!(err.to_string().contains(field), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn parse_list_v2_requires_token_for_truncated_page() {
+        let xml = r#"<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>"#;
+        let err = parse_list_v2(xml).unwrap_err();
+        assert!(err.to_string().contains("NextContinuationToken"));
+    }
+
+    #[test]
+    fn parse_list_v2_rejects_incomplete_documents() {
+        for xml in [
+            r#"<ListBucketResult><IsTruncated>false</IsTruncated>"#,
+            r#"<ListBucketResult><Contents><Key>a</Key><Size>1</Size><ETag>e</ETag>"#,
+            r#"<IsTruncated>false</IsTruncated>"#,
+            r#"<ListBucketResult></ListBucketResult><IsTruncated>false</IsTruncated>"#,
+            r#"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult><Other/>"#,
+        ] {
+            assert!(parse_list_v2(xml).is_err(), "{xml}");
+        }
     }
 
     #[test]
@@ -387,13 +793,52 @@ mod tests {
     }
 
     #[test]
-    fn index_keys_are_normalized() {
+    fn region_uses_sdk_then_cli_environment_order() {
+        let missing = || Err(std::env::VarError::NotPresent);
+        assert_eq!(
+            read_region(
+                Ok("us-east-2".into()),
+                Ok("us-west-1".into()),
+                Some("ca-central-1".into())
+            )
+            .unwrap(),
+            "us-east-2"
+        );
+        assert_eq!(
+            read_region(
+                missing(),
+                Ok("us-west-1".into()),
+                Some("ca-central-1".into())
+            )
+            .unwrap(),
+            "us-west-1"
+        );
+        assert!(read_region(missing(), missing(), None).is_err());
+        assert!(read_region(Ok(String::new()), missing(), None).is_err());
+    }
+
+    #[test]
+    fn region_uses_profile_after_environment() {
+        let missing = || Err(std::env::VarError::NotPresent);
+        assert_eq!(
+            read_region(missing(), missing(), Some("ca-central-1".into())).unwrap(),
+            "ca-central-1"
+        );
+    }
+
+    #[test]
+    fn index_keys_preserve_prefix() {
         assert_eq!(build_index_key("", "CURRENT"), ".holys3/CURRENT");
         assert_eq!(
-            build_index_key("/root//path/", "/builds/1/footer.bin"),
-            "root/path/.holys3/builds/1/footer.bin"
+            build_index_key("root//path/", "/builds/1/footer.bin"),
+            "root//path/.holys3/builds/1/footer.bin"
         );
         assert!(is_index_key("root/path", "root/path/.holys3/CURRENT"));
+        assert!(!is_index_key(
+            "root/path",
+            "root/path/child/.holys3/segments.bin"
+        ));
+        assert!(!is_index_key("root/path", "root/path/.holys3-data/log"));
         assert!(!is_index_key("root/path", "root/path/file.txt"));
     }
 
@@ -402,6 +847,6 @@ mod tests {
         assert_eq!(list_prefix(""), "");
         assert_eq!(list_prefix("foo"), "foo/");
         assert_eq!(list_prefix("foo/"), "foo/");
-        assert_eq!(list_prefix("/a//b/"), "a/b/");
+        assert_eq!(list_prefix("/a//b/"), "/a//b/");
     }
 }

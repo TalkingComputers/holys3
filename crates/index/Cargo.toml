@@ -13,8 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-holys3-core = { path = "../core", version = "0.1.0" }
-holys3-query = { path = "../query", version = "0.1.0" }
+holys3-core = { path = "../core", version = "0.4.0" }
+holys3-query = { path = "../query", version = "0.4.0" }
 anyhow.workspace = true
 serde.workspace = true
 postcard.workspace = true
@@ -22,9 +22,14 @@ regex.workspace = true
 fst = "0.4.7"
 rayon = "1.12.0"
 sha2.workspace = true
+tempfile.workspace = true
+radsort.workspace = true
+rapidhash.workspace = true
+blake3.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
-holys3-core = { path = "../core", version = "0.1.0", features = ["testutil"] }
+holys3-core = { path = "../core", version = "0.4.0", features = ["testutil"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 tempfile = "3.27.0"

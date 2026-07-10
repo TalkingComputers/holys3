@@ -40,6 +40,42 @@
 
 ## Interface Contracts
 
+### `generated_corpus`
+
+```rust
+fn generated_corpus(objects: usize, size: usize) -> MemCorpus;
+```
+
+Input schema: `objects` is the exact document count and `size` is the exact encoded bytes per document. Both are positive benchmark constants.
+
+Output schema: a deterministic in-memory corpus with lexical keys and exactly `objects * size` body bytes. It cannot throw.
+
+Transformation: render repeatable production-shaped log records containing timestamp, level, service, request ID, and message fields for each object; repeat and truncate each body to `size` bytes.
+
+### `bench_index_build`
+
+```rust
+fn bench_index_build(c: &mut criterion::Criterion);
+```
+
+Input schema: `c` is Criterion's mutable benchmark registry.
+
+Output schema: registered benchmark IDs `index_build_1024x4096_trigram` and `index_build_1024x4096_sparse`; setup failures panic with `benchmark setup failed` context.
+
+Transformation: create a fresh deterministic corpus, listing, blob directory, and cache directory outside each timed iteration; time one complete `update_index` call for each strategy.
+
+### `bench_packed_sort_crossover`
+
+```rust
+fn bench_packed_sort_crossover(c: &mut criterion::Criterion);
+```
+
+Input schema: `c` is Criterion's mutable benchmark registry.
+
+Output schema: paired `packed_sort_control/<length>` and `packed_sort_hybrid/<length>` benchmark IDs for 128, 256, 512, 1,024, 4,096, and 65,536 trigram windows.
+
+Transformation: generate one deterministic byte input per length; benchmark direct integer extraction plus standard sort/dedup as the control and `pack_trigram_grams` as the candidate.
+
 ### `sort_packed_grams`
 
 ```rust
@@ -191,6 +227,30 @@ Input schema: `self.paths` and `self.docs` have equal lengths and lexical path o
 Output schema: one `(key, BLAKE3 digest, encoded size)` tuple per document in exactly `self.docs()` order. Any worker error aborts the complete result.
 
 Transformation: parallel-map indexed paths to digests, collect through Rayon’s indexed iterator, and zip with existing keys/sizes without a second sort.
+
+### `LocalCorpus::fetch_many`
+
+```rust
+fn fetch_many(&self, docs: std::ops::Range<usize>) -> anyhow::Result<Vec<(usize, Vec<u8>)>>;
+```
+
+Input schema: `docs` is a contiguous in-bounds range of corpus positions.
+
+Output schema: one `(position, complete file bytes)` tuple per position in ascending order. Any open/read failure aborts the batch with its path.
+
+Transformation: parallel-map the indexed position range through `std::fs::read`, then collect through Rayon’s indexed iterator so transport completion does not change output order.
+
+### `upload_dir`
+
+```rust
+fn upload_dir() -> anyhow::Result<()>;
+```
+
+Input schema: the deterministic generated corpus already exists at `objects_dir()`.
+
+Output schema: a complete local index at `local_index_dir()` and its path on stdout. Filesystem, listing, build, or write failures retain context.
+
+Transformation: remove the old benchmark index, enumerate the generated directory directly, build its listing, and run a fresh trigram update. The timed local path does not parse the unrelated expected-hit manifest.
 
 ## Task 1: Benchmark Controls
 

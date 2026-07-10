@@ -23,11 +23,11 @@ fn lit_query(lit: &[u8], s: Strategy) -> Query {
 /// One side's literal set (prefixes OR suffixes) as a gram constraint.
 /// `None` = this side constrains nothing.
 fn side_query(seq: &regex_syntax::hir::literal::Seq, strategy: Strategy) -> Option<Query> {
-    let lits = seq.literals()?;
-    if lits.is_empty() {
+    let literals = seq.literals()?;
+    if literals.is_empty() {
         return None;
     }
-    let branches: Vec<Query> = lits
+    let branches: Vec<Query> = literals
         .iter()
         .map(|l| lit_query(l.as_bytes(), strategy))
         .collect();

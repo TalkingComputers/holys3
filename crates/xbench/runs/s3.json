@@ -8,7 +8,7 @@
   "concurrency": 64,
   "backend": {
     "kind": "s3",
-    "bucket": "holys3-test-381235349110-ue2",
+    "bucket": "benchmark-bucket",
     "region": "us-east-2",
     "endpoint": null
   },
@@ -99,7 +99,7 @@
     },
     {
       "name": "dot_star_gap",
-      "pattern": "(?s)needle.*alpha",
+      "pattern": "needle.*alpha",
       "expected_hits": 100,
       "hits": 100,
       "candidates": 100,

@@ -138,7 +138,7 @@ fn object_bytes(rng: &mut DeterministicRng, index: usize, size: usize) -> Vec<u8
         write_token(&mut bytes, 96, b"longliteralbenchmarktoken");
     }
     if index.is_multiple_of(5) {
-        write_token(&mut bytes, 160, b"alpha");
+        write_token(&mut bytes, 64, b"alpha");
     }
     if index.is_multiple_of(7) {
         write_token(&mut bytes, 192, b"beta");

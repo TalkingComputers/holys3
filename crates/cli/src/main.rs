@@ -11,12 +11,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use holys3_core::{LocalBlobStore, MatchOptions, Strategy};
 use holys3_index::{
-    search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, LocalFetcher, MatchSink,
-    SearchStats, SegmentedReader,
+    search_streaming, update_index, IndexChanged, IndexReader, KeyScope, LocalCorpus, LocalFetcher,
+    MatchSink, SearchStats, SegmentedReader,
 };
 use holys3_s3::{
-    build_fetch_config, build_index_namespace, is_index_key, list_prefix, normalize_prefix,
-    region_from_env, s3_client_from_env, ObjectMeta, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
+    build_fetch_config, build_index_namespace, is_index_key, list_prefix, region_from_env,
+    s3_client_from_env, ObjectCacheConfig, ObjectMeta, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
 };
 use scope::Scope;
 use std::io::IsTerminal;
@@ -187,6 +187,21 @@ struct SearchArgs {
     /// Only search objects covering times at or before this instant (same formats).
     #[arg(long)]
     until: Option<String>,
+    #[arg(
+        long,
+        requires = "object_cache_cap",
+        value_name = "DIR",
+        help = "Cache immutable S3 source bodies under DIR"
+    )]
+    object_cache: Option<PathBuf>,
+    #[arg(
+        long,
+        requires = "object_cache",
+        value_name = "BYTES",
+        value_parser = parse_positive_u64,
+        help = "Limit the source-object cache to BYTES"
+    )]
+    object_cache_cap: Option<u64>,
     #[command(flatten)]
     connect: ConnectArgs,
 }
@@ -204,7 +219,7 @@ fn parse_target(raw: &str) -> Result<Target> {
             anyhow::ensure!(!bucket.is_empty(), "s3:// target needs a bucket");
             Ok(Target::S3 {
                 bucket: bucket.to_owned(),
-                prefix: normalize_prefix(prefix),
+                prefix: prefix.to_owned(),
             })
         }
         None => Ok(Target::Local(PathBuf::from(raw))),
@@ -292,17 +307,42 @@ fn parse_concurrency(value: &str) -> std::result::Result<usize, String> {
     Ok(concurrency)
 }
 
+fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
+    let value = value.parse::<u64>().map_err(|error| error.to_string())?;
+    if value == 0 {
+        return Err("value must be greater than 0".to_owned());
+    }
+    Ok(value)
+}
+
+fn build_local_key_prefix(dir: &Path) -> Result<String> {
+    let canonical = std::fs::canonicalize(dir)?;
+    let mut prefix = canonical
+        .to_str()
+        .with_context(|| format!("local target is not valid UTF-8: {}", canonical.display()))?
+        .to_owned();
+    #[cfg(windows)]
+    {
+        prefix = prefix.replace('\\', "/");
+    }
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    Ok(prefix)
+}
+
 fn build_local(dir: &Path, out: &Path, strategy: Strategy, rebuild: bool) -> Result<()> {
     // Canonical target root: `./logs` and `logs` must produce identical
     // index keys, or invocation spelling would churn the incremental diff.
     let dir = std::fs::canonicalize(dir)?;
     std::fs::create_dir_all(out)?;
     let out_canonical = std::fs::canonicalize(out)?;
-    let corpus = LocalCorpus::new(&dir)?;
-    let mut listing = corpus.listing()?;
-    // The index itself must never be indexed (the local analogue of the S3
-    // path filtering `.holys3/`), or every run would re-ingest the last one.
-    listing.retain(|(key, _, _)| !Path::new(key).starts_with(&out_canonical));
+    anyhow::ensure!(
+        !dir.starts_with(&out_canonical),
+        "local index directory must not contain the target directory"
+    );
+    let corpus = LocalCorpus::new_excluding(&dir, Some(&out_canonical))?;
+    let listing = corpus.listing()?;
     let store = LocalBlobStore::new(out);
     let cache_dir = local_cache_dir(out)?;
     let report = update_index(&store, &cache_dir, strategy, &listing, rebuild, &|shard| {
@@ -378,40 +418,81 @@ fn build_s3(src: S3Source, strategy: Strategy, rebuild: bool) -> Result<()> {
 
 /// Run one search against the opened source. Scope filtering, the optional
 /// stats line, and the undated-keys note are shared across all output modes.
-fn execute_search(
-    source: Source,
-    index: &Path,
-    pattern: &str,
-    scope: Option<&Scope>,
+#[derive(Clone, Copy)]
+struct SearchExecution<'a> {
+    index: &'a Path,
+    pattern: &'a str,
+    scope: Option<&'a Scope>,
     options: MatchOptions,
     stats_line: bool,
+    object_cache: Option<&'a ObjectCacheConfig>,
+}
+
+fn execute_search(
+    source: Source,
+    execution: SearchExecution<'_>,
     sink: &dyn MatchSink,
 ) -> Result<SearchStats> {
-    let key_filter = scope.map(|scope| move |key: &str| scope.matches(key));
-    let key_scope = KeyScope {
-        prefix: scope.and_then(Scope::key_prefix),
-        matches: key_filter
-            .as_ref()
-            .map(|filter| filter as &(dyn Fn(&str) -> bool + Sync)),
-    };
+    let key_filter = execution.scope.map(|scope| {
+        move |key: &str| {
+            scope
+                .key_prefix()
+                .is_none_or(|prefix| key.starts_with(prefix))
+                && scope.matches(key)
+        }
+    });
+    let key_matches = key_filter
+        .as_ref()
+        .map(|filter| filter as &(dyn Fn(&str) -> bool + Sync));
     let search_stats = match source {
-        Source::Local(_) => {
-            let reader = open_local_reader(index)?;
-            search_streaming(&reader, &LocalFetcher, pattern, key_scope, options, sink)?
+        Source::Local(dir) => {
+            anyhow::ensure!(
+                execution.object_cache.is_none(),
+                "--object-cache only applies to s3:// targets"
+            );
+            let target_prefix = build_local_key_prefix(&dir)?;
+            let fetcher = LocalFetcher::new(std::thread::available_parallelism()?.get())?;
+            search_with_reopen(
+                || open_local_reader(execution.index),
+                &fetcher,
+                execution.pattern,
+                KeyScope {
+                    prefix: Some(&target_prefix),
+                    matches: key_matches,
+                },
+                execution.options,
+                sink,
+            )?
         }
         Source::S3(src) => {
             let cache_dir = build_cache_dir(src.endpoint.as_deref(), &src.bucket, &src.prefix)?;
-            let store =
-                S3BlobStore::new(src.client.clone(), src.bucket.clone(), src.prefix.clone());
-            let reader = SegmentedReader::open(Box::new(store), &cache_dir)?;
-            let fetcher = S3Fetcher::new(src.client, src.bucket);
-            search_streaming(&reader, &fetcher, pattern, key_scope, options, sink)?
+            let client = src.client.clone();
+            let bucket = src.bucket.clone();
+            let prefix = src.prefix.clone();
+            let fetcher = match execution.object_cache {
+                Some(config) => S3Fetcher::with_cache(src.client, src.bucket, config.clone())?,
+                None => S3Fetcher::new(src.client, src.bucket),
+            };
+            search_with_reopen(
+                || {
+                    let store = S3BlobStore::new(client.clone(), bucket.clone(), prefix.clone());
+                    SegmentedReader::open(Box::new(store), &cache_dir)
+                },
+                &fetcher,
+                execution.pattern,
+                KeyScope {
+                    prefix: execution.scope.and_then(Scope::key_prefix),
+                    matches: key_matches,
+                },
+                execution.options,
+                sink,
+            )?
         }
     };
-    if let Some(scope) = scope {
+    if let Some(scope) = execution.scope {
         scope.report();
     }
-    if stats_line {
+    if execution.stats_line {
         eprintln!(
             "candidates={} total={} hits={}",
             search_stats.candidates,
@@ -420,6 +501,24 @@ fn execute_search(
         );
     }
     Ok(search_stats)
+}
+
+fn search_with_reopen(
+    mut open: impl FnMut() -> Result<SegmentedReader>,
+    fetcher: &dyn holys3_core::DocFetcher,
+    pattern: &str,
+    scope: KeyScope<'_>,
+    options: MatchOptions,
+    sink: &dyn MatchSink,
+) -> Result<SearchStats> {
+    let reader = open()?;
+    match search_streaming(&reader, fetcher, pattern, scope, options, sink) {
+        Err(error) if error.is::<IndexChanged>() => {
+            let reader = open()?;
+            search_streaming(&reader, fetcher, pattern, scope, options, sink)
+        }
+        result => result,
+    }
 }
 
 /// Returns whether anything matched (drives the exit code).
@@ -441,6 +540,11 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         args.until,
         globs,
     )?;
+    let object_cache = match (args.object_cache, args.object_cache_cap) {
+        (Some(root), Some(cap_bytes)) => Some(ObjectCacheConfig { root, cap_bytes }),
+        (None, None) => None,
+        _ => anyhow::bail!("--object-cache and --object-cache-cap must be supplied together"),
+    };
 
     let standard_mode =
         !args.quiet && !args.json && !args.files_with_matches && !args.count && !args.count_matches;
@@ -474,18 +578,18 @@ fn run_search(args: SearchArgs) -> Result<bool> {
 
     let source = open_source(parse_target(&target_raw)?, &args.connect)?;
     let stats_line = args.stats && !args.json;
+    let execution = SearchExecution {
+        index: &args.index,
+        pattern: &pattern,
+        scope: scope.as_ref(),
+        options,
+        stats_line,
+        object_cache: object_cache.as_ref(),
+    };
 
     if args.quiet {
         let sink = printer::QuietSink::new(!args.stats);
-        let result = execute_search(
-            source,
-            &args.index,
-            &pattern,
-            scope.as_ref(),
-            options,
-            stats_line,
-            &sink,
-        );
+        let result = execute_search(source, execution, &sink);
         return match result {
             Ok(_) => Ok(sink.matched()),
             // rg's quiet error-mask: a found match wins over later errors
@@ -496,15 +600,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     if args.json {
         let started = std::time::Instant::now();
         let sink = json::JsonSink::new();
-        let stats = execute_search(
-            source,
-            &args.index,
-            &pattern,
-            scope.as_ref(),
-            options,
-            stats_line,
-            &sink,
-        )?;
+        let stats = execute_search(source, execution, &sink)?;
         sink.write_summary(&stats, started.elapsed())?;
         return Ok(!stats.hits.is_empty());
     }
@@ -523,15 +619,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
             color,
         ))
     };
-    let stats = execute_search(
-        source,
-        &args.index,
-        &pattern,
-        scope.as_ref(),
-        options,
-        stats_line,
-        sink.as_ref(),
-    )?;
+    let stats = execute_search(source, execution, sink.as_ref())?;
     Ok(!stats.hits.is_empty())
 }
 
@@ -670,6 +758,10 @@ mod tests {
         assert!(matches!(
             parse_target("s3://bkt/a/b").unwrap(),
             Target::S3 { bucket, prefix } if bucket == "bkt" && prefix == "a/b"
+        ));
+        assert!(matches!(
+            parse_target("s3://bkt/a//b/").unwrap(),
+            Target::S3 { bucket, prefix } if bucket == "bkt" && prefix == "a//b/"
         ));
         assert!(parse_target("s3://").is_err());
         assert!(matches!(

@@ -6,14 +6,27 @@ BENCH_ITERATIONS=5
 BENCH_WARMUP=1
 BENCH_CONCURRENCY=64
 MINIO_ENV=AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin HOLYS3_BENCH_BUCKET=holys3-bench HOLYS3_BENCH_REGION=us-east-1 HOLYS3_BENCH_ENDPOINT=http://localhost:9000
-XBENCH=cargo run --release -p holys3-bench --
+XBENCH=cargo run --locked --release -p holys3-bench --
 
-.PHONY: bench bench-micro bench-s3 bench-minio
+.PHONY: check package bench bench-micro bench-s3 bench-minio
+
+check:
+	cargo fmt --all --check
+	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+	cargo test --locked --workspace --all-features
+	cargo test --locked --release --workspace --all-features
+	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items --workspace
+	cargo deny check
+	actionlint
+	typos
+
+package:
+	cargo package --locked --workspace
 
 bench: bench-micro
 
 bench-micro:
-	cargo bench -p holys3-index
+	cargo bench --locked -p holys3-index
 
 bench-s3:
 	$(XBENCH) seed --seed $(BENCH_SEED) --objects $(BENCH_OBJECTS) --size $(BENCH_SIZE)

@@ -1,6 +1,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! AWS `SigV4` signing and credential loading.
 
+use anyhow::Context;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
@@ -123,14 +124,45 @@ pub fn sign_request(
     }
 }
 
-pub fn from_env() -> Option<Credentials> {
-    let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok()?;
-    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok()?;
-    Some(Credentials {
-        access_key,
-        secret_key,
-        session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
-    })
+pub fn from_env() -> anyhow::Result<Option<Credentials>> {
+    read_env_credentials(
+        std::env::var("AWS_ACCESS_KEY_ID"),
+        std::env::var("AWS_SECRET_ACCESS_KEY"),
+        std::env::var("AWS_SESSION_TOKEN"),
+    )
+}
+
+fn read_env_credentials(
+    access_key: Result<String, std::env::VarError>,
+    secret_key: Result<String, std::env::VarError>,
+    session_token: Result<String, std::env::VarError>,
+) -> anyhow::Result<Option<Credentials>> {
+    let read =
+        |name: &str, value: Result<String, std::env::VarError>| -> anyhow::Result<Option<String>> {
+            match value {
+                Ok(value) => {
+                    anyhow::ensure!(!value.is_empty(), "{name} is empty");
+                    Ok(Some(value))
+                }
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        };
+    let access_key = read("AWS_ACCESS_KEY_ID", access_key)?;
+    let secret_key = read("AWS_SECRET_ACCESS_KEY", secret_key)?;
+    let session_token = read("AWS_SESSION_TOKEN", session_token)?;
+    if access_key.is_none() && secret_key.is_none() && session_token.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Credentials {
+        access_key: access_key.context(
+            "AWS_ACCESS_KEY_ID must be set when AWS_SECRET_ACCESS_KEY or AWS_SESSION_TOKEN is set",
+        )?,
+        secret_key: secret_key.context(
+            "AWS_SECRET_ACCESS_KEY must be set when AWS_ACCESS_KEY_ID or AWS_SESSION_TOKEN is set",
+        )?,
+        session_token,
+    }))
 }
 
 /// Parse `[profile]` ... `access_key/secret/token` from an ini-style credentials file body.
@@ -147,10 +179,11 @@ pub fn from_credentials_file(body: &str, profile: &str) -> Option<Credentials> {
             continue;
         }
         if let Some((k, v)) = line.split_once('=') {
+            let value = (!v.trim().is_empty()).then(|| v.trim().to_owned());
             match k.trim() {
-                "aws_access_key_id" => ak = Some(v.trim().to_owned()),
-                "aws_secret_access_key" => sk = Some(v.trim().to_owned()),
-                "aws_session_token" => tok = Some(v.trim().to_owned()),
+                "aws_access_key_id" => ak = value,
+                "aws_secret_access_key" => sk = value,
+                "aws_session_token" => tok = value,
                 _ => {}
             }
         }
@@ -165,25 +198,51 @@ pub fn from_credentials_file(body: &str, profile: &str) -> Option<Credentials> {
 /// The active profile name: `$AWS_PROFILE` or "default".
 pub fn profile_name() -> anyhow::Result<String> {
     match std::env::var("AWS_PROFILE") {
-        Ok(profile) => Ok(profile),
+        Ok(profile) => {
+            anyhow::ensure!(!profile.is_empty(), "AWS_PROFILE is empty");
+            Ok(profile)
+        }
         Err(std::env::VarError::NotPresent) => Ok("default".to_owned()),
         Err(err) => Err(err.into()),
     }
 }
 
 fn aws_dir() -> anyhow::Result<std::path::PathBuf> {
-    Ok(std::path::PathBuf::from(std::env::var("HOME")?).join(".aws"))
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))?;
+    Ok(std::path::PathBuf::from(home).join(".aws"))
+}
+
+fn read_env_path(name: &str, fallback: std::path::PathBuf) -> anyhow::Result<std::path::PathBuf> {
+    match std::env::var(name) {
+        Ok(path) => {
+            anyhow::ensure!(!path.is_empty(), "{name} is empty");
+            Ok(path.into())
+        }
+        Err(std::env::VarError::NotPresent) => Ok(fallback),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn read_optional_file(path: &std::path::Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => Ok(Some(body)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 /// Static credentials: env vars first, then the active profile in
 /// ~/.aws/credentials. `None` when neither has keys (the SSO chain in
 /// holys3-s3 takes over from there).
 pub fn resolve_static() -> anyhow::Result<Option<Credentials>> {
-    if let Some(creds) = from_env() {
+    if let Some(creds) = from_env()? {
         return Ok(Some(creds));
     }
-    let path = aws_dir()?.join("credentials");
-    let Ok(body) = std::fs::read_to_string(&path) else {
+    let path = read_env_path(
+        "AWS_SHARED_CREDENTIALS_FILE",
+        aws_dir()?.join("credentials"),
+    )?;
+    let Some(body) = read_optional_file(&path)? else {
         return Ok(None);
     };
     Ok(from_credentials_file(&body, &profile_name()?))
@@ -219,6 +278,26 @@ fn config_section<'a>(
             .map(|(k, v)| (k.trim(), v.trim()))
             .filter(|(k, _)| !k.is_empty())
     })
+}
+
+fn region_from_config_body(body: &str, profile: &str) -> Option<String> {
+    let header = if profile == "default" {
+        "default".to_owned()
+    } else {
+        format!("profile {profile}")
+    };
+    config_section(body, header)
+        .filter(|(key, _)| *key == "region")
+        .map(|(_, value)| value.to_owned())
+        .last()
+}
+
+pub fn region_from_config() -> anyhow::Result<Option<String>> {
+    let path = read_env_path("AWS_CONFIG_FILE", aws_dir()?.join("config"))?;
+    let Some(body) = read_optional_file(&path)? else {
+        return Ok(None);
+    };
+    Ok(region_from_config_body(&body, &profile_name()?))
 }
 
 /// Parse the SSO settings for `profile` out of a ~/.aws/config body.
@@ -266,8 +345,8 @@ pub fn sso_profile_from_config(body: &str, profile: &str) -> Option<SsoProfile> 
 
 /// SSO settings for the active profile, from ~/.aws/config on disk.
 pub fn sso_profile() -> anyhow::Result<Option<SsoProfile>> {
-    let path = aws_dir()?.join("config");
-    let Ok(body) = std::fs::read_to_string(&path) else {
+    let path = read_env_path("AWS_CONFIG_FILE", aws_dir()?.join("config"))?;
+    let Some(body) = read_optional_file(&path)? else {
         return Ok(None);
     };
     Ok(sso_profile_from_config(&body, &profile_name()?))
@@ -426,18 +505,40 @@ mod cred_tests {
 
     #[test]
     fn parse_sso_session_style_config() {
-        let body = "[profile speedtrain]\nsso_session = speedtrain\nsso_account_id = 381235349110\nsso_role_name = AdministratorAccess\nregion = us-east-2\n\n[sso-session speedtrain]\nsso_start_url = https://speedtrain.awsapps.com/start\nsso_region = us-west-2\n";
-        let p = sso_profile_from_config(body, "speedtrain").unwrap();
-        assert_eq!(p.account_id, "381235349110");
-        assert_eq!(p.role_name, "AdministratorAccess");
-        assert_eq!(p.start_url, "https://speedtrain.awsapps.com/start");
+        let body = "[profile example]\nsso_session = example\nsso_account_id = 123456789012\nsso_role_name = ReadOnly\nregion = us-east-2\n\n[sso-session example]\nsso_start_url = https://example.awsapps.com/start\nsso_region = us-west-2\n";
+        let p = sso_profile_from_config(body, "example").unwrap();
+        assert_eq!(p.account_id, "123456789012");
+        assert_eq!(p.role_name, "ReadOnly");
+        assert_eq!(p.start_url, "https://example.awsapps.com/start");
         assert_eq!(p.sso_region, "us-west-2");
-        assert_eq!(p.session_name.as_deref(), Some("speedtrain"));
+        assert_eq!(p.session_name.as_deref(), Some("example"));
         // The cache file is keyed by the session name, per botocore.
         assert_eq!(
             sso_token_cache_key(&p),
-            "fd66acda1ac8273e084bf508925ad8f1d566ec92"
+            "c3499c2729730a7f807efb8676a92dcb6f8a3f8f"
         );
+    }
+
+    #[test]
+    fn reads_region_from_active_profile_config() {
+        let body = "[default]\nregion = us-east-1\n\n[profile example]\nregion = ca-central-1\n";
+        assert_eq!(
+            region_from_config_body(body, "example").as_deref(),
+            Some("ca-central-1")
+        );
+        assert_eq!(
+            region_from_config_body(body, "default").as_deref(),
+            Some("us-east-1")
+        );
+    }
+
+    #[test]
+    fn optional_shared_file_only_ignores_missing_files() {
+        assert_eq!(
+            read_optional_file(std::path::Path::new("missing-shared-aws-config")).unwrap(),
+            None
+        );
+        assert!(read_optional_file(std::path::Path::new(".")).is_err());
     }
 
     #[test]
@@ -460,5 +561,22 @@ mod cred_tests {
         let body = "[profile plain]\nregion = us-east-1\n";
         assert!(sso_profile_from_config(body, "plain").is_none());
         assert!(sso_profile_from_config(body, "missing").is_none());
+    }
+
+    #[test]
+    fn environment_credentials_are_all_or_nothing() {
+        let missing = || Err(std::env::VarError::NotPresent);
+        assert!(read_env_credentials(missing(), missing(), missing())
+            .unwrap()
+            .is_none());
+        assert!(read_env_credentials(Ok("AKIA".into()), missing(), missing()).is_err());
+        assert!(read_env_credentials(missing(), Ok("secret".into()), missing()).is_err());
+        assert!(read_env_credentials(missing(), missing(), Ok("token".into())).is_err());
+        assert!(read_env_credentials(Ok(String::new()), Ok("secret".into()), missing()).is_err());
+        let credentials =
+            read_env_credentials(Ok("AKIA".into()), Ok("secret".into()), Ok("token".into()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(credentials.session_token.as_deref(), Some("token"));
     }
 }

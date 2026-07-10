@@ -17,6 +17,12 @@ pub(crate) const PATTERNS: &[&str] = &[
     ".*(quick|world).*",
     ".*(quick)+.*",
     ".*(zzzznotpresent)?.*",
+    "arrow",
+    "orc",
+    "brotli",
+    "zlib",
+    "archive",
+    "tar member",
 ];
 
 fn bodies() -> Vec<Vec<u8>> {
@@ -84,25 +90,47 @@ pub(crate) fn encoded_corpus() -> MemCorpus {
             _ => encode::xz(&body),
         })
         .collect();
+    let mut keys = keys_for(&bodies);
     bodies.push(encode::parquet_of_lines(&[
         "the quick brown fox in parquet",
         "hello world from a parquet row",
     ]));
+    keys.push("rows.parquet".into());
     bodies.push(encode::avro_of_lines(&[
         "EMAIL: avro@example.com",
         "second line with world in avro",
     ]));
-    MemCorpus::new(keys_for(&bodies), bodies)
+    keys.push("rows.avro".into());
+    bodies.push(encode::arrow_of_lines(&["arrow needle", "hello world"]));
+    keys.push("rows.arrow".into());
+    bodies.push(encode::orc_of_lines(&["orc needle", "second line"]));
+    keys.push("rows.orc".into());
+    bodies.push(encode::brotli(b"brotli needle\n"));
+    keys.push("rows.br".into());
+    bodies.push(encode::zlib(b"zlib needle\n"));
+    keys.push("rows.zlib".into());
+    bodies.push(encode::zip(&[
+        ("a.log", b"archive needle\n"),
+        ("b.log", b"hello world in archive\n"),
+    ]));
+    keys.push("bundle.zip".into());
+    bodies.push(encode::tar(&[("nested/c.log", b"tar member needle\n")]));
+    keys.push("bundle.tar".into());
+    MemCorpus::new(keys, bodies)
 }
 
 /// The corpus as plain text: what searches must behave as if they saw.
 pub(crate) fn decoded_corpus(c: &dyn Corpus) -> MemCorpus {
-    let keys: Vec<String> = c.docs().iter().map(|doc| doc.key.clone()).collect();
+    let keys: Vec<String> = c
+        .sources()
+        .iter()
+        .map(|source| source.key.clone())
+        .collect();
     let bodies = c
-        .docs()
+        .sources()
         .iter()
         .enumerate()
-        .map(|(idx, doc)| decode_body(&doc.key, c.fetch(idx).unwrap()).unwrap())
+        .map(|(idx, source)| decode_body(&source.key, c.fetch(idx).unwrap().to_vec()).unwrap())
         .collect();
     MemCorpus::new(keys, bodies)
 }

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{corpus, decoded_corpus, encoded_corpus, gzipped_corpus, PATTERNS};
+use common::{corpus, encoded_corpus, gzipped_corpus, PATTERNS};
 use holys3_core::{
     scan_matching_docs, testutil::MemCorpus, Corpus, LocalBlobStore, MatchOptions, Strategy,
 };
@@ -23,9 +23,15 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
             let cache_dir = tempfile::tempdir()?;
             let store = LocalBlobStore::new(store_dir.path());
             let listing = c
-                .docs()
+                .sources()
                 .iter()
-                .map(|doc| (doc.key.clone(), format!("etag-{}", doc.key), doc.size))
+                .map(|source| {
+                    (
+                        source.key.clone(),
+                        source.version.clone(),
+                        source.encoded_size,
+                    )
+                })
                 .collect::<Vec<_>>();
             update_index(
                 &store,
@@ -39,11 +45,11 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
                         .iter()
                         .map(|key| {
                             let idx = c
-                                .docs()
+                                .sources()
                                 .iter()
-                                .position(|doc| doc.key == *key)
+                                .position(|source| source.key == *key)
                                 .expect("listed key exists");
-                            c.fetch(idx)
+                            Ok(c.fetch(idx)?.to_vec())
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     Ok(Box::new(MemCorpus::new(keys, bodies)))
@@ -53,11 +59,10 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
                 Box::new(LocalBlobStore::new(store_dir.path())),
                 cache_dir.path(),
             )?;
-            let decoded = decoded_corpus(&c);
             for p in PATTERNS {
                 let indexed: Vec<String> = search_collect(&reader, &c, p)?.1.hits;
                 let re = regex::bytes::Regex::new(p)?;
-                let oracle = scan_matching_docs(&decoded, &re)?;
+                let oracle = scan_matching_docs(&c, &re)?;
                 assert_eq!(
                     indexed, oracle,
                     "corpus {label} strategy {strategy:?} pattern `{p}`: store index != scan"

@@ -23,6 +23,14 @@ fn corpus() -> Corpus {
     )
     .unwrap();
     std::fs::write(dir.path().join("gamma.txt"), "ERROR ERROR double\n").unwrap();
+    std::fs::write(
+        dir.path().join("bundle.zip"),
+        holys3_core::testutil::encode::zip(&[
+            ("logs/app.log", b"before\nZIPNEEDLE one\nafter\n"),
+            ("other.txt", b"ZIPNEEDLE two\n"),
+        ]),
+    )
+    .unwrap();
     let index = tempfile::tempdir().unwrap();
     holys3()
         .args(["index"])
@@ -86,6 +94,63 @@ fn exit_codes() {
     search_pattern(&c, "(").assert().code(2);
     holys3().args(["x", "s3://"]).assert().code(2);
     holys3().assert().code(2); // missing args (clap usage error)
+}
+
+#[test]
+fn object_cache_flags_are_paired_and_s3_only() {
+    holys3()
+        .args([
+            "needle",
+            "s3://bucket",
+            "--object-cache",
+            "/tmp/holys3-cache",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--object-cache-cap"));
+    holys3()
+        .args(["needle", "s3://bucket", "--object-cache-cap", "1024"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--object-cache"));
+    holys3()
+        .args([
+            "needle",
+            "s3://bucket",
+            "--object-cache",
+            "/tmp/holys3-cache",
+            "--object-cache-cap",
+            "0",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("greater than 0"));
+
+    let c = corpus();
+    search_pattern(&c, "ERROR")
+        .args([
+            "--object-cache",
+            "/tmp/holys3-cache",
+            "--object-cache-cap",
+            "1024",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("only applies to s3://"));
+}
+
+#[test]
+fn prints_object_cache_help() {
+    holys3()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Cache immutable S3 source bodies under DIR",
+        ))
+        .stdout(predicate::str::contains(
+            "Limit the source-object cache to BYTES",
+        ));
 }
 
 #[test]
@@ -253,6 +318,46 @@ fn json_wire_format() {
 }
 
 #[test]
+fn archive_members_support_output_modes_and_globs() {
+    let c = corpus();
+    let bundle = key(&c, "bundle.zip");
+    let app = format!("{bundle}!/logs/app.log");
+    let other = format!("{bundle}!/other.txt");
+
+    let out = search_pattern(&c, "ZIPNEEDLE").arg("-l").output().unwrap();
+    assert_eq!(sorted_lines(&out.stdout), [app.clone(), other]);
+
+    let out = search_pattern(&c, "ZIPNEEDLE")
+        .args(["-g", "*.log", "-n", "-C", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{app}-1-before\n{app}:2:ZIPNEEDLE one\n{app}-3-after\n")
+    );
+
+    let out = search_pattern(&c, "ZIPNEEDLE")
+        .args(["-g", "*.log", "-c"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{app}:1\n"));
+
+    let out = search_pattern(&c, "ZIPNEEDLE")
+        .args(["-g", "*.log", "--json"])
+        .output()
+        .unwrap();
+    let paths = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let value = serde_json::from_str::<serde_json::Value>(line).unwrap();
+            (value["type"] == "match")
+                .then(|| value["data"]["path"]["text"].as_str().unwrap().to_owned())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(paths, [app]);
+}
+
+#[test]
 fn color_control() {
     let c = corpus();
     let out = search(&c).args(["--color", "always"]).output().unwrap();
@@ -321,6 +426,82 @@ fn nonexistent_local_target_errors() {
         .arg("--index")
         .arg(c.index.path());
     cmd.assert().code(2);
+}
+
+#[test]
+fn local_index_cannot_contain_target() {
+    let target = tempfile::tempdir().unwrap();
+    std::fs::write(target.path().join("source.log"), "needle\n").unwrap();
+    holys3()
+        .arg("index")
+        .arg(target.path())
+        .arg("--out")
+        .arg(target.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("must not contain the target"));
+}
+
+#[test]
+fn local_target_does_not_escape_directory() {
+    let indexed = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let index = tempfile::tempdir().unwrap();
+    std::fs::write(indexed.path().join("outside.log"), "needle\n").unwrap();
+    std::fs::write(target.path().join("inside.log"), "clean\n").unwrap();
+    holys3()
+        .arg("index")
+        .arg(indexed.path())
+        .arg("--out")
+        .arg(index.path())
+        .assert()
+        .success();
+    holys3()
+        .arg("needle")
+        .arg(target.path())
+        .arg("--index")
+        .arg(index.path())
+        .arg("-l")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn local_index_detects_same_size_same_mtime_rewrite() {
+    let data = tempfile::tempdir().unwrap();
+    let index = tempfile::tempdir().unwrap();
+    let path = data.path().join("event.log");
+    std::fs::write(&path, "alpha\n").unwrap();
+    holys3()
+        .arg("index")
+        .arg(data.path())
+        .arg("--out")
+        .arg(index.path())
+        .assert()
+        .success();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, "bravo\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    holys3()
+        .arg("index")
+        .arg(data.path())
+        .arg("--out")
+        .arg(index.path())
+        .assert()
+        .success();
+    holys3()
+        .arg("bravo")
+        .arg(data.path())
+        .arg("--index")
+        .arg(index.path())
+        .assert()
+        .success();
 }
 
 #[test]

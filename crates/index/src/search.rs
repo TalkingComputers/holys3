@@ -2,11 +2,17 @@
 //! per-doc result sinks. Documents are addressed by key throughout.
 
 use crate::{IndexReader, SearchStats};
-use anyhow::Result;
-use holys3_core::{decode_body, grep_doc, DocFetcher, LineEvent, MatchOptions};
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use holys3_core::{
+    can_search_as_document, grep_bytes, grep_bytes_fast, has_line_match, has_line_match_fast,
+    DocAddress, DocFetcher, LineEvent, MatchOptions,
+};
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
+
+const SEARCH_CANDIDATE_BATCH: usize = 16_384;
 
 /// Key-level search scope. `prefix` is authoritative for both segment
 /// pruning in readers and per-key filtering here; `matches` carries any
@@ -81,74 +87,47 @@ fn lock<'a, T>(mutex: &'a Mutex<T>) -> Result<MutexGuard<'a, T>> {
         .map_err(|_| anyhow::anyhow!("a search worker panicked"))
 }
 
-/// Streaming search: candidate docs are fetched concurrently, decompressed
-/// and regex-verified on a worker pool, and reported to `sink` per doc as
-/// they complete (unordered across docs; in-order within a doc). Memory is
-/// bounded by fetch concurrency + worker count, not corpus size.
-///
-/// `scope` prunes candidates by key before anything is fetched. When the
-/// sink does not want match positions, verification stops at the first
-/// match per doc.
-pub fn search_streaming(
-    reader: &dyn IndexReader,
+fn search_batch(
+    documents: &[DocAddress],
     fetcher: &dyn DocFetcher,
-    pattern: &str,
-    scope: KeyScope<'_>,
+    re: &regex::bytes::Regex,
+    whole_document: bool,
     options: MatchOptions,
     sink: &dyn MatchSink,
-) -> Result<SearchStats> {
-    if options.max_count == Some(0) {
-        // rg -m0: zero matching lines per doc means zero results everywhere,
-        // including sinks that never look at match positions
-        return Ok(SearchStats {
-            hits: Vec::new(),
-            candidates: 0,
-            total_docs: reader.total_docs(),
-            bytes_fetched: 0,
-        });
-    }
-    let q = holys3_query::plan(pattern, reader.strategy())?;
-    let mut keys = reader.candidate_keys(&q, scope.prefix)?;
-    keys.retain(|key| scope.admits(key));
-    let candidates = keys.len();
-    let re = regex::bytes::Regex::new(pattern)?;
-    if keys.is_empty() {
-        return Ok(SearchStats {
-            hits: Vec::new(),
-            candidates,
-            total_docs: reader.total_docs(),
-            bytes_fetched: 0,
-        });
-    }
-    let workers = std::thread::available_parallelism()?.get().min(keys.len());
+) -> Result<(Vec<String>, usize, bool)> {
+    let workers = std::thread::available_parallelism()?
+        .get()
+        .min(documents.len());
 
     let bytes_fetched = AtomicUsize::new(0);
     let hits: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(workers * 2);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Bytes)>(workers * 2);
 
     let wants_matches = sink.wants_matches();
-    let keys_ref = &keys;
+    let documents_ref = documents;
     // `re` is cloned per rayon split: the meta engine's shared scratch Cache
     // contends under exactly this all-threads-search workload.
-    let verify = |re: &regex::bytes::Regex, idx: usize, bytes: Vec<u8>| -> Result<()> {
-        let key = &keys_ref[idx];
+    let verify = |re: &regex::bytes::Regex, idx: usize, text: Bytes| -> Result<()> {
+        let key = &documents_ref[idx].display_key;
         let started = std::time::Instant::now();
-        let text = match decode_body(key, bytes) {
-            Ok(text) => text,
-            Err(err) => {
-                eprintln!("warning: {err:#}; skipping");
-                return Ok(());
-            }
-        };
         let events = if wants_matches {
-            let events = grep_doc(&text, re, options);
+            let events = if whole_document {
+                grep_bytes_fast(text.clone(), re, options)
+            } else {
+                grep_bytes(text.clone(), re, options)
+            };
             if events.is_empty() {
                 return Ok(());
             }
             events
         } else {
             // line semantics, same as grep_doc: no lines in an empty doc
-            if !holys3_core::has_line_match(&text, re) {
+            let matched = if whole_document {
+                has_line_match_fast(&text, re)
+            } else {
+                has_line_match(&text, re)
+            };
+            if !matched {
                 return Ok(());
             }
             Vec::new()
@@ -183,7 +162,7 @@ pub fn search_streaming(
                 },
             )
         });
-        let feed = fetcher.fetch_each(keys_ref, &mut |idx, bytes| {
+        let feed = fetcher.fetch_each(documents_ref, &mut |idx, bytes| {
             bytes_fetched.fetch_add(bytes.len(), Ordering::Relaxed);
             tx.send((idx, bytes))
                 .map_err(|_| anyhow::anyhow!("search workers exited early"))
@@ -195,22 +174,87 @@ pub fn search_streaming(
         (feed, verified)
     });
 
-    match verify_result {
-        // the sink declared completion; a racing feed error is moot
-        Err(err) if err.is::<StopEarly>() => {}
+    let stopped = match verify_result {
+        Err(err) if err.is::<StopEarly>() => true,
         Err(err) => return Err(err),
-        Ok(()) => feed_result?,
-    }
+        Ok(()) => {
+            feed_result?;
+            false
+        }
+    };
 
-    let mut hits = hits
+    let hits = hits
         .into_inner()
         .map_err(|_| anyhow::anyhow!("a search worker panicked"))?;
+    Ok((hits, bytes_fetched.into_inner(), stopped))
+}
+
+/// Streaming search: candidate docs are fetched concurrently, decompressed
+/// and regex-verified on a worker pool, and reported to `sink` per doc as
+/// they complete (unordered across docs; in-order within a doc). Memory is
+/// bounded by one candidate batch, fetch concurrency, and worker count.
+///
+/// `scope` prunes candidates by key before anything is fetched. When the
+/// sink does not want match positions, verification stops at the first
+/// match per doc.
+pub fn search_streaming(
+    reader: &dyn IndexReader,
+    fetcher: &dyn DocFetcher,
+    pattern: &str,
+    scope: KeyScope<'_>,
+    options: MatchOptions,
+    sink: &dyn MatchSink,
+) -> Result<SearchStats> {
+    let total_docs = reader.total_docs();
+    if options.max_count == Some(0) {
+        return Ok(SearchStats {
+            hits: Vec::new(),
+            candidates: 0,
+            total_docs,
+            bytes_fetched: 0,
+        });
+    }
+    let query = holys3_query::plan(pattern, reader.strategy())?;
+    let re = regex::bytes::Regex::new(pattern)?;
+    let whole_document = can_search_as_document(pattern)?;
+    let mut hits = Vec::new();
+    let mut candidates = 0usize;
+    let mut bytes_fetched = 0usize;
+    let visited = reader.visit_candidates(
+        &query,
+        scope.prefix,
+        SEARCH_CANDIDATE_BATCH,
+        &mut |mut documents| {
+            documents.retain(|document| scope.admits(&document.display_key));
+            candidates = candidates
+                .checked_add(documents.len())
+                .context("candidate count overflows usize")?;
+            if documents.is_empty() {
+                return Ok(true);
+            }
+            let (batch_hits, batch_bytes, stopped) =
+                search_batch(&documents, fetcher, &re, whole_document, options, sink)?;
+            hits.extend(batch_hits);
+            bytes_fetched = bytes_fetched
+                .checked_add(batch_bytes)
+                .context("fetched byte count overflows usize")?;
+            Ok(!stopped)
+        },
+    );
+    if let Err(error) = visited {
+        if candidates > 0 && error.is::<crate::IndexChanged>() {
+            anyhow::bail!(
+                "index changed after candidate batches began; rerun the search to get a clean snapshot"
+            );
+        }
+        return Err(error);
+    }
     hits.sort_unstable();
     Ok(SearchStats {
         hits,
         candidates,
-        total_docs: reader.total_docs(),
-        bytes_fetched: bytes_fetched.into_inner(),
+        total_docs,
+        bytes_fetched,
     })
 }
 
@@ -273,4 +317,174 @@ pub fn search_collect(
         ))
     });
     Ok((matches, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{IndexReader, IndexStats};
+    use holys3_core::{DocAddress, SourceEncoding, Strategy};
+    use holys3_query::Query;
+
+    struct BatchReader {
+        documents: Vec<DocAddress>,
+    }
+
+    impl IndexReader for BatchReader {
+        fn strategy(&self) -> Strategy {
+            Strategy::Trigram
+        }
+
+        fn total_docs(&self) -> usize {
+            self.documents.len()
+        }
+
+        fn candidate_docs(
+            &self,
+            _query: &Query,
+            _key_prefix: Option<&str>,
+        ) -> Result<Vec<DocAddress>> {
+            panic!("search should consume candidate batches")
+        }
+
+        fn visit_candidates(
+            &self,
+            _query: &Query,
+            _key_prefix: Option<&str>,
+            _batch_size: usize,
+            visit: &mut dyn FnMut(Vec<DocAddress>) -> Result<bool>,
+        ) -> Result<()> {
+            for chunk in self.documents.chunks(2) {
+                if !visit(chunk.to_vec())? {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn stats(&self) -> IndexStats {
+            IndexStats {
+                distinct_grams: 0,
+                terms_fst_bytes: 0,
+                postings_bytes: 0,
+            }
+        }
+    }
+
+    struct RecordingFetcher {
+        largest: AtomicUsize,
+    }
+
+    impl DocFetcher for RecordingFetcher {
+        fn fetch_each(
+            &self,
+            documents: &[DocAddress],
+            consume: &mut dyn FnMut(usize, Bytes) -> Result<()>,
+        ) -> Result<()> {
+            self.largest.fetch_max(documents.len(), Ordering::Relaxed);
+            for index in 0..documents.len() {
+                consume(index, Bytes::from_static(b"needle\n"))?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn search_consumes_candidate_batches() {
+        let reader = BatchReader {
+            documents: (0..5)
+                .map(|index| DocAddress {
+                    display_key: format!("doc-{index}"),
+                    source_key: format!("doc-{index}"),
+                    source_version: "v1".into(),
+                    encoded_size: 7,
+                    encoding: SourceEncoding::Raw,
+                    member_path: None,
+                })
+                .collect(),
+        };
+        let fetcher = RecordingFetcher {
+            largest: AtomicUsize::new(0),
+        };
+        let stats = search_streaming(
+            &reader,
+            &fetcher,
+            "needle",
+            KeyScope::default(),
+            MatchOptions::default(),
+            &NullSink,
+        )
+        .unwrap();
+        assert_eq!(stats.hits.len(), 5);
+        assert_eq!(fetcher.largest.load(Ordering::Relaxed), 2);
+    }
+
+    struct ChangingReader {
+        document: DocAddress,
+    }
+
+    impl IndexReader for ChangingReader {
+        fn strategy(&self) -> Strategy {
+            Strategy::Trigram
+        }
+
+        fn total_docs(&self) -> usize {
+            1
+        }
+
+        fn candidate_docs(
+            &self,
+            _query: &Query,
+            _key_prefix: Option<&str>,
+        ) -> Result<Vec<DocAddress>> {
+            unreachable!()
+        }
+
+        fn visit_candidates(
+            &self,
+            _query: &Query,
+            _key_prefix: Option<&str>,
+            _batch_size: usize,
+            visit: &mut dyn FnMut(Vec<DocAddress>) -> Result<bool>,
+        ) -> Result<()> {
+            visit(vec![self.document.clone()])?;
+            Err(anyhow::Error::new(crate::IndexChanged))
+        }
+
+        fn stats(&self) -> IndexStats {
+            IndexStats {
+                distinct_grams: 0,
+                terms_fst_bytes: 0,
+                postings_bytes: 0,
+            }
+        }
+    }
+
+    #[test]
+    fn index_change_after_a_batch_is_not_retryable() {
+        let reader = ChangingReader {
+            document: DocAddress {
+                display_key: "doc".into(),
+                source_key: "doc".into(),
+                source_version: "v1".into(),
+                encoded_size: 7,
+                encoding: SourceEncoding::Raw,
+                member_path: None,
+            },
+        };
+        let fetcher = RecordingFetcher {
+            largest: AtomicUsize::new(0),
+        };
+        let error = search_streaming(
+            &reader,
+            &fetcher,
+            "needle",
+            KeyScope::default(),
+            MatchOptions::default(),
+            &NullSink,
+        )
+        .expect_err("late index change should fail the partial search");
+        assert!(!error.is::<crate::IndexChanged>());
+        assert!(error.to_string().contains("candidate batches began"));
+    }
 }

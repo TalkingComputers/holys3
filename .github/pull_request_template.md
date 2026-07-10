@@ -13,9 +13,9 @@ Closes #
 ## Checklist
 
 - [ ] `cargo fmt --all --check` passes
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] Docs build clean (`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`)
+- [ ] `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` passes
+- [ ] Debug and release workspace tests pass with all features
+- [ ] Docs, dependency policy, packaging, and workflow lint pass
 - [ ] Commits use [Conventional Commits](https://www.conventionalcommits.org) and are signed off (`git commit -s`)
 - [ ] Added/updated tests for the change
 - [ ] Breaking change to a library's public API? If so, called out above.

@@ -1,30 +1,59 @@
-use crate::grams::hash_ngram;
+use crate::codec::{decode_source, DecodeSink, LogicalDocumentMeta, DECODE_LIMITS};
 use crate::grep::has_line_match;
 use anyhow::Result as AnyhowResult;
+use bytes::Bytes;
+use fs4::FileExt;
+use std::io::Write;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// One document in a corpus; its id is its position in `Corpus::docs()`.
-pub struct Doc {
-    /// Object key / file path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceObject {
     pub key: String,
-    /// Compressed/raw byte size, bounding the build's per-chunk fetch
-    /// memory; 0 = unknown.
-    pub size: u64,
+    pub version: String,
+    pub encoded_size: u64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocAddress {
+    pub display_key: String,
+    pub source_key: String,
+    pub source_version: String,
+    pub encoded_size: u64,
+    pub encoding: crate::SourceEncoding,
+    pub member_path: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct StaleSource {
+    pub key: String,
+    pub expected: String,
+}
+
+impl std::fmt::Display for StaleSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "indexed source changed: {} expected version {}",
+            self.key, self.expected
+        )
+    }
+}
+
+impl std::error::Error for StaleSource {}
 
 /// A source of documents for INDEX BUILDS, which need full enumeration.
 /// Implemented by a local dir (tests) and S3 (prod).
 pub trait Corpus {
     /// All documents; a doc's id is its position in this slice.
-    fn docs(&self) -> &[Doc];
+    fn sources(&self) -> &[SourceObject];
     /// Fetch the full bytes of one document by position.
-    fn fetch(&self, idx: usize) -> AnyhowResult<Vec<u8>>;
+    fn fetch(&self, idx: usize) -> AnyhowResult<Bytes>;
     /// Fetch a contiguous run of docs concurrently. Result order is NOT
     /// guaranteed; each item carries its position. Implementations may
     /// return fewer docs than requested when a doc vanished between
     /// indexing and fetching. Default = sequential, fail-fast.
-    fn fetch_many(&self, docs: Range<usize>) -> AnyhowResult<Vec<(usize, Vec<u8>)>> {
+    fn fetch_many(&self, docs: Range<usize>) -> AnyhowResult<Vec<(usize, Bytes)>> {
         docs.map(|idx| Ok((idx, self.fetch(idx)?))).collect()
     }
 }
@@ -37,13 +66,14 @@ pub trait Corpus {
 pub trait DocFetcher {
     fn fetch_each(
         &self,
-        keys: &[String],
-        consume: &mut dyn FnMut(usize, Vec<u8>) -> AnyhowResult<()>,
+        documents: &[DocAddress],
+        consume: &mut dyn FnMut(usize, Bytes) -> AnyhowResult<()>,
     ) -> AnyhowResult<()>;
 }
 
 pub trait BlobStore {
     fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()>;
+    fn put_file(&self, name: &str, path: &Path) -> AnyhowResult<()>;
     /// `Ok(None)` = blob does not exist. Transient store failures are `Err`
     /// so callers never mistake an outage for an empty store.
     fn get(&self, name: &str) -> AnyhowResult<Option<Vec<u8>>>;
@@ -68,7 +98,7 @@ pub trait BlobStore {
 
 /// Version token for stores without native versions: content-derived.
 pub fn content_version(bytes: &[u8]) -> String {
-    format!("{:016x}-{}", hash_ngram(bytes), bytes.len())
+    format!("{}-{}", blake3::hash(bytes).to_hex(), bytes.len())
 }
 
 pub struct LocalBlobStore {
@@ -79,6 +109,17 @@ impl LocalBlobStore {
     pub fn new(root: impl Into<PathBuf>) -> LocalBlobStore {
         LocalBlobStore { root: root.into() }
     }
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> AnyhowResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("blob path has no parent: {}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|err| err.error)?;
+    Ok(())
 }
 
 impl BlobStore for LocalBlobStore {
@@ -97,42 +138,29 @@ impl BlobStore for LocalBlobStore {
         }))
     }
 
-    /// CAS via an exclusive lock file beside the blob: check-then-write runs
-    /// under the lock, so two local writers serialize.
     fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> AnyhowResult<bool> {
         let path = self.root.join(name);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let lock_path = path.with_extension("lock");
-        let lock = loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(file) => break file,
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(err) => return Err(err.into()),
-            }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        FileExt::lock(&lock)?;
+        let current = match std::fs::read(&path) {
+            Ok(bytes) => Some(content_version(&bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
         };
-        drop(lock);
-        let result = (|| {
-            let current = match std::fs::read(&path) {
-                Ok(bytes) => Some(content_version(&bytes)),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-                Err(err) => return Err(err.into()),
-            };
-            if current.as_deref() != expected {
-                return Ok(false);
-            }
-            std::fs::write(&path, bytes)?;
-            Ok(true)
-        })();
-        std::fs::remove_file(&lock_path).ok();
-        result
+        if current.as_deref() != expected {
+            return Ok(false);
+        }
+        write_atomic(&path, bytes)?;
+        Ok(true)
     }
 
     fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()> {
@@ -140,7 +168,21 @@ impl BlobStore for LocalBlobStore {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, bytes)?;
+        write_atomic(&path, bytes)?;
+        Ok(())
+    }
+
+    fn put_file(&self, name: &str, source: &Path) -> AnyhowResult<()> {
+        let path = self.root.join(name);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("blob path has no parent: {}", path.display()))?;
+        std::fs::create_dir_all(parent)?;
+        let mut input = std::fs::File::open(source)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        std::io::copy(&mut input, &mut temp)?;
+        temp.as_file().sync_all()?;
+        temp.persist(path).map_err(|err| err.error)?;
         Ok(())
     }
 
@@ -169,22 +211,73 @@ pub fn scan_matching_docs(
     corpus: &dyn Corpus,
     re: &regex::bytes::Regex,
 ) -> AnyhowResult<Vec<String>> {
-    let mut hits = Vec::new();
-    for (idx, doc) in corpus.docs().iter().enumerate() {
-        let bytes = corpus.fetch(idx)?;
-        if has_line_match(&bytes, re) {
-            hits.push(doc.key.clone());
+    struct ScanSink<'a> {
+        re: &'a regex::bytes::Regex,
+        key: String,
+        bytes: Vec<u8>,
+        hits: Vec<String>,
+    }
+
+    impl DecodeSink for ScanSink<'_> {
+        fn begin(&mut self, document: &LogicalDocumentMeta) -> AnyhowResult<()> {
+            self.key.clone_from(&document.display_key);
+            self.bytes.clear();
+            Ok(())
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> AnyhowResult<()> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> AnyhowResult<()> {
+            if has_line_match(&self.bytes, self.re) {
+                self.hits.push(self.key.clone());
+            }
+            Ok(())
         }
     }
-    hits.sort_unstable();
-    Ok(hits)
+
+    let mut sink = ScanSink {
+        re,
+        key: String::new(),
+        bytes: Vec::new(),
+        hits: Vec::new(),
+    };
+    for (idx, source) in corpus.sources().iter().enumerate() {
+        let bytes = corpus.fetch(idx)?;
+        decode_source(&source.key, bytes, DECODE_LIMITS, &mut sink)?;
+    }
+    sink.hits.sort_unstable();
+    Ok(sink.hits)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::MemCorpus;
+    use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn source_and_document_contracts_are_complete() {
+        let source = SourceObject {
+            key: "logs/bundle.zip".to_owned(),
+            version: "etag-1".to_owned(),
+            encoded_size: 1024,
+        };
+        let document = DocAddress {
+            display_key: "logs/bundle.zip!/app.log".to_owned(),
+            source_key: source.key.clone(),
+            source_version: source.version.clone(),
+            encoded_size: source.encoded_size,
+            encoding: crate::SourceEncoding::Zip,
+            member_path: Some("app.log".to_owned()),
+        };
+        assert_eq!(document.source_key, source.key);
+        assert_eq!(document.source_version, source.version);
+        assert_eq!(document.encoded_size, source.encoded_size);
+    }
 
     #[test]
     fn scan_finds_matching_docs() {
@@ -194,6 +287,22 @@ mod tests {
         );
         let re = regex::bytes::Regex::new("world").unwrap();
         assert_eq!(scan_matching_docs(&c, &re).unwrap(), vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn scan_finds_archive_members() {
+        let c = MemCorpus::new(
+            vec!["bundle.zip".into()],
+            vec![crate::testutil::encode::zip(&[
+                ("a.log", b"hello world"),
+                ("b.log", b"nothing"),
+            ])],
+        );
+        let re = regex::bytes::Regex::new("world").unwrap();
+        assert_eq!(
+            scan_matching_docs(&c, &re).unwrap(),
+            vec!["bundle.zip!/a.log".to_owned()]
+        );
     }
 
     #[test]
@@ -220,6 +329,21 @@ mod tests {
     }
 
     #[test]
+    fn local_blob_store_puts_files_atomically() -> AnyhowResult<()> {
+        let root = tempfile::tempdir()?;
+        let mut source = tempfile::NamedTempFile::new()?;
+        source.write_all(b"file-backed index blob")?;
+        source.as_file().sync_all()?;
+        let store = LocalBlobStore::new(root.path());
+        store.put_file("segments/a/postings.bin", source.path())?;
+        assert_eq!(
+            store.get("segments/a/postings.bin")?.as_deref(),
+            Some(b"file-backed index blob".as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn doc_fetcher_resolves_keys() {
         use crate::testutil::MemCorpus;
         use crate::DocFetcher;
@@ -227,47 +351,109 @@ mod tests {
             vec!["a".into(), "b".into()],
             vec![b"one".to_vec(), b"two".to_vec()],
         );
-        let keys = vec!["b".to_owned(), "a".to_owned()];
+        let documents = vec![
+            DocAddress {
+                display_key: "b".into(),
+                source_key: "b".into(),
+                source_version: content_version(b"two"),
+                encoded_size: 3,
+                encoding: crate::SourceEncoding::Raw,
+                member_path: None,
+            },
+            DocAddress {
+                display_key: "a".into(),
+                source_key: "a".into(),
+                source_version: content_version(b"one"),
+                encoded_size: 3,
+                encoding: crate::SourceEncoding::Raw,
+                member_path: None,
+            },
+        ];
         let mut seen = Vec::new();
-        c.fetch_each(&keys, &mut |idx, bytes| {
+        c.fetch_each(&documents, &mut |idx, bytes| {
             seen.push((idx, bytes));
             Ok(())
         })
         .unwrap();
-        assert_eq!(seen, vec![(0, b"two".to_vec()), (1, b"one".to_vec())]);
+        seen.sort_unstable_by_key(|(idx, _)| *idx);
+        assert_eq!(
+            seen,
+            vec![
+                (0, Bytes::from_static(b"two")),
+                (1, Bytes::from_static(b"one"))
+            ]
+        );
     }
 
     #[test]
     fn fetch_many_aborts_on_first_error() {
         struct BrokenCorpus {
-            docs: Vec<Doc>,
+            sources: Vec<SourceObject>,
         }
 
         impl Corpus for BrokenCorpus {
-            fn docs(&self) -> &[Doc] {
-                &self.docs
+            fn sources(&self) -> &[SourceObject] {
+                &self.sources
             }
 
-            fn fetch(&self, idx: usize) -> AnyhowResult<Vec<u8>> {
+            fn fetch(&self, idx: usize) -> AnyhowResult<Bytes> {
                 if idx == 1 {
                     anyhow::bail!("broken");
                 }
-                Ok(b"ok".to_vec())
+                Ok(Bytes::from_static(b"ok"))
             }
         }
 
         let corpus = BrokenCorpus {
-            docs: vec![
-                Doc {
+            sources: vec![
+                SourceObject {
                     key: "a".into(),
-                    size: 2,
+                    version: "a-1".into(),
+                    encoded_size: 2,
                 },
-                Doc {
+                SourceObject {
                     key: "b".into(),
-                    size: 2,
+                    version: "b-1".into(),
+                    encoded_size: 2,
                 },
             ],
         };
         assert!(corpus.fetch_many(0..2).is_err());
+    }
+
+    #[test]
+    fn preexisting_lock_file_does_not_block_put_if() -> AnyhowResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "holys3-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let lock_path = root.join("segments.lock");
+        std::fs::write(&lock_path, [])?;
+        let thread_root = root.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = LocalBlobStore::new(thread_root).put_if("segments.bin", b"root", None);
+            let _ = tx.send(result);
+        });
+        let result = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(result) => result,
+            Err(_) => {
+                std::fs::remove_file(&lock_path)?;
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("put_if worker panicked"))?;
+                std::fs::remove_dir_all(&root)?;
+                anyhow::bail!("put_if blocked on a stale lock file");
+            }
+        };
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("put_if worker panicked"))?;
+        assert!(result?);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

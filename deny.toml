@@ -34,11 +34,8 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
-    "MPL-2.0",
     "CC0-1.0",
     "Unlicense",
-    "OpenSSL",
-    "CDLA-Permissive-2.0",
     # libbz2-rs-sys: the bzip2 library's own BSD-style permissive license
     "bzip2-1.0.6",
 ]

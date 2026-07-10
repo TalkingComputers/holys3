@@ -52,8 +52,9 @@ $ cargo test --workspace
 real bucket. They **self-skip** unless you point them at one:
 
 ```console
+$ export AWS_PROFILE=my-test-profile
 $ export HOLYS3_TEST_BUCKET=my-test-bucket
-$ export AWS_REGION=us-east-1   # credentials read from the `default` profile
+$ export AWS_REGION=us-east-1
 $ cargo test --workspace
 ```
 
@@ -66,10 +67,14 @@ Every PR is run through the same checks CI runs. Run them locally first:
 
 ```console
 $ cargo fmt --all --check
-$ cargo clippy --workspace --all-targets --all-features -- -D warnings
-$ cargo test --workspace
-$ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+$ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+$ cargo test --locked --workspace --all-features
+$ cargo test --locked --release --workspace --all-features
+$ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace
 $ cargo deny check          # advisories, licenses, bans, sources
+$ cargo package --locked --workspace
+$ actionlint
+$ typos
 ```
 
 In short, your change must:

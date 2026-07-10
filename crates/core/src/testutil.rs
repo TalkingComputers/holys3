@@ -1,49 +1,63 @@
-use super::{Corpus, Doc};
+use super::{content_version, Corpus, SourceObject};
 use anyhow::Result;
+use bytes::Bytes;
 
 pub struct MemCorpus {
-    docs: Vec<Doc>,
+    sources: Vec<SourceObject>,
     bodies: Vec<Vec<u8>>,
 }
 
 impl MemCorpus {
     pub fn new(keys: Vec<String>, bodies: Vec<Vec<u8>>) -> MemCorpus {
         assert_eq!(keys.len(), bodies.len());
-        let docs = keys
+        let sources = keys
             .into_iter()
             .zip(&bodies)
-            .map(|(key, body)| Doc {
+            .map(|(key, body)| SourceObject {
                 key,
-                size: body.len() as u64,
+                version: content_version(body),
+                encoded_size: body.len() as u64,
             })
             .collect();
-        MemCorpus { docs, bodies }
+        MemCorpus { sources, bodies }
     }
 }
 
 impl Corpus for MemCorpus {
-    fn docs(&self) -> &[Doc] {
-        &self.docs
+    fn sources(&self) -> &[SourceObject] {
+        &self.sources
     }
 
-    fn fetch(&self, idx: usize) -> Result<Vec<u8>> {
-        Ok(self.bodies[idx].clone())
+    fn fetch(&self, idx: usize) -> Result<Bytes> {
+        Ok(Bytes::from(self.bodies[idx].clone()))
     }
 }
 
 impl crate::DocFetcher for MemCorpus {
     fn fetch_each(
         &self,
-        keys: &[String],
-        consume: &mut dyn FnMut(usize, Vec<u8>) -> Result<()>,
+        documents: &[crate::DocAddress],
+        consume: &mut dyn FnMut(usize, Bytes) -> Result<()>,
     ) -> Result<()> {
-        for (idx, key) in keys.iter().enumerate() {
+        let mut groups = std::collections::BTreeMap::new();
+        for (idx, document) in documents.iter().enumerate() {
+            groups
+                .entry((document.source_key.clone(), document.source_version.clone()))
+                .or_insert_with(Vec::new)
+                .push((idx, document.member_path.clone()));
+        }
+        for ((key, _), requests) in groups {
             let pos = self
-                .docs
+                .sources
                 .iter()
-                .position(|doc| doc.key == *key)
+                .position(|source| source.key == key)
                 .ok_or_else(|| anyhow::anyhow!("unknown key {key}"))?;
-            consume(idx, self.bodies[pos].clone())?;
+            crate::decode_requested(
+                &key,
+                &requests,
+                Bytes::from(self.bodies[pos].clone()),
+                consume,
+            )?;
         }
         Ok(())
     }
@@ -53,6 +67,30 @@ impl crate::DocFetcher for MemCorpus {
 /// bytes of its format so engine-vs-oracle equality covers every codec.
 pub mod encode {
     use std::io::Write;
+
+    pub fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        for (name, body) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(body).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    pub fn tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = tar::Builder::new(Vec::new());
+        for (name, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(body.len() as u64);
+            header.set_cksum();
+            writer.append_data(&mut header, *name, *body).unwrap();
+        }
+        writer.into_inner().unwrap()
+    }
 
     pub fn gzip(data: &[u8]) -> Vec<u8> {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -88,6 +126,18 @@ pub mod encode {
         enc.finish().unwrap()
     }
 
+    pub fn brotli(data: &[u8]) -> Vec<u8> {
+        let mut enc = brotli::CompressorWriter::new(Vec::new(), 64 * 1024, 5, 22);
+        enc.write_all(data).unwrap();
+        enc.into_inner()
+    }
+
+    pub fn zlib(data: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
     /// One string column `line`, one row per input line: the JSON Lines
     /// projection contains each input line verbatim inside its row.
     pub fn parquet_of_lines(lines: &[&str]) -> Vec<u8> {
@@ -119,5 +169,36 @@ pub mod encode {
             writer.append(record).unwrap();
         }
         writer.into_inner().unwrap()
+    }
+
+    pub fn arrow_of_lines(lines: &[&str]) -> Vec<u8> {
+        use arrow_array::{ArrayRef, RecordBatch, StringArray};
+        use std::sync::Arc;
+        let batch = RecordBatch::try_from_iter(vec![(
+            "line",
+            Arc::new(StringArray::from(lines.to_vec())) as ArrayRef,
+        )])
+        .unwrap();
+        let mut writer =
+            arrow_ipc::writer::FileWriter::try_new(Vec::new(), batch.schema().as_ref()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.into_inner().unwrap()
+    }
+
+    pub fn orc_of_lines(lines: &[&str]) -> Vec<u8> {
+        use arrow_array_58::{ArrayRef, RecordBatch, StringArray};
+        use std::sync::Arc;
+        let batch = RecordBatch::try_from_iter(vec![(
+            "line",
+            Arc::new(StringArray::from(lines.to_vec())) as ArrayRef,
+        )])
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = orc_rust::ArrowWriterBuilder::new(&mut bytes, batch.schema())
+            .try_build()
+            .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        bytes
     }
 }

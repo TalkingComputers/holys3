@@ -4,7 +4,7 @@ members = ["crates/core", "crates/query", "crates/index", "crates/sigv4", "crate
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.4.0"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Indexed regex search for local files and private S3 buckets"
@@ -28,12 +28,28 @@ sha2 = "0.11"
 hex = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "http2"] }
 tokio = { version = "1", features = ["full"] }
-quick-xml = "0.40"
+quick-xml = "0.41.0"
 clap = { version = "4", features = ["derive"] }
+fs4 = { version = "1.1.0", features = ["sync"] }
+tempfile = "3.27.0"
+radsort = "0.1.1"
+rapidhash = "4.5.1"
+blake3 = "1.8.5"
+bytes = "1"
+percent-encoding = "2.3.2"
+zip = { version = "8.6.0", default-features = false, features = ["bzip2", "deflate-flate2-zlib-rs", "deflate64", "lzma", "xz", "zstd"] }
+tar = { version = "0.4.46", default-features = false }
+brotli = "8.0.4"
+arrow-ipc = "59.1.0"
+orc-rust = { version = "0.8.0", default-features = false }
+prost = "0.13.5"
+arrow-array-58 = { package = "arrow-array", version = "58.0.0", features = ["chrono-tz"] }
+arrow-json-58 = { package = "arrow-json", version = "58.0.0" }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = "symbols"
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }

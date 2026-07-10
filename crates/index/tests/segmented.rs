@@ -4,15 +4,19 @@
 
 use anyhow::Result;
 use holys3_core::{
-    decode_body, scan_matching_docs, testutil::MemCorpus, Corpus, DocFetcher, LocalBlobStore,
-    MatchOptions, Strategy,
+    decode_body, decode_requested, scan_matching_docs,
+    testutil::{encode, MemCorpus},
+    Corpus, DocAddress, DocFetcher, LocalBlobStore, MatchOptions, SourceEncoding, SourceObject,
+    Strategy,
 };
 use holys3_index::{
-    search_collect, search_streaming, update_index, IndexReader, KeyScope, NullSink,
+    search_collect, search_streaming, update_index, IndexChanged, IndexReader, KeyScope, NullSink,
     SegmentedReader,
 };
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A mutable in-memory "bucket": key -> body. Etags are content hashes so
 /// modify-then-restore behaves like real S3.
@@ -59,16 +63,41 @@ struct BucketFetcher<'a>(&'a Bucket);
 impl DocFetcher for BucketFetcher<'_> {
     fn fetch_each(
         &self,
-        keys: &[String],
-        consume: &mut dyn FnMut(usize, Vec<u8>) -> Result<()>,
+        documents: &[DocAddress],
+        consume: &mut dyn FnMut(usize, bytes::Bytes) -> Result<()>,
     ) -> Result<()> {
-        for (idx, key) in keys.iter().enumerate() {
-            match self.0.objects.get(key) {
-                Some(body) => consume(idx, body.clone())?,
+        let mut groups = BTreeMap::new();
+        for (idx, document) in documents.iter().enumerate() {
+            groups
+                .entry((document.source_key.clone(), document.source_version.clone()))
+                .or_insert_with(Vec::new)
+                .push((idx, document.member_path.clone()));
+        }
+        for ((key, _), requests) in groups {
+            match self.0.objects.get(&key) {
+                Some(body) => {
+                    decode_requested(&key, &requests, bytes::Bytes::from(body.clone()), consume)?;
+                }
                 None => eprintln!("warning: {key} vanished; skipping"),
             }
         }
         Ok(())
+    }
+}
+
+struct CountingBucketFetcher<'a> {
+    bucket: &'a Bucket,
+    calls: AtomicUsize,
+}
+
+impl DocFetcher for CountingBucketFetcher<'_> {
+    fn fetch_each(
+        &self,
+        documents: &[DocAddress],
+        consume: &mut dyn FnMut(usize, bytes::Bytes) -> Result<()>,
+    ) -> Result<()> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        BucketFetcher(self.bucket).fetch_each(documents, consume)
     }
 }
 
@@ -92,12 +121,18 @@ fn assert_matches_oracle(
 ) -> Result<()> {
     let reader = SegmentedReader::open(Box::new(LocalBlobStore::new(store_dir)), cache_dir)?;
     let full = bucket.full_corpus();
-    let keys: Vec<String> = full.docs().iter().map(|doc| doc.key.clone()).collect();
+    let keys: Vec<String> = full
+        .sources()
+        .iter()
+        .map(|source| source.key.clone())
+        .collect();
     let decoded_bodies: Vec<Vec<u8>> = full
-        .docs()
+        .sources()
         .iter()
         .enumerate()
-        .map(|(idx, doc)| decode_body(&doc.key, full.fetch(idx).expect("fetch")).expect("decode"))
+        .map(|(idx, source)| {
+            decode_body(&source.key, full.fetch(idx).expect("fetch").to_vec()).expect("decode")
+        })
         .collect();
     let decoded = MemCorpus::new(keys, decoded_bodies);
     for pattern in patterns {
@@ -111,6 +146,202 @@ fn assert_matches_oracle(
 }
 
 const PATTERNS: &[&str] = &["needle", "shared", "zzznope", ".*", "v[12]-only"];
+
+#[test]
+fn archive_members_follow_source_lifecycle() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put(
+        "logs/bundle.zip",
+        &encode::zip(&[
+            ("app.log", b"needle alpha"),
+            ("nested/worker.log", b"needle beta"),
+            ("quiet.log", b"haystack"),
+        ]),
+    );
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+    )?;
+    let query = holys3_query::plan("needle", Strategy::Trigram)?;
+    let candidates = reader.candidate_docs(&query, Some("logs/bundle.zip!/"))?;
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|document| document.display_key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "logs/bundle.zip!/app.log",
+            "logs/bundle.zip!/nested/worker.log"
+        ]
+    );
+    assert!(candidates.iter().all(|document| {
+        document.source_key == "logs/bundle.zip"
+            && document.encoding == SourceEncoding::Zip
+            && document.member_path.is_some()
+    }));
+    assert_eq!(
+        search_collect(&reader, &BucketFetcher(&bucket), "needle")?
+            .1
+            .hits,
+        [
+            "logs/bundle.zip!/app.log".to_owned(),
+            "logs/bundle.zip!/nested/worker.log".to_owned()
+        ]
+    );
+    assert_eq!(
+        search_streaming(
+            &reader,
+            &BucketFetcher(&bucket),
+            "needle",
+            KeyScope {
+                prefix: Some("logs/bundle.zip!/nested/"),
+                matches: None,
+            },
+            MatchOptions::default(),
+            &NullSink,
+        )?
+        .hits,
+        ["logs/bundle.zip!/nested/worker.log".to_owned()]
+    );
+
+    bucket.put(
+        "logs/bundle.zip",
+        &encode::zip(&[("renamed.log", b"needle gamma"), ("quiet.log", b"haystack")]),
+    );
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+    )?;
+    assert_eq!(
+        search_collect(&reader, &BucketFetcher(&bucket), "needle")?
+            .1
+            .hits,
+        ["logs/bundle.zip!/renamed.log".to_owned()]
+    );
+
+    bucket.delete("logs/bundle.zip");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+    )?;
+    assert_eq!(reader.total_docs(), 0);
+    Ok(())
+}
+
+#[test]
+fn indexes_large_archive_without_decoding_it_twice_per_search() -> Result<()> {
+    let names = (0..17_000)
+        .map(|index| format!("logs/member-{index:05}.log"))
+        .collect::<Vec<_>>();
+    let bodies = (0..17_000)
+        .map(|index| {
+            if index % 1_000 == 0 {
+                format!("member {index} scale-needle").into_bytes()
+            } else {
+                format!("member {index} ordinary").into_bytes()
+            }
+        })
+        .collect::<Vec<_>>();
+    let entries = names
+        .iter()
+        .zip(&bodies)
+        .map(|(name, body)| (name.as_str(), body.as_slice()))
+        .collect::<Vec<_>>();
+    let archive = encode::zip(&entries);
+    let mut bucket = Bucket::default();
+    bucket.put("scale.zip", &archive);
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+    )?;
+    assert_eq!(reader.total_docs(), 17_000);
+    let stats = search_collect(&reader, &BucketFetcher(&bucket), "scale-needle")?.1;
+    assert_eq!(stats.candidates, 17);
+    assert_eq!(stats.hits.len(), 17);
+    assert!(stats
+        .hits
+        .iter()
+        .all(|key| key.starts_with("scale.zip!/logs/member-")));
+    let fetcher = CountingBucketFetcher {
+        bucket: &bucket,
+        calls: AtomicUsize::new(0),
+    };
+    let stats = search_streaming(
+        &reader,
+        &fetcher,
+        ".+",
+        KeyScope::default(),
+        MatchOptions::default(),
+        &NullSink,
+    )?;
+    assert_eq!(stats.hits.len(), 17_000);
+    assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[test]
+fn reports_changed_root_when_garbage_collection_invalidates_reader() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("logs/a", b"needle old");
+    bucket.put("logs/b", b"hay old");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+    )?;
+
+    bucket.put("logs/a", b"needle new");
+    bucket.put("logs/b", b"hay new");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+
+    let query = holys3_query::plan("needle", Strategy::Trigram)?;
+    let error = reader
+        .candidate_docs(&query, None)
+        .expect_err("stale reader should fail");
+    assert!(error.is::<IndexChanged>(), "{error:#}");
+    Ok(())
+}
 
 #[test]
 fn lifecycle_add_modify_delete_readd() -> Result<()> {
@@ -346,6 +577,17 @@ fn corrupt_cache_self_heals_and_stale_segments_evict() -> Result<()> {
     std::fs::write(&fst_path, vec![0u8; len])?;
     assert_matches_oracle(&bucket, store_dir.path(), cache.path(), PATTERNS, "healed")?;
 
+    let docs_path = seg_dir.join("docs.bin");
+    let len = std::fs::metadata(&docs_path)?.len() as usize;
+    std::fs::write(&docs_path, vec![0u8; len])?;
+    assert_matches_oracle(
+        &bucket,
+        store_dir.path(),
+        cache.path(),
+        PATTERNS,
+        "docs healed",
+    )?;
+
     // Replacing the corpus retires the old segment; its cache dir goes too.
     bucket.put("a", b"replacement world");
     reindex(&bucket, store_dir.path(), cache.path(), Strategy::Trigram)?;
@@ -404,6 +646,73 @@ fn undecodable_objects_marked_failed_and_converge() -> Result<()> {
         &["needle", "recovered"],
         "failed-doc-recovery",
     )?;
+    Ok(())
+}
+
+#[test]
+fn object_missing_during_fetch_retries_with_same_etag() -> Result<()> {
+    struct MissingOnceCorpus {
+        sources: Vec<SourceObject>,
+        missing: bool,
+    }
+
+    impl Corpus for MissingOnceCorpus {
+        fn sources(&self) -> &[SourceObject] {
+            &self.sources
+        }
+
+        fn fetch(&self, _idx: usize) -> Result<bytes::Bytes> {
+            Ok(bytes::Bytes::from_static(b"needle"))
+        }
+
+        fn fetch_many(&self, sources: Range<usize>) -> Result<Vec<(usize, bytes::Bytes)>> {
+            if self.missing {
+                Ok(Vec::new())
+            } else {
+                Ok(sources
+                    .map(|idx| (idx, bytes::Bytes::from_static(b"needle")))
+                    .collect())
+            }
+        }
+    }
+
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let store = LocalBlobStore::new(store_dir.path());
+    let listing = vec![("a".to_owned(), "same-etag".to_owned(), 6)];
+    let missing = AtomicBool::new(true);
+    let build = |shard: &[(String, String, u64)]| {
+        Ok(Box::new(MissingOnceCorpus {
+            sources: shard
+                .iter()
+                .map(|(key, version, size)| SourceObject {
+                    key: key.clone(),
+                    version: version.clone(),
+                    encoded_size: *size,
+                })
+                .collect(),
+            missing: missing.swap(false, Ordering::SeqCst),
+        }) as Box<dyn Corpus>)
+    };
+    let first = update_index(
+        &store,
+        cache_dir.path(),
+        Strategy::Trigram,
+        &listing,
+        false,
+        &build,
+    )?;
+    assert_eq!(first.total_docs, 0);
+    let second = update_index(
+        &store,
+        cache_dir.path(),
+        Strategy::Trigram,
+        &listing,
+        false,
+        &build,
+    )?;
+    assert_eq!(second.added, 1);
+    assert_eq!(second.total_docs, 1);
     Ok(())
 }
 
@@ -559,6 +868,9 @@ fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
         fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
             self.inner.put(name, bytes)
         }
+        fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+            self.inner.put_file(name, path)
+        }
         fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
             self.inner.get(name)
         }
@@ -693,6 +1005,10 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
             self.inner.put(name, bytes)
         }
 
+        fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+            self.inner.put_file(name, path)
+        }
+
         fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
             if name == "segments.bin" && self.fail_next_root_get.replace(false) {
                 anyhow::bail!("simulated transient outage");
@@ -748,5 +1064,31 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
         result.is_err(),
         "a transient store error must fail loudly, not silently rebuild"
     );
+    Ok(())
+}
+
+#[test]
+fn duplicate_listing_fails_before_fetching() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let calls = AtomicUsize::new(0);
+    let listing = vec![
+        ("logs/a".to_owned(), "v1".to_owned(), 1),
+        ("logs/a".to_owned(), "v1".to_owned(), 1),
+    ];
+    let error = update_index(
+        &LocalBlobStore::new(store_dir.path()),
+        cache_dir.path(),
+        Strategy::Trigram,
+        &listing,
+        false,
+        &|_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("factory should not run")
+        },
+    )
+    .expect_err("duplicate listing should fail");
+    assert!(error.to_string().contains("duplicate listing key"));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
     Ok(())
 }

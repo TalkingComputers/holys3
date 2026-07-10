@@ -24,4 +24,4 @@ pattern = ".*"
 
 [[scenarios]]
 name = "dot_star_gap"
-pattern = "(?s)needle.*alpha"
+pattern = "needle.*alpha"

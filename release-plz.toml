@@ -1,7 +1,8 @@
 # release-plz configuration. https://release-plz.dev/docs/config
 [workspace]
-# All crates share one version and are bumped together.
-release_always = false
+# All crates share one version and are bumped together. The protected
+# crates-io environment gates every registry-missing workspace version.
+release_always = true
 # Keep the changelog in Keep a Changelog style, grouped by Conventional Commit type.
 changelog_update = true
 # crates.io trusted publishing handles auth; no token needed in the manifest.

@@ -1,0 +1,7 @@
+[files]
+extend-exclude = ["crates/xbench/runs/*.json"]
+
+[default.extend-words]
+AIMD = "AIMD"
+Aimd = "Aimd"
+ERRO = "ERRO"
