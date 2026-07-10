@@ -186,9 +186,12 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2
         with:
-          tool: actionlint,typos-cli
+          tool: typos-cli
           fallback: none
-      - run: actionlint -color
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
+        with:
+          args: -color
       - run: typos
 
   coverage:
