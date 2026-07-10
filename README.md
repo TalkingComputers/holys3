@@ -231,7 +231,8 @@ than only on physical source objects.
 <!-- BENCH:END -->
 
 Microbenchmarks: `make bench-micro` (CI-gated against
-[`benches/baseline.json`](benches/baseline.json)).
+[`benches/baseline.json`](benches/baseline.json)). Refresh the baseline only
+from CI's `bench-micro` artifact so measurements stay on the same runner class.
 
 ## Limitations
 

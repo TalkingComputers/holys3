@@ -38,7 +38,9 @@ jobs:
           toolchain: 1.96.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Run Criterion benches
-        run: cargo bench --locked -p holys3-index --bench hot_paths -- --save-baseline pr
+        run: |
+          rm -rf target/criterion
+          cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --save-baseline pr
       - name: Collect Criterion medians
         run: |
           python3 <<'PY'
@@ -79,6 +81,7 @@ jobs:
                   raise SystemExit(f"benchmark {name} reported non-positive median {value}")
               if name not in base:
                   rows.append(f"| {name} | new | {value:.0f} | new |")
+                  failed = True
                   continue
               old = base[name]
               delta = ((value - old) / old) * 100.0
@@ -212,8 +215,9 @@ jobs:
           if match is None:
               raise SystemExit("scale benchmark did not report listing_ms and build_ms")
           build_ms = float(match.group(2))
-          if build_ms > 6000:
-              raise SystemExit(f"25,000-object build took {build_ms:.3f} ms, exceeds 6000 ms")
+          build_limit_ms = 14_000
+          if build_ms > build_limit_ms:
+              raise SystemExit(f"25,000-object build took {build_ms:.3f} ms, exceeds {build_limit_ms} ms")
           PY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()

@@ -1,4 +1,6 @@
 /target
+/bench-micro.md
+/benches/current.json
 # stray local tooling artifacts (not part of holys3)
 agentdb.rvf
 agentdb.rvf.lock
