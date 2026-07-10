@@ -12,6 +12,7 @@ jobs:
   # Keeps an open release PR (version bumps + CHANGELOG) up to date.
   release-plz-pr:
     name: release-plz PR
+    if: vars.RELEASE_PLZ_PR_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -34,10 +35,10 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
       - name: Run CI on release branches
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           RELEASE_PRS: ${{ steps.release-pr.outputs.prs }}
         run: |
           jq -r '.[].head_branch' <<< "$RELEASE_PRS" | while read -r branch; do
