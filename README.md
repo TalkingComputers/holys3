@@ -210,7 +210,7 @@ Absolute latencies vary with the network (per-object RTT dominates from a
 laptop; in-region EC2 is far lower) — the prune ratios and hits are the
 stable part.
 
-**Continuous (CI)** — regenerated on every push against a pinned local MinIO
+**Continuous (CI)** — measured on every push against a pinned local MinIO
 image (`make bench-minio`). CI runs release binaries, rejects missing or >30%
 slower microbenchmarks, validates exact end-to-end hit counts, indexes 25,000
 objects, and enforces a 300 MiB peak-RSS ceiling for high-cardinality and
