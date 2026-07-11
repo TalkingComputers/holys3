@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 const MAGIC: &[u8; 8] = b"HS3CACH2";
-const STATE_MAGIC: &[u8; 8] = b"HS3SIZE1";
+const STATE_MAGIC: &[u8; 8] = b"HS3STAT2";
 const HEADER_LEN: usize = 56;
 #[cfg(not(test))]
 const CACHE_MEMORY_LIMIT: u64 = 8 * 1024 * 1024;
@@ -20,6 +20,12 @@ enum CacheBody {
     Missing,
     Valid(DocumentBody),
     Invalid(u64),
+}
+
+#[derive(Clone, Copy)]
+struct CacheState {
+    total: u64,
+    stamp: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,8 +79,8 @@ impl ObjectCache {
         };
         let lock = cache.lock()?;
         cache.remove_temps()?;
-        let total = cache.evict()?;
-        cache.write_total(Some(total))?;
+        let state = cache.evict()?;
+        cache.write_state(Some(state))?;
         drop(lock);
         Ok(cache)
     }
@@ -98,10 +104,11 @@ impl ObjectCache {
             CacheBody::Valid(body) => return Ok(Some(body)),
             CacheBody::Invalid(len) => len,
         };
-        let total = self.read_total()?;
-        self.write_total(None)?;
+        let mut state = self.read_state()?;
+        self.write_state(None)?;
         std::fs::remove_file(&path)?;
-        self.write_total(Some(total.saturating_sub(len)))?;
+        state.total = state.total.saturating_sub(len);
+        self.write_state(Some(state))?;
         drop(lock);
         Ok(None)
     }
@@ -123,13 +130,17 @@ impl ObjectCache {
             Err(error) => return Err(error.into()),
         };
         let new_len = u64::try_from(HEADER_LEN)? + body_len;
-        let total = self.read_total()?;
-        self.write_total(None)?;
+        let mut state = self.read_state()?;
+        self.write_state(None)?;
+        state.stamp = state
+            .stamp
+            .checked_add(1)
+            .context("object cache insertion sequence exhausted")?;
         let mut temp = tempfile::NamedTempFile::new_in(&self.objects)?;
         temp.write_all(MAGIC)?;
         temp.write_all(&body_len.to_le_bytes())?;
         temp.write_all(&[0; 32])?;
-        temp.write_all(&insertion_stamp().to_le_bytes())?;
+        temp.write_all(&state.stamp.to_le_bytes())?;
         let mut reader = body.into_reader();
         let mut hasher = blake3::Hasher::new();
         let mut written = 0u64;
@@ -157,16 +168,15 @@ impl ObjectCache {
             Err(error) => return Err(error.into()),
         }
         temp.persist(&path).map_err(|error| error.error)?;
-        let total = total
+        state.total = state
+            .total
             .checked_sub(old_len)
             .and_then(|value| value.checked_add(new_len))
             .context("object cache size overflows u64")?;
-        let total = if total > self.cap_bytes {
-            self.evict()?
-        } else {
-            total
-        };
-        self.write_total(Some(total))?;
+        if state.total > self.cap_bytes {
+            state = self.evict()?;
+        }
+        self.write_state(Some(state))?;
         drop(lock);
         Ok(())
     }
@@ -272,23 +282,26 @@ impl ObjectCache {
         Ok(())
     }
 
-    fn read_total(&self) -> Result<u64> {
+    fn read_state(&self) -> Result<CacheState> {
         let path = self.root.join("cache.state");
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error.into()),
         };
-        if bytes.len() == 16 && &bytes[..8] == STATE_MAGIC {
-            return Ok(u64::from_le_bytes(bytes[8..].try_into()?));
+        if bytes.len() == 24 && &bytes[..8] == STATE_MAGIC {
+            return Ok(CacheState {
+                total: u64::from_le_bytes(bytes[8..16].try_into()?),
+                stamp: u64::from_le_bytes(bytes[16..24].try_into()?),
+            });
         }
         self.remove_temps()?;
-        let total = self.evict()?;
-        self.write_total(Some(total))?;
-        Ok(total)
+        let state = self.evict()?;
+        self.write_state(Some(state))?;
+        Ok(state)
     }
 
-    fn write_total(&self, total: Option<u64>) -> Result<()> {
+    fn write_state(&self, state: Option<CacheState>) -> Result<()> {
         let path = self.root.join("cache.state");
         let mut file = OpenOptions::new()
             .create(true)
@@ -296,10 +309,11 @@ impl ObjectCache {
             .write(true)
             .open(path)?;
         set_file_mode(&file)?;
-        match total {
-            Some(total) => {
+        match state {
+            Some(state) => {
                 file.write_all(STATE_MAGIC)?;
-                file.write_all(&total.to_le_bytes())?;
+                file.write_all(&state.total.to_le_bytes())?;
+                file.write_all(&state.stamp.to_le_bytes())?;
             }
             None => file.write_all(b"D")?,
         }
@@ -307,7 +321,7 @@ impl ObjectCache {
         Ok(())
     }
 
-    fn evict(&self) -> Result<u64> {
+    fn evict(&self) -> Result<CacheState> {
         #[cfg(test)]
         self.scans.fetch_add(1, Ordering::Relaxed);
         let mut entries = Vec::new();
@@ -332,8 +346,9 @@ impl ObjectCache {
                 .checked_add(entry.3)
                 .context("object cache size overflows u64")
         })?;
+        let stamp = entries.iter().fold(0, |stamp, entry| stamp.max(entry.0));
         if total <= self.cap_bytes {
-            return Ok(total);
+            return Ok(CacheState { total, stamp });
         }
         entries.sort_unstable_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
         for (_, _, path, bytes) in entries {
@@ -343,7 +358,7 @@ impl ObjectCache {
             std::fs::remove_file(path)?;
             total -= bytes;
         }
-        Ok(total)
+        Ok(CacheState { total, stamp })
     }
 }
 
@@ -454,14 +469,6 @@ fn read_entry(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn insertion_stamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
-        })
-}
-
 fn read_stamp(path: &Path) -> Result<u64> {
     use std::io::Read;
     let mut header = [0u8; HEADER_LEN];
@@ -515,10 +522,27 @@ mod tests {
         cache.put(&key("v1"), &Bytes::from_static(b"1234"))?;
         assert_eq!(cache.get(&key("v1"))?, Some(Bytes::from_static(b"1234")));
         assert_eq!(cache.get(&key("v2"))?, None);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         cache.put(&key("v2"), &Bytes::from_static(b"56789"))?;
         assert_eq!(cache.get(&key("v1"))?, None);
         assert_eq!(cache.get(&key("v2"))?, Some(Bytes::from_static(b"56789")));
+        Ok(())
+    }
+
+    #[test]
+    fn cache_persists_monotonic_insertion_stamps() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cap = u64::try_from(2 * (HEADER_LEN + 4))?;
+        let first_cache = ObjectCache::open(dir.path(), cap)?;
+        let second_cache = ObjectCache::open(dir.path(), cap)?;
+        first_cache.put(&key("v1"), &Bytes::from_static(b"1234"))?;
+        let first = read_stamp(&first_cache.path(&key("v1")))?;
+        second_cache.put(&key("v2"), &Bytes::from_static(b"5678"))?;
+        assert_eq!(
+            read_stamp(&second_cache.path(&key("v2")))?,
+            first
+                .checked_add(1)
+                .context("object cache insertion sequence exhausted")?
+        );
         Ok(())
     }
 
