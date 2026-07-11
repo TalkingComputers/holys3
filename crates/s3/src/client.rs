@@ -791,7 +791,7 @@ mod tests {
         MAX_MULTIPART_PARTS, MAX_MULTIPART_PART_SIZE, MULTIPART_PART_SIZE, SMALL_READ_MAX,
     };
     use holys3_sigv4::Credentials;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1223,7 +1223,13 @@ mod tests {
         let fetched = client
             .0
             .rt
-            .block_on(client.fetch_source_ranges("bucket", "key", "\"etag\"", body.len() as u64, 8))
+            .block_on(client.fetch_source_ranges(
+                "bucket",
+                "key",
+                Some("\"etag\""),
+                body.len() as u64,
+                8,
+            ))
             .unwrap()
             .unwrap();
         assert!(fetched.is_file());
@@ -1267,6 +1273,57 @@ mod tests {
         assert!(fetched.is_file());
         assert_eq!(fetched.into_bytes().unwrap(), body);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn writes_large_object_to_file_with_ranges() {
+        let body = vec![b'x'; usize::try_from(SMALL_READ_MAX).unwrap() + 1];
+        let (endpoint, server) = start_response_server("206 Partial Content", &body);
+        let client = S3Client::new(
+            "us-east-1".into(),
+            Credentials {
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                session_token: None,
+            },
+            Some(endpoint),
+            FetchConfig::default(),
+        )
+        .unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        assert!(client
+            .get_file("bucket", "key", &mut output, body.len() as u64)
+            .unwrap());
+        output.rewind().unwrap();
+        let mut fetched = Vec::new();
+        output.read_to_end(&mut fetched).unwrap();
+        assert_eq!(fetched, body);
+        let request = server.join().unwrap().to_ascii_lowercase();
+        let range = format!("range: bytes=0-{}\r\n", body.len() - 1);
+        assert!(request.contains(&range), "{request}");
+        assert!(!request.contains("if-match:"), "{request}");
+    }
+
+    #[test]
+    fn writes_empty_object_to_file() {
+        let (endpoint, server) = start_response_server("200 OK", b"");
+        let client = S3Client::new(
+            "us-east-1".into(),
+            Credentials {
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                session_token: None,
+            },
+            Some(endpoint),
+            FetchConfig::default(),
+        )
+        .unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        output.write_all(b"stale").unwrap();
+        assert!(client.get_file("bucket", "key", &mut output, 0).unwrap());
+        assert_eq!(output.metadata().unwrap().len(), 0);
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(!request.contains("range:"), "{request}");
     }
 
     #[test]

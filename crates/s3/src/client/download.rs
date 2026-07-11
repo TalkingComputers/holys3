@@ -4,7 +4,7 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use holys3_core::{DocId, DocumentBody, DocumentSpool};
 use reqwest::StatusCode;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -130,21 +130,21 @@ impl S3Client {
         Ok(Some(body))
     }
 
-    pub(super) async fn fetch_source_ranges(
+    async fn fetch_source_parts(
         &self,
         bucket: &str,
         key: &str,
-        etag: &str,
+        etag: Option<&str>,
         size: u64,
         part_size: u64,
-    ) -> Result<Option<DocumentBody>> {
+        consume: &mut (dyn FnMut(u64, DocumentBody) -> Result<()> + Send),
+    ) -> Result<bool> {
         anyhow::ensure!(size > 0, "source range size must be greater than 0");
         anyhow::ensure!(
             part_size > 0,
             "source range part size must be greater than 0"
         );
         let parts = size.div_ceil(part_size);
-        let mut body = DocumentSpool::new(size)?;
         let mut fetches = stream::iter((0..parts).map(|part| async move {
             let start = part
                 .checked_mul(part_size)
@@ -154,39 +154,59 @@ impl S3Client {
                     .context("source range starts after object end")?,
             );
             let range = byte_range(start, len)?;
-            let bytes = self
-                .fetch_hedged(bucket, key, Some(range), Some(etag))
-                .await?;
+            let bytes = self.fetch_hedged(bucket, key, Some(range), etag).await?;
             Ok::<_, anyhow::Error>((start, bytes))
         }))
         .buffer_unordered(SOURCE_RANGE_CONCURRENCY.min(self.0.cfg.cap));
         while let Some(result) = fetches.next().await {
             let (start, part) = result?;
             let Some(part) = part else {
-                return Ok(None);
+                return Ok(false);
             };
-            let part_len = part.len();
-            let mut reader = part.into_reader();
-            let mut copied = 0u64;
-            let mut chunk = [0u8; 64 * 1024];
-            loop {
-                let read = reader.read(&mut chunk)?;
-                if read == 0 {
-                    break;
-                }
-                body.write_at(
-                    start
-                        .checked_add(copied)
-                        .context("source range write offset overflows u64")?,
-                    &chunk[..read],
-                )?;
-                copied = copied
-                    .checked_add(u64::try_from(read)?)
-                    .context("source range length overflows u64")?;
-            }
-            anyhow::ensure!(copied == part_len, "source range body length changed");
+            consume(start, part)?;
         }
-        Ok(Some(body.finish()?))
+        Ok(true)
+    }
+
+    pub(super) async fn fetch_source_ranges(
+        &self,
+        bucket: &str,
+        key: &str,
+        etag: Option<&str>,
+        size: u64,
+        part_size: u64,
+    ) -> Result<Option<DocumentBody>> {
+        let mut body = DocumentSpool::new(size)?;
+        let found = self
+            .fetch_source_parts(bucket, key, etag, size, part_size, &mut |start, part| {
+                let part_len = part.len();
+                let mut reader = part.into_reader();
+                let mut copied = 0u64;
+                let mut chunk = [0u8; 64 * 1024];
+                loop {
+                    let read = reader.read(&mut chunk)?;
+                    if read == 0 {
+                        break;
+                    }
+                    body.write_at(
+                        start
+                            .checked_add(copied)
+                            .context("source range write offset overflows u64")?,
+                        &chunk[..read],
+                    )?;
+                    copied = copied
+                        .checked_add(u64::try_from(read)?)
+                        .context("source range length overflows u64")?;
+                }
+                anyhow::ensure!(copied == part_len, "source range body length changed");
+                Ok(())
+            })
+            .await?;
+        if found {
+            Ok(Some(body.finish()?))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn fetch_source(
@@ -198,7 +218,7 @@ impl S3Client {
     ) -> Result<Option<DocumentBody>> {
         match etag {
             Some(etag) if size >= SOURCE_RANGE_MIN => {
-                self.fetch_source_ranges(bucket, key, etag, size, SOURCE_RANGE_SIZE)
+                self.fetch_source_ranges(bucket, key, Some(etag), size, SOURCE_RANGE_SIZE)
                     .await
             }
             _ => self.fetch_hedged(bucket, key, None, etag).await,
@@ -211,6 +231,48 @@ impl S3Client {
             .block_on(self.fetch_hedged(bucket, key, None, None))?
             .map(|body| body.into_bytes().map(|bytes| bytes.to_vec()))
             .transpose()
+    }
+
+    pub(crate) fn get_file(
+        &self,
+        bucket: &str,
+        key: &str,
+        output: &mut std::fs::File,
+        size: u64,
+    ) -> Result<bool> {
+        if size == 0 {
+            let body = self
+                .0
+                .rt
+                .block_on(self.fetch_hedged(bucket, key, None, None))?;
+            let Some(body) = body else {
+                return Ok(false);
+            };
+            anyhow::ensure!(body.is_empty(), "S3 object length changed while copying");
+            output.set_len(0)?;
+        } else {
+            output.set_len(size)?;
+            let found = self.0.rt.block_on(self.fetch_source_parts(
+                bucket,
+                key,
+                None,
+                size,
+                SOURCE_RANGE_SIZE,
+                &mut |start, part| {
+                    let expected = part.len();
+                    output.seek(SeekFrom::Start(start))?;
+                    let copied = std::io::copy(&mut part.into_reader(), output)?;
+                    anyhow::ensure!(copied == expected, "S3 range length changed while copying");
+                    Ok(())
+                },
+            ))?;
+            if !found {
+                return Ok(false);
+            }
+        }
+        output.seek(SeekFrom::Start(0))?;
+        output.flush()?;
+        Ok(true)
     }
 
     pub fn get_if_match(&self, bucket: &str, key: &str, etag: &str) -> Result<Option<Bytes>> {

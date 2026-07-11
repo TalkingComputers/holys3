@@ -370,6 +370,13 @@ impl BlobStore for S3BlobStore {
         self.client.get(&self.bucket, &self.build_key(name))
     }
 
+    fn get_file(&self, name: &str, output: &mut std::fs::File, len: u64) -> anyhow::Result<()> {
+        self.client
+            .get_file(&self.bucket, &self.build_key(name), output, len)?
+            .then_some(())
+            .with_context(|| self.blob_context(name))
+    }
+
     fn get_range(&self, name: &str, start: u64, len: u64) -> anyhow::Result<Vec<u8>> {
         self.client
             .get_range(&self.bucket, &self.build_key(name), start, len)?
