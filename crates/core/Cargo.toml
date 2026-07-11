@@ -16,7 +16,8 @@ categories.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 regex.workspace = true
-rapidhash = "4.4.1"
+regex-syntax.workspace = true
+rapidhash.workspace = true
 memchr = "2.8.1"
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 zstd = "0.13.3"
@@ -24,17 +25,30 @@ bzip2 = "0.6.1"
 snap = "1.1.1"
 lz4_flex = "0.13.1"
 liblzma = "0.4.6"
-bytes = "1"
-parquet = { version = "59.0.0", default-features = false, features = ["arrow", "snap", "zstd", "flate2", "flate2-zlib-rs", "lz4", "brotli"] }
-arrow-json = "59.0.0"
-arrow-schema = "59.0.0"
+bytes.workspace = true
+blake3.workspace = true
+parquet = { version = "59.1.0", default-features = false, features = ["arrow", "snap", "zstd", "flate2", "flate2-zlib-rs", "lz4", "brotli"] }
+arrow-json = "59.1.0"
+arrow-schema = "59.1.0"
 apache-avro = { version = "0.21.0", features = ["snappy", "zstandard", "bzip", "xz"] }
 num-bigint = "0.4.6"
 serde_json.workspace = true
 # chrono-tz is load-bearing: without it, arrow rejects named timezones
 # ("UTC" — the pyarrow/pandas/Spark default) and every parquet file carrying
 # one would fail decode and silently vanish from results.
-arrow-array = { version = "59.0.0", features = ["chrono-tz"] }
+arrow-array = { version = "59.1.0", features = ["chrono-tz"] }
+fs4.workspace = true
+tempfile.workspace = true
+memmap2.workspace = true
+zip.workspace = true
+tar.workspace = true
+brotli.workspace = true
+arrow-ipc.workspace = true
+orc-rust.workspace = true
+prost.workspace = true
+arrow-array-58.workspace = true
+arrow-json-58.workspace = true
+radsort.workspace = true
 
 [features]
 testutil = []

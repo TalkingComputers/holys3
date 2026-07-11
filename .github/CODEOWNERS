@@ -1,8 +1,4 @@
-# Default owners for everything in the repo.
-# Replace @OWNER with the GitHub user/team that should review by default.
-*               @OWNER
-
-# Per-crate owners (optional — adjust as the team grows).
-/crates/sigv4/  @OWNER
-/crates/s3/     @OWNER
-/.github/       @OWNER
+*               @prsabahrami
+/crates/sigv4/  @prsabahrami
+/crates/s3/     @prsabahrami
+/.github/       @prsabahrami

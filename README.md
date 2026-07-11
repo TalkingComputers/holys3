@@ -26,11 +26,10 @@ verifies with real Rust regexes against the original bytes. **The index narrows
 candidates; the verifier decides matches** — results are always exact, never
 index-approximated.
 
-Measured against the fastest DIY alternative (s5cmd at 64 workers + `rg -z`) on
-a 100,000-object log corpus in S3: holys3 answered needle queries in **1.5 s**
-fetching ~100 objects; the download-and-grep path takes **~4.3 minutes and
-100,000 GETs — every query**. The gap grows with bucket size, because scan time
-is O(corpus) and holys3 is O(matches).
+In the tracked real-S3 benchmark below, a literal query over 1,000 objects
+finished in **1.5 s** at concurrency 64 versus **54.7 s** sequentially. A
+no-match query fetched zero objects. Every benchmark corpus, planted hit count,
+candidate count, and byte count is deterministic and checked before timing.
 
 ## Install
 
@@ -41,6 +40,10 @@ Windows ship with every [GitHub release](https://github.com/TalkingComputers/hol
 cargo binstall holys3   # fetches the prebuilt binary for your platform
 cargo install holys3    # or build from source (Rust 1.88+)
 ```
+
+Release archives include SHA-256 checksums and GitHub build-provenance
+attestations. Verify an archive with
+`gh attestation verify -R TalkingComputers/holys3 <archive>`.
 
 ## Quickstart
 
@@ -66,10 +69,9 @@ subcommand, use `-e`: `holys3 -e index s3://bucket`.
 
 ### Object formats
 
-Format detection is by **magic bytes only** — file extensions are never
-trusted, and every check is an exact byte comparison from the format's
-official specification. An object either matches a magic or it is searched as
-raw text.
+Format detection is magic-first. Brotli and zlib have no reliable container
+magic, so only `.br`, `.zlib`, and `.zz` select those decoders, and the entire
+stream must validate. Other extensions are never trusted.
 
 | format                           | detection                      | behavior                                                                                                                                                                                              |
 | -------------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -80,16 +82,23 @@ raw text.
 | xz                               | `fd 37 7a 58 5a 00`            | transparent decompress, incl. multi-stream + stream padding                                                                                                                                           |
 | snappy (framing format)          | `ff 06 00 00 sNaPpY`           | transparent decompress, incl. concatenated streams                                                                                                                                                    |
 | lz4 (frame format)               | `04 22 4d 18`                  | transparent decompress, incl. concatenated frames and skippable frames                                                                                                                                |
+| Brotli                           | validated `.br` hint           | transparent strict decompression                                                                                                                                                                      |
+| zlib                             | validated `.zlib`/`.zz` hint   | transparent strict decompression                                                                                                                                                                      |
+| ZIP                              | ZIP signatures                 | every regular member is a searchable document at `object.zip!/member/path`; directories and links are skipped, while encrypted members reject the source                                             |
+| TAR                              | validated `ustar` header        | every regular member is a searchable document; nested archives/compression recurse to four layers                                                                                                    |
 | **Parquet**                      | `PAR1` head + validated footer | each row projected to one JSON line and searched as text — RFC3339 timestamps (incl. `tz="UTC"` files from pyarrow/pandas/Spark), unquoted decimals, hex binary, explicit nulls, nested structs/lists |
 | **Avro** (Object Container File) | `Obj` `01`                     | each record projected to one JSON line — null/deflate/snappy/zstd/bzip2/xz codecs, decimals rendered as decimal strings (`"123.45"`), NaN/Infinity as `null`                                          |
+| Arrow IPC file / stream / Feather | validated file or stream framing | each record batch is projected to canonical JSON Lines; continuation-marker and legacy streams are supported                                                                                         |
+| ORC                               | validated postscript + footer    | Arrow-backed rows are projected to canonical JSON Lines                                                                                                                                               |
 
-Because the Parquet/Avro projection happens at the same layer as
-decompression, the index and the verifier always see identical text — search
-results over columnar data are exact, line numbers refer to rows.
+Projection and decompression happen at one canonical decoder boundary, so the
+index and verifier see identical bytes. Columnar line numbers refer to rows.
+Archive member paths are normalized without filesystem extraction; unsafe
+paths fail the source, and duplicate normalized names receive `#2`, `#3`, etc.
 
 Truncated or corrupt-tailed streams **salvage**: the cleanly decoded prefix is
 searched and a warning names the object. Undecodable objects are excluded
-loudly, never silently mis-searched.
+loudly, never silently searched incorrectly.
 
 ### Search flags (ripgrep semantics)
 
@@ -124,6 +133,10 @@ match the line terminator, and a literal `\n` in a pattern is an error.
   time scoping never silently hides data.
 - `--region`, `--endpoint` (MinIO, R2, any S3-compatible store),
   `--concurrency` (default 750), `--index` (local index dir)
+- `--object-cache DIR --object-cache-cap BYTES` — explicit private cache for
+  immutable S3 source bodies. Both flags are required; files are checksummed,
+  content-addressed by endpoint/bucket/key/ETag, owner-only, atomically
+  replaced, and size-bounded with FIFO eviction.
 
 ### Credentials
 
@@ -139,15 +152,19 @@ SigV4 implementation, tested against AWS signature vectors.
 1. The query planner extracts gram constraints from the regex — prefix,
    suffix, **and required inner literals** (Cox-style), so `.*ERROR.*` prunes
    instead of scanning.
-2. The term dictionary (an FST) maps each gram to its postings offset _and_
-   doc count, so selectivity is known before any fetch: absent grams answer
-   instantly, only the rarest grams per AND-group are fetched, and grams
-   present in every doc cost zero bytes on disk and zero fetches.
+2. The term dictionary (an FST, adaptively prefix-sharded for dense trigram
+   spaces) maps each gram to its postings offset _and_ doc count, so
+   selectivity is known before any fetch: absent grams answer instantly, only
+   the rarest grams per AND-group are fetched, and grams present in every doc
+   cost zero bytes on disk and zero fetches.
 3. Posting blocks are read with coalesced ranged GETs; candidates are pruned
    by key scope before a single object is fetched.
-4. Candidate objects stream through concurrent fetches (adaptive AIMD
-   concurrency, retries, request hedging), get decoded, and are
-   regex-verified on a worker pool — results print as they complete,
+4. Candidate physical sources stream through concurrent conditional GETs
+   (`If-Match` against the indexed ETag), with adaptive AIMD concurrency,
+   retries, request hedging, and a 512 MiB in-flight byte budget. Sources of
+   at least 64 MiB use four concurrent streamed 8 MiB conditional ranges. One archive
+   is fetched and decoded once even when many members are candidates. Sources
+   are then regex-verified on a worker pool — results print as they complete,
    unordered across objects like rg's parallel mode, pipe-friendly
    (`holys3 ... | head` terminates cleanly).
 
@@ -157,16 +174,21 @@ SigV4 implementation, tested against AWS signature vectors.
 `.holys3/`. Runs are **incremental diffs**: only new or changed objects are
 fetched and indexed, deletions take effect immediately, an unchanged bucket
 costs one listing (~seconds), and small segments merge automatically. Posting
-lists are density-classed and bit-packed — on a 100K-object log corpus the
-index is ~260 MB against 217 MB of gzipped data, and grams shared by every
-document cost nothing. Replaced segments are garbage-collected; the root
+lists are density-classed and bit-packed, and grams shared by every document
+cost nothing. Index construction uses bounded sorted runs instead of a global
+in-memory postings map. Replaced segments are garbage-collected; the root
 pointer swap is a **compare-and-swap** (S3 conditional writes), so a racing
 concurrent index run fails loudly instead of corrupting anything. Large index
-blobs upload as concurrent multipart parts.
+blobs upload as concurrent multipart parts. Every immutable segment blob has
+its own SHA-256 length/hash contract; readers reject truncation, corruption,
+duplicate segment IDs, and malformed metadata before using it.
 
-Local directories use the same segmented format, written to `--out` (default
-`holys3.idxdir`) with `{size}-{mtime}` freshness etags — local runs are
-incremental too, and `--rebuild` re-ingests everything.
+Local directories use the same format-8 physical-source/logical-document
+tables, written to `--out` (default `holys3.idxdir`) with BLAKE3 content
+freshness tokens. Local verification rechecks the token, local runs are
+incremental, and `--rebuild` re-ingests everything. Raw candidate files are
+read concurrently under the same 512 MiB byte budget; expanding formats stay
+serial so decompression cannot multiply peak memory.
 
 ## Performance
 
@@ -183,31 +205,43 @@ far lower). Reproduce with `make bench-s3`.
 | alternation | `alpha\|beta` | 314 | 314/1000 | 1088 | 35729 | 32.8x |
 | anchored | `^ANCHOR_START` | 91 | 91/1000 | 390 | 10204 | 26.1x |
 | long_literal | `longliteralbenchmarktoken` | 334 | 334/1000 | 1810 | 37891 | 20.9x |
-| dot_star_gap | `(?s)needle.*alpha` | 100 | 100/1000 | 1135 | 10984 | 9.7x |
+| dot_star_gap | `needle.*alpha` | 100 | 100/1000 | 1135 | 10984 | 9.7x |
 
 Absolute latencies vary with the network (per-object RTT dominates from a
 laptop; in-region EC2 is far lower) — the prune ratios and hits are the
-stable part. At 100K objects the same needle queries return exact candidate
-sets (the planted-needle suite returns precisely 1/5/100 matching objects
-out of 100,000) in ~1.5 s.
+stable part.
 
-**Continuous (CI)** — regenerated on every push against a local MinIO
-(`make bench-minio`); tracks regressions rather than headline latency.
+**Continuous (CI)** — measured on every push against a pinned local MinIO
+image (`make bench-minio`). CI runs release binaries, rejects missing or
+unbaselined microbenchmarks and hybrid sort paths more than 15% slower than
+their same-run controls, validates exact end-to-end hit counts, indexes 25,000
+objects, and enforces hosted-run time plus a 300 MiB peak-RSS ceiling for
+high-cardinality and 256 MiB decoded workloads under both index strategies.
+Segment construction also enforces its cap on logical documents, including
+archive members, rather than only on physical source objects. A separate 512
+MiB compressed-expansion gate caps trigram/sparse index and files-only search
+RSS at 96 MiB. A 512 MiB raw-object MinIO gate applies the same ceiling to S3
+indexing and files-only search with both strategies. A separate 64 MiB
+high-entropy gzip gate exercises ranged source download, streaming decode,
+bitmap-backed trigram construction, cold term-cache population, and mmap lookup
+under the same 96 MiB ceiling. Workspace line coverage is gated at 80%.
 
 <!-- BENCH:START -->
 | scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| short_literal | 50 | 50/100 | 0.500 | 204800 | 34.729 | 36.447 | 36.447 | 64.202 |
-| long_literal | 34 | 34/100 | 0.340 | 139264 | 24.675 | 24.694 | 24.694 | 44.539 |
-| alternation | 32 | 32/100 | 0.320 | 131072 | 23.523 | 24.426 | 24.426 | 42.832 |
-| anchored | 10 | 10/100 | 0.100 | 40960 | 8.766 | 8.888 | 8.888 | 14.460 |
-| no_match | 0 | 0/100 | 0.000 | 0 | 0.141 | 0.214 | 0.214 | 0.139 |
-| QAll | 100 | 100/100 | 1.000 | 409600 | 84.952 | 96.251 | 96.251 | 132.444 |
-| dot_star_gap | 10 | 10/100 | 0.100 | 40960 | 10.395 | 10.722 | 10.722 | 16.454 |
+| short_literal | 500 | 500/1000 | 0.500 | 2048000 | 20.887 | 210.947 | 210.947 | 102.454 |
+| long_literal | 334 | 334/1000 | 0.334 | 1368064 | 12.522 | 23.286 | 23.286 | 64.968 |
+| alternation | 314 | 314/1000 | 0.314 | 1286144 | 14.916 | 207.664 | 207.664 | 62.277 |
+| anchored | 91 | 91/1000 | 0.091 | 372736 | 3.303 | 3.585 | 3.585 | 19.080 |
+| no_match | 0 | 0/1000 | 0.000 | 0 | 0.004 | 0.004 | 0.004 | 0.003 |
+| QAll | 1000 | 1000/1000 | 1.000 | 4096000 | 231.110 | 245.671 | 245.671 | 206.964 |
+| dot_star_gap | 100 | 100/1000 | 0.100 | 409600 | 5.413 | 12.604 | 12.604 | 22.036 |
 <!-- BENCH:END -->
 
-Microbenchmarks: `make bench-micro` (CI-gated against
-[`benches/baseline.json`](benches/baseline.json)).
+Microbenchmarks: `make bench-micro`. PR CI compares the base and head revisions
+on one runner and gates statistically confident regressions above 20%; the
+committed [`benches/baseline.json`](benches/baseline.json) remains the reporting
+reference. Refresh it only from CI's `bench-micro` artifact.
 
 ## Limitations
 
@@ -217,11 +251,25 @@ Microbenchmarks: `make bench-micro` (CI-gated against
   output) are detected and rejected loudly rather than decoded.
 - No multiline mode: patterns that would match across line boundaries are
   line-restricted exactly like rg without `-U`.
-- Decompression is in-memory and unbounded: a pathological archive expands to
-  its full decoded size during indexing/search.
+- Decoded output above 8 MiB spills to private temporary files. Trigram indexing
+  and files-only bounded regex verification stream those files; sparse indexing
+  reads them through a bounded 1 MiB window. Expansion is capped at 64 GiB per
+  physical source, 100,000 regular archive members, and four nested format
+  layers.
+- Oversized local sources, S3 sources of at least 64 MiB, and large optional
+  object-cache entries remain file-backed through indexing and verification
+  instead of materializing the full body in memory. File-backed gzip, zstd,
+  bzip2, Snappy, Brotli, and zlib sources decode through bounded readers rather
+  than whole-source mappings.
+- A search that races segment garbage collection reopens the new index root
+  once before emitting results. Continuous write churn can still require a
+  manual rerun; no incorrect matches are returned.
 - Concurrent `holys3 index` runs over one prefix are safe (the loser errors
   cleanly and retries), but the design assumes occasional writers, not a
   write-heavy pipeline.
+- AWS general-purpose buckets and S3-compatible endpoints are supported. S3
+  Express directory buckets require zonal endpoints and session credentials
+  and are not yet supported.
 - The library crates are not a stable API; the CLI is the supported surface.
 
 ## Security

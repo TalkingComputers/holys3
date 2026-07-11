@@ -1,4 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::mem::size_of;
+use std::ops::Range;
+
+const RADIX_SORT_MIN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Strategy {
@@ -6,17 +10,49 @@ pub enum Strategy {
     Sparse,
 }
 
-/// Every overlapping 3-byte window as raw bytes (sorted, deduped). <3 bytes => empty.
-/// Windows pack big-endian into u32 so sort+dedup run over integers (u32
-/// order == lexicographic byte order) and only distinct grams allocate.
-pub fn trigram_grams_bytes(data: &[u8]) -> Vec<Vec<u8>> {
+pub fn pack_trigram_grams(data: &[u8]) -> Vec<u32> {
+    const BITMAP_WORDS: usize = (1 << 24) / 64;
+    const BITMAP_THRESHOLD: usize = BITMAP_WORDS * size_of::<u64>() / size_of::<u32>();
+    if data.len().saturating_sub(2) > BITMAP_THRESHOLD {
+        let mut bitmap = vec![0u64; BITMAP_WORDS];
+        for window in data.windows(3) {
+            let gram =
+                usize::from(window[0]) << 16 | usize::from(window[1]) << 8 | usize::from(window[2]);
+            bitmap[gram / 64] |= 1u64 << (gram % 64);
+        }
+        let count = bitmap.iter().map(|word| word.count_ones() as usize).sum();
+        let mut packed = Vec::with_capacity(count);
+        for (word_index, mut word) in bitmap.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                packed.push((word_index * 64 + bit) as u32);
+                word &= word - 1;
+            }
+        }
+        return packed;
+    }
     let mut packed: Vec<u32> = data
         .windows(3)
         .map(|w| u32::from(w[0]) << 16 | u32::from(w[1]) << 8 | u32::from(w[2]))
         .collect();
-    packed.sort_unstable();
-    packed.dedup();
+    sort_packed_grams(&mut packed);
     packed
+}
+
+fn sort_packed_grams(grams: &mut Vec<u32>) {
+    if grams.len() < RADIX_SORT_MIN {
+        grams.sort_unstable();
+    } else {
+        radsort::sort(grams);
+    }
+    grams.dedup();
+}
+
+/// Every overlapping 3-byte window as raw bytes (sorted, deduped). <3 bytes => empty.
+/// Windows pack big-endian into u32 so sort+dedup run over integers (u32
+/// order == lexicographic byte order) and only distinct grams allocate.
+pub fn trigram_grams_bytes(data: &[u8]) -> Vec<Vec<u8>> {
+    pack_trigram_grams(data)
         .into_iter()
         .map(|g| vec![(g >> 16) as u8, (g >> 8) as u8, g as u8])
         .collect()
@@ -34,29 +70,85 @@ fn pair_weight(a: u8, b: u8) -> u32 {
     rapidhash::v3::rapidhash_v3(&[a, b]) as u32
 }
 
-/// `build_all` as raw gram byte strings (sorted, deduped). Index-time.
-pub fn sparse_grams_all_bytes(data: &[u8]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    if data.len() < 2 {
-        return out;
+pub fn iterate_sparse_gram_ranges(
+    len: usize,
+    mut byte: impl FnMut(usize) -> u8,
+) -> impl Iterator<Item = Range<usize>> {
+    let mut ranges = start_sparse_gram_ranges(len);
+    std::iter::from_fn(move || {
+        match ranges.next_with(|index| Ok::<u8, std::convert::Infallible>(byte(index))) {
+            Ok(range) => range,
+            Err(error) => match error {},
+        }
+    })
+}
+
+pub struct SparseGramRanges {
+    pair_count: usize,
+    start: usize,
+    end: usize,
+    interior_max: u32,
+    start_weight: u32,
+    emit_pair: bool,
+}
+
+pub fn start_sparse_gram_ranges(len: usize) -> SparseGramRanges {
+    SparseGramRanges {
+        pair_count: len.saturating_sub(1),
+        start: 0,
+        end: 0,
+        interior_max: 0,
+        start_weight: 0,
+        emit_pair: true,
     }
-    let weights: Vec<u32> = data.windows(2).map(|w| pair_weight(w[0], w[1])).collect();
-    let n = weights.len();
-    for i in 0..n {
-        out.push(data[i..i + 2].to_vec());
-        let mut interior_max: u32 = 0;
-        for j in (i + 1)..n {
-            if j > i + 1 {
-                interior_max = interior_max.max(weights[j - 1]);
+}
+
+impl SparseGramRanges {
+    pub fn next_with<E>(
+        &mut self,
+        mut byte: impl FnMut(usize) -> Result<u8, E>,
+    ) -> Result<Option<Range<usize>>, E> {
+        loop {
+            if self.start >= self.pair_count {
+                return Ok(None);
             }
-            if interior_max >= weights[i] {
-                break;
+            if self.emit_pair {
+                self.emit_pair = false;
+                self.end = self.start + 1;
+                self.interior_max = 0;
+                self.start_weight = pair_weight(byte(self.start)?, byte(self.start + 1)?);
+                return Ok(Some(self.start..self.start + 2));
             }
-            if weights[j] > interior_max {
-                out.push(data[i..j + 2].to_vec());
+            while self.end < self.pair_count {
+                if self.end > self.start + 1 {
+                    self.interior_max = self
+                        .interior_max
+                        .max(pair_weight(byte(self.end - 1)?, byte(self.end)?));
+                }
+                if self.interior_max >= self.start_weight {
+                    break;
+                }
+                let current = self.end;
+                self.end += 1;
+                if pair_weight(byte(current)?, byte(current + 1)?) > self.interior_max {
+                    return Ok(Some(self.start..current + 2));
+                }
             }
+            self.start += 1;
+            self.emit_pair = true;
         }
     }
+}
+
+pub fn iterate_sparse_grams(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    iterate_sparse_gram_ranges(data.len(), |index| data[index]).map(move |range| &data[range])
+}
+
+/// `build_all` as raw gram byte strings (sorted, deduped). Index-time.
+pub fn sparse_grams_all_bytes(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = iterate_sparse_grams(data)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
     out.sort_unstable();
     out.dedup();
     out
@@ -167,12 +259,42 @@ mod tests {
             trigram_grams_bytes(b"abcab"),
             vec![b"abc".to_vec(), b"bca".to_vec(), b"cab".to_vec()]
         );
+        assert_eq!(
+            pack_trigram_grams(b"abcab"),
+            vec![0x616263, 0x626361, 0x636162]
+        );
     }
 
     #[test]
     fn trigrams_short_is_empty() {
         assert!(trigram_grams_bytes(b"ab").is_empty());
         assert!(trigram_grams_bytes(b"").is_empty());
+    }
+
+    #[test]
+    fn trigrams_large_repeated_input_is_deduplicated() {
+        assert_eq!(pack_trigram_grams(&vec![b'a'; 600_000]), vec![0x616161]);
+    }
+
+    #[test]
+    fn packed_sort_matches_control() {
+        for len in [0, 1, 2, 3, 31, 255, 256, 4096, 600_000] {
+            let mut state = 0x9e37_79b9_u32;
+            let grams = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state & 0x00ff_ffff
+                })
+                .collect::<Vec<_>>();
+            let mut expected = grams.clone();
+            expected.sort_unstable();
+            expected.dedup();
+            let mut actual = grams;
+            sort_packed_grams(&mut actual);
+            assert_eq!(actual, expected, "length {len}");
+        }
     }
 
     #[test]
@@ -196,12 +318,58 @@ mod sparse_tests {
     use super::*;
     use std::collections::HashSet;
 
+    fn collect_sparse_reference(data: &[u8]) -> Vec<Vec<u8>> {
+        let mut grams = Vec::new();
+        if data.len() < 2 {
+            return grams;
+        }
+        let weights = data
+            .windows(2)
+            .map(|window| pair_weight(window[0], window[1]))
+            .collect::<Vec<_>>();
+        for start in 0..weights.len() {
+            grams.push(data[start..start + 2].to_vec());
+            let mut interior_max = 0;
+            for end in start + 1..weights.len() {
+                if end > start + 1 {
+                    interior_max = interior_max.max(weights[end - 1]);
+                }
+                if interior_max >= weights[start] {
+                    break;
+                }
+                if weights[end] > interior_max {
+                    grams.push(data[start..end + 2].to_vec());
+                }
+            }
+        }
+        grams
+    }
+
     #[test]
     fn sparse_short_input() {
         assert!(extract_sparse_ngrams_all(b"a").is_empty());
         assert!(!extract_sparse_ngrams_all(b"ab").is_empty());
         assert!(extract_sparse_ngrams_covering(b"a").is_empty());
         assert!(!extract_sparse_ngrams_covering(b"ab").is_empty());
+    }
+
+    #[test]
+    fn sparse_iterator_matches_reference_emissions() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for len in 0..256 {
+            let input = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[0]
+                })
+                .collect::<Vec<_>>();
+            let actual = iterate_sparse_grams(&input)
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, collect_sparse_reference(&input), "length {len}");
+        }
     }
 
     #[test]

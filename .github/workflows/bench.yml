@@ -1,20 +1,24 @@
 name: benchmarks
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches:
       - main
     paths-ignore:
       - README.md
+  schedule:
+    - cron: "00 05 * * 3"
 
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  MC_IMAGE: quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+  MINIO_IMAGE: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
   RUST_BACKTRACE: 1
 
 concurrency:
@@ -24,12 +28,42 @@ concurrency:
 jobs:
   micro:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Checkout benchmark base
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: benchmark-base
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+      - name: Clear Criterion results
+        run: rm -rf target/criterion
+      - name: Run base Criterion benches
+        if: github.event_name == 'pull_request'
+        working-directory: benchmark-base
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --save-baseline pull-request-base
+      - name: Keep only the named base results
+        if: github.event_name == 'pull_request'
+        run: rm -rf target/criterion/*/new target/criterion/*/change target/criterion/*/report
+      - name: Run Criterion benches against PR base
+        if: github.event_name == 'pull_request'
+        run: cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --baseline-lenient pull-request-base
       - name: Run Criterion benches
-        run: cargo bench --locked -p holys3-index --bench hot_paths -- --save-baseline pr
+        if: github.event_name != 'pull_request'
+        run: |
+          cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --save-baseline pr
       - name: Collect Criterion medians
         run: |
           python3 <<'PY'
@@ -50,31 +84,62 @@ jobs:
         run: |
           python3 <<'PY'
           import json
+          import os
           import sys
           from pathlib import Path
 
-          # Shared runners swing CPU-bound medians ~20% run to run (verified:
-          # an untouched code path flapped +19.8% and back across runs); gate
-          # only on regressions big enough to clear that noise floor.
-          threshold = 30.0
+          regression_limit = 0.20
+          root = Path("target/criterion")
           baseline = json.loads(Path("benches/baseline.json").read_text())
           current = json.loads(Path("benches/current.json").read_text())
           base = baseline["benchmarks"]
           rows = ["| benchmark | baseline ns | current ns | delta |", "|---|---:|---:|---:|"]
           failed = False
+          for name in sorted(base.keys() - current["benchmarks"].keys()):
+              rows.append(f"| {name} | {base[name]:.0f} | missing | missing |")
+              failed = True
           for name, value in current["benchmarks"].items():
+              if value <= 0:
+                  raise SystemExit(f"benchmark {name} reported non-positive median {value}")
               if name not in base:
                   rows.append(f"| {name} | new | {value:.0f} | new |")
+                  failed = True
                   continue
               old = base[name]
               delta = ((value - old) / old) * 100.0
               rows.append(f"| {name} | {old:.0f} | {value:.0f} | {delta:+.1f}% |")
-              failed = failed or delta > threshold
+          rows.extend(["", "| paired benchmark | hybrid/control | limit |", "|---|---:|---:|"])
+          for windows in (128, 256, 512, 1024, 4096, 65_536):
+              control_name = f"packed_sort_control_{windows}"
+              hybrid_name = f"packed_sort_hybrid_{windows}"
+              missing = [name for name in (control_name, hybrid_name) if name not in current["benchmarks"]]
+              if missing:
+                  rows.append(f"| packed sort {windows} | missing: {', '.join(missing)} | 1.150x |")
+                  failed = True
+                  continue
+              control = current["benchmarks"][control_name]
+              hybrid = current["benchmarks"][hybrid_name]
+              ratio = hybrid / control
+              rows.append(f"| packed sort {windows} | {ratio:.3f}x | 1.150x |")
+              failed = failed or ratio > 1.15
+          if os.environ["GITHUB_EVENT_NAME"] == "pull_request":
+              changes = []
+              for path in root.rglob("change/estimates.json"):
+                  name = path.parent.parent.relative_to(root).as_posix()
+                  estimate = json.loads(path.read_text())["median"]
+                  interval = estimate["confidence_interval"]
+                  changes.append((name, interval["lower_bound"], estimate["point_estimate"], interval["upper_bound"]))
+              if not changes:
+                  raise SystemExit("Criterion produced no PR-base comparisons")
+              rows.extend(["", "| benchmark vs PR base | median delta | 95% CI | limit |", "|---|---:|---:|---:|"])
+              for name, lower, point, upper in sorted(changes):
+                  rows.append(f"| {name} | {point:+.1%} | {lower:+.1%} to {upper:+.1%} | +{regression_limit:.0%} |")
+                  failed = failed or lower > regression_limit
           Path("bench-micro.md").write_text("\n".join(rows) + "\n")
           if failed:
               sys.exit(1)
           PY
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: bench-micro
@@ -84,28 +149,34 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
-    continue-on-error: true
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Start MinIO service
         run: |
           docker run -d --name holys3-minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data --address :9000
+            "$MINIO_IMAGE" server /data --address :9000
       - name: Create bucket
         env:
           MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
-          for i in $(seq 1 60); do
-            docker run --rm --network host -e MC_HOST_local quay.io/minio/mc ready local && break
+          attempts=0
+          until docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ready local; do
+            attempts=$((attempts + 1))
+            test "$attempts" -lt 60
             sleep 1
           done
-          docker run --rm --network host -e MC_HOST_local quay.io/minio/mc mb --ignore-existing local/holys3-bench
-      - name: Build xbench
-        run: cargo build --locked -p holys3-bench
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-bench
+      - name: Build benchmark binaries
+        run: cargo build --locked --release -p holys3 -p holys3-bench
       - name: Run xbench
         env:
           AWS_ACCESS_KEY_ID: minioadmin
@@ -114,27 +185,199 @@ jobs:
           HOLYS3_BENCH_REGION: us-east-1
           HOLYS3_BENCH_ENDPOINT: http://127.0.0.1:9000
         run: |
-          cargo run --locked -p holys3-bench -- seed --seed 1 --objects 100 --size 4096
-          cargo run --locked -p holys3-bench -- upload --target s3
-          cargo run --locked -p holys3-bench -- run --scenarios crates/xbench/scenarios/queries.toml --iterations 3 --warmup 1 --concurrency 64
-          cargo run --locked -p holys3-bench -- render --input crates/xbench/runs/latest.json > bench-e2e.md
-      - uses: actions/upload-artifact@v7
+          target/release/holys3-bench seed --seed 1 --objects 1000 --size 4096
+          target/release/holys3-bench upload --target s3
+          target/release/holys3-bench run --scenarios crates/xbench/scenarios/queries.toml --iterations 3 --warmup 1 --concurrency 64
+          target/release/holys3-bench render --input crates/xbench/runs/latest.json > bench-e2e.md
+      - name: Test large-object ranged fetch
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
+        run: |
+          truncate -s 536870912 bench-large.log
+          printf RANGE_NEEDLE | dd of=bench-large.log bs=1 seek=268435456 conv=notrunc status=none
+          docker run --rm --network host -e MC_HOST_local -v "$PWD/bench-large.log:/bench-large.log:ro" "$MC_IMAGE" cp /bench-large.log local/holys3-bench/range/large.log
+          /usr/bin/time -v -o bench-s3-trigram-index.txt target/release/holys3 index s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64
+          /usr/bin/time -v -o bench-s3-trigram-search.txt target/release/holys3 -l RANGE_NEEDLE s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-s3-trigram-hits.txt
+          test "$(wc -l < bench-s3-trigram-hits.txt)" -eq 1
+          /usr/bin/time -v -o bench-s3-sparse-index.txt target/release/holys3 index s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse --rebuild
+          /usr/bin/time -v -o bench-s3-sparse-search.txt target/release/holys3 -l RANGE_NEEDLE s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-s3-sparse-hits.txt
+          test "$(wc -l < bench-s3-sparse-hits.txt)" -eq 1
+          python3 <<'PY'
+          from pathlib import Path
+
+          limit_kib = 96 * 1024
+          for path in Path(".").glob("bench-s3-*.txt"):
+              if path.name.endswith("-hits.txt"):
+                  continue
+              lines = path.read_text().splitlines()
+              field = next(line for line in lines if "Maximum resident set size" in line)
+              peak_kib = int(field.rsplit(":", 1)[1])
+              if peak_kib > limit_kib:
+                  raise SystemExit(f"{path}: peak RSS {peak_kib} KiB exceeds {limit_kib} KiB")
+          PY
+      - name: Test high-entropy compressed source
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
+        run: |
+          dd if=/dev/urandom of=bench-entropy.log bs=1048576 count=64 status=none
+          printf ENTROPY_NEEDLE | dd of=bench-entropy.log bs=1 seek=33554432 conv=notrunc status=none
+          gzip -1 -c bench-entropy.log > bench-entropy.log.gz
+          docker run --rm --network host -e MC_HOST_local -v "$PWD/bench-entropy.log.gz:/bench-entropy.log.gz:ro" "$MC_IMAGE" cp /bench-entropy.log.gz local/holys3-bench/entropy/large.log.gz
+          /usr/bin/time -v -o bench-entropy-index.txt target/release/holys3 index s3://holys3-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild
+          /usr/bin/time -v -o bench-entropy-search.txt target/release/holys3 -l ENTROPY_NEEDLE s3://holys3-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-entropy-hits.txt
+          test "$(wc -l < bench-entropy-hits.txt)" -eq 1
+          python3 <<'PY'
+          from pathlib import Path
+
+          limit_kib = 96 * 1024
+          for name in ("bench-entropy-index.txt", "bench-entropy-search.txt"):
+              lines = Path(name).read_text().splitlines()
+              field = next(line for line in lines if "Maximum resident set size" in line)
+              peak_kib = int(field.rsplit(":", 1)[1])
+              if peak_kib > limit_kib:
+                  raise SystemExit(f"{name}: peak RSS {peak_kib} KiB exceeds {limit_kib} KiB")
+          PY
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force holys3-minio
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: bench-e2e
           path: |
             bench-e2e.md
+            bench-entropy-*.txt
+            bench-s3-*.txt
             crates/xbench/runs/latest.json
           if-no-files-found: ignore
 
+  scale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+      - run: cargo build --locked --release -p holys3 -p holys3-bench
+      - name: Profile 25,000-object index
+        run: |
+          target/release/holys3-bench seed --seed 1 --objects 25000 --size 4096
+          /usr/bin/time -v -o bench-scale-index.txt target/release/holys3-bench upload --target dir | tee bench-scale-build.txt
+          target/release/holys3-bench run --scenarios crates/xbench/scenarios/queries.toml --iterations 1 --warmup 0 --concurrency 64
+          target/release/holys3-bench render --input crates/xbench/runs/latest.json > bench-scale.md
+          cp crates/xbench/runs/latest.json bench-scale.json
+      - name: Profile 256 MiB decoded workload
+        run: |
+          mkdir -p /tmp/holys3-large-data
+          truncate -s 134217728 /tmp/holys3-large-data/large.log
+          printf needle | dd of=/tmp/holys3-large-data/large.log bs=1 seek=67108864 conv=notrunc status=none
+          gzip -c /tmp/holys3-large-data/large.log > /tmp/holys3-large-data/large.log.gz
+          /usr/bin/time -v -o bench-scale-large.txt target/release/holys3 index /tmp/holys3-large-data --out /tmp/holys3-large-index
+          hits=$(target/release/holys3 -l needle /tmp/holys3-large-data --index /tmp/holys3-large-index | wc -l)
+          test "$hits" -eq 2
+          /usr/bin/time -v -o bench-scale-sparse.txt target/release/holys3 index /tmp/holys3-large-data --out /tmp/holys3-large-sparse-index --strategy sparse
+          hits=$(target/release/holys3 -l needle /tmp/holys3-large-data --index /tmp/holys3-large-sparse-index | wc -l)
+          test "$hits" -eq 2
+      - name: Profile 512 MiB compression expansion
+        run: |
+          mkdir -p /tmp/holys3-expansion-data
+          truncate -s 536870912 /tmp/holys3-expansion-data/expanded.log
+          printf EXPANSION_NEEDLE | dd of=/tmp/holys3-expansion-data/expanded.log bs=1 seek=268435456 conv=notrunc status=none
+          gzip /tmp/holys3-expansion-data/expanded.log
+          /usr/bin/time -v -o bench-expansion-index.txt target/release/holys3 index /tmp/holys3-expansion-data --out /tmp/holys3-expansion-index
+          /usr/bin/time -v -o bench-expansion-search.txt target/release/holys3 -l EXPANSION_NEEDLE /tmp/holys3-expansion-data --index /tmp/holys3-expansion-index > bench-expansion-hits.txt
+          test "$(wc -l < bench-expansion-hits.txt)" -eq 1
+          /usr/bin/time -v -o bench-expansion-sparse-index.txt target/release/holys3 index /tmp/holys3-expansion-data --out /tmp/holys3-expansion-sparse-index --strategy sparse
+          /usr/bin/time -v -o bench-expansion-sparse-search.txt target/release/holys3 -l EXPANSION_NEEDLE /tmp/holys3-expansion-data --index /tmp/holys3-expansion-sparse-index > bench-expansion-sparse-hits.txt
+          test "$(wc -l < bench-expansion-sparse-hits.txt)" -eq 1
+      - name: Enforce peak memory ceilings
+        run: |
+          python3 <<'PY'
+          import re
+          from pathlib import Path
+
+          limit_kib = 300 * 1024
+          for name in ("bench-scale-index.txt", "bench-scale-large.txt", "bench-scale-sparse.txt"):
+              lines = Path(name).read_text().splitlines()
+              field = next(line for line in lines if "Maximum resident set size" in line)
+              peak_kib = int(field.rsplit(":", 1)[1])
+              if peak_kib > limit_kib:
+                  raise SystemExit(f"{name}: peak RSS {peak_kib} KiB exceeds {limit_kib} KiB")
+
+          expansion_limit_kib = 96 * 1024
+          for name in (
+              "bench-expansion-index.txt",
+              "bench-expansion-search.txt",
+              "bench-expansion-sparse-index.txt",
+              "bench-expansion-sparse-search.txt",
+          ):
+              lines = Path(name).read_text().splitlines()
+              field = next(line for line in lines if "Maximum resident set size" in line)
+              peak_kib = int(field.rsplit(":", 1)[1])
+              if peak_kib > expansion_limit_kib:
+                  raise SystemExit(f"{name}: peak RSS {peak_kib} KiB exceeds {expansion_limit_kib} KiB")
+
+          output = Path("bench-scale-build.txt").read_text()
+          match = re.search(r"listing_ms=([0-9.]+) build_ms=([0-9.]+)", output)
+          if match is None:
+              raise SystemExit("scale benchmark did not report listing_ms and build_ms")
+          build_ms = float(match.group(2))
+          build_limit_ms = 14_000
+          if build_ms > build_limit_ms:
+              raise SystemExit(f"25,000-object build took {build_ms:.3f} ms, exceeds {build_limit_ms} ms")
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: bench-scale
+          path: |
+            bench-scale.md
+            bench-scale-index.txt
+            bench-scale-build.txt
+            bench-scale-large.txt
+            bench-scale-sparse.txt
+            bench-scale.json
+            bench-expansion-index.txt
+            bench-expansion-search.txt
+            bench-expansion-hits.txt
+            bench-expansion-sparse-index.txt
+            bench-expansion-sparse-search.txt
+            bench-expansion-sparse-hits.txt
+          if-no-files-found: error
+
+  benchmarks-success:
+    name: benchmarks-success
+    if: always()
+    needs: [micro, e2e, scale]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify benchmark jobs passed
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: jq --exit-status 'all(.result == "success")' <<< "$NEEDS_JSON"
+
   pr-comment:
-    if: github.event_name == 'pull_request' && always()
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     needs:
       - micro
       - e2e
+      - scale
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         continue-on-error: true
         with:
           path: artifacts
@@ -149,44 +392,11 @@ jobs:
             echo
             echo '### e2e S3'
             if [ -f artifacts/bench-e2e.md ]; then cat artifacts/bench-e2e.md; else echo 'e2e did not produce a table'; fi
+            echo
+            echo '### scale'
+            if [ -f artifacts/bench-scale.md ]; then cat artifacts/bench-scale.md; else echo 'scale did not produce a table'; fi
           } > bench-comment.md
-      - uses: marocchino/sticky-pull-request-comment@v3
+      - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         with:
           header: holys3-benchmarks
           path: bench-comment.md
-
-  publish-main:
-    # Runs even when micro's threshold check fails: main pushes refresh the
-    # baseline from CI's own runner (PRs still gate against it), so an
-    # intentional perf-semantics change cannot wedge main permanently red.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && always()
-    needs:
-      - micro
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v8
-        continue-on-error: true
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: Update benchmark files
-        run: |
-          cp artifacts/benches/current.json benches/baseline.json
-          python3 <<'PY'
-          from pathlib import Path
-
-          readme = Path("README.md")
-          table_path = Path("artifacts/bench-e2e.md")
-          table = table_path.read_text() if table_path.exists() else "| scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
-          start = "<!-- BENCH:START -->"
-          end = "<!-- BENCH:END -->"
-          body = readme.read_text()
-          before, rest = body.split(start, 1)
-          _, after = rest.split(end, 1)
-          readme.write_text(before + start + "\n" + table + end + after)
-          PY
-      - uses: stefanzweifel/git-auto-commit-action@v7
-        with:
-          commit_message: Update benchmark results [skip ci]
-          file_pattern: README.md benches/baseline.json

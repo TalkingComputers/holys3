@@ -17,6 +17,7 @@ pub struct FetchConfig {
     pub backoff_cap_ms: u64,
     pub hedge_after: Duration,
     pub hedge_tokens: usize,
+    pub max_inflight_bytes: u64,
 }
 
 impl Default for FetchConfig {
@@ -29,6 +30,7 @@ impl Default for FetchConfig {
             backoff_cap_ms: 20_000,
             hedge_after: Duration::from_secs(2),
             hedge_tokens: 500,
+            max_inflight_bytes: 512 * 1024 * 1024,
         }
     }
 }

@@ -32,18 +32,24 @@ impl Scope {
             return Ok(None);
         }
         let now = OffsetDateTime::now_utc();
+        let since = since
+            .map(|s| parse_instant(&s, now, Bound::Start).context("invalid --since"))
+            .transpose()?;
+        let until = until
+            .map(|s| parse_instant(&s, now, Bound::End).context("invalid --until"))
+            .transpose()?;
+        anyhow::ensure!(
+            !matches!((since, until), (Some(start), Some(end)) if start >= end),
+            "--since must be earlier than --until"
+        );
         Ok(Some(Scope {
             key_prefix,
             key_regex: key_regex
                 .map(|pattern| regex::Regex::new(&pattern).context("invalid --key-regex"))
                 .transpose()?,
             globs,
-            since: since
-                .map(|s| parse_instant(&s, now, Bound::Start).context("invalid --since"))
-                .transpose()?,
-            until: until
-                .map(|s| parse_instant(&s, now, Bound::End).context("invalid --until"))
-                .transpose()?,
+            since,
+            until,
             undated: AtomicUsize::new(0),
         }))
     }
@@ -118,15 +124,20 @@ fn parse_instant(input: &str, now: OffsetDateTime, bound: Bound) -> Result<Offse
         .filter(|(value, _)| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
     {
         let value: i64 = value.parse()?;
-        let ago = match unit {
-            's' => Duration::seconds(value),
-            'm' => Duration::minutes(value),
-            'h' => Duration::hours(value),
-            'd' => Duration::days(value),
-            'w' => Duration::weeks(value),
+        let multiplier = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 60 * 60,
+            'd' => 24 * 60 * 60,
+            'w' => 7 * 24 * 60 * 60,
             other => anyhow::bail!("unknown relative-time unit `{other}` (use s/m/h/d/w)"),
         };
-        return Ok(now - ago);
+        let seconds = value
+            .checked_mul(multiplier)
+            .context("relative time out of supported range")?;
+        return now
+            .checked_sub(Duration::seconds(seconds))
+            .context("relative time out of supported range");
     }
     let input = input.strip_suffix('Z').unwrap_or(input);
     let (date_part, time_part) = match input.split_once('T') {
@@ -417,6 +428,33 @@ mod tests {
     #[test]
     fn year_9999_until_errors_instead_of_panicking() {
         assert!(Scope::from_args(None, None, None, Some("9999-12-31".into()), None).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_or_reversed_time_windows() {
+        assert!(Scope::from_args(
+            None,
+            None,
+            Some("2026-06-10".into()),
+            Some("2026-06-09".into()),
+            None,
+        )
+        .is_err());
+        assert!(Scope::from_args(
+            None,
+            None,
+            Some("2026-06-10T00:00:00Z".into()),
+            Some("2026-06-09".into()),
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn extreme_relative_times_error_instead_of_panicking() {
+        let now = utc(2026, 6, 10, 12, 0, 0);
+        assert!(parse_instant("9223372036854775807w", now, Bound::Start).is_err());
+        assert!(parse_instant("9223372036854775807s", now, Bound::Start).is_err());
     }
 
     #[test]

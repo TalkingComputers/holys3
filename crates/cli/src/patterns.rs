@@ -30,7 +30,7 @@ fn compose_pattern(patterns: &[String], word_regexp: bool, insensitive: bool) ->
         .iter()
         .map(|p| {
             if word_regexp {
-                // rg uses HALF word boundaries: full \b mis-anchors when the
+                // rg uses HALF word boundaries: full \b anchors incorrectly when the
                 // pattern's first/last char is a non-word char (`foo(`, `->`)
                 format!(r"\b{{start-half}}(?:{p})\b{{end-half}}")
             } else {
@@ -119,7 +119,7 @@ fn sanitize_line_terminators(pattern: &str) -> anyhow::Result<String> {
 
 /// rg smart case: insensitive iff the patterns contain at least one literal
 /// character and none of the literal characters are uppercase. Classes like
-/// `\pL` are not literals. An unparseable raw pattern is "not lowercase" —
+/// `\pL` are not literals. An unparsable raw pattern is "not lowercase" —
 /// the sanitize parse surfaces the real error.
 fn smart_case_insensitive(patterns: &[String]) -> bool {
     let mut literals = Vec::new();
@@ -212,7 +212,7 @@ mod tests {
         assert!(!smart_case_insensitive(&one(r"Foo\pL")));
         assert!(!smart_case_insensitive(&one(r"\d+"))); // no literals
         assert!(!smart_case_insensitive(&one("(")));
-        // an unparseable raw pattern errors out of build_pattern
+        // an unparsable raw pattern errors out of build_pattern
         assert!(build_pattern(&one("("), false, false, false, true).is_err());
     }
 

@@ -1,4 +1,6 @@
 /target
+/bench-micro.md
+/benches/current.json
 # stray local tooling artifacts (not part of holys3)
 agentdb.rvf
 agentdb.rvf.lock
@@ -8,6 +10,7 @@ ruvector.db
 # transient xbench artifacts (keep runs/*.json reports)
 crates/xbench/runs/corpus/
 crates/xbench/runs/*-cache*/
+crates/xbench/runs/local-index/
 
 # local planning scratch, never tracked
 /docs/

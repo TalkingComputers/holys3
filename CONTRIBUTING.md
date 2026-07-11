@@ -52,8 +52,9 @@ $ cargo test --workspace
 real bucket. They **self-skip** unless you point them at one:
 
 ```console
+$ export AWS_PROFILE=my-test-profile
 $ export HOLYS3_TEST_BUCKET=my-test-bucket
-$ export AWS_REGION=us-east-1   # credentials read from the `default` profile
+$ export AWS_REGION=us-east-1
 $ cargo test --workspace
 ```
 
@@ -64,12 +65,17 @@ locally if you touch the `s3` or `sigv4` crates.
 
 Every PR is run through the same checks CI runs. Run them locally first:
 
-```console
-$ cargo fmt --all --check
-$ cargo clippy --workspace --all-targets --all-features -- -D warnings
-$ cargo test --workspace
-$ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-$ cargo deny check          # advisories, licenses, bans, sources
+```bash
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
+cargo test --locked --release --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items --workspace
+cargo deny check          # advisories, licenses, bans, sources
+cargo machete --with-metadata
+cargo package --locked --workspace
+actionlint
+typos
 ```
 
 In short, your change must:
@@ -78,7 +84,8 @@ In short, your change must:
 - be **clippy-clean** with warnings treated as errors (`-D warnings`);
 - **build and pass tests** on the workspace;
 - **build docs** with no rustdoc warnings;
-- pass **`cargo deny`** (no new advisories, only allowed licenses).
+- pass **`cargo deny`** (no new advisories, only allowed licenses);
+- have no unused dependencies according to **`cargo machete`**.
 
 ### Optional tooling we recommend
 
@@ -89,6 +96,8 @@ In short, your change must:
   real floor when you bump dependencies.
 - [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks) —
   `cargo semver-checks` to catch accidental breaking changes in the libraries.
+- [`cargo-machete`](https://github.com/bnjbvr/cargo-machete) —
+  `cargo machete --with-metadata` to catch unused dependencies.
 - A pre-commit runner such as [`lefthook`](https://github.com/evilmartians/lefthook)
   or [`rusty-hook`](https://github.com/swellaby/rusty-hook) to run `fmt` +
   `clippy` on every commit.
@@ -126,4 +135,22 @@ issues are larger but still up for grabs. Comment on an issue to claim it.
 
 holys3 follows [Semantic Versioning](https://semver.org/). The libraries are
 public API surface: breaking changes require a major bump and should be flagged
-in your PR. See the release process in the README.
+in your PR.
+
+## Releasing
+
+Every push to `main` verifies release tests and packages before the protected
+`crates-io` environment can publish registry-missing workspace versions through
+trusted publishing. A successful release creates the shared version tag,
+GitHub release, checksums, attestations, and binaries for Linux, macOS, and
+Windows.
+
+Release PR automation is opt-in because some organizations prohibit PRs created
+by `GITHUB_TOKEN`:
+
+1. Add a repository secret named `RELEASE_PLZ_TOKEN` from a fine-grained PAT or
+   GitHub App with Contents and Pull requests read/write access.
+2. Set the repository variable `RELEASE_PLZ_PR_ENABLED` to `true`.
+
+Leave the variable `false` when no scoped token is configured. Direct releases
+from reviewed version bumps on `main` remain enabled.

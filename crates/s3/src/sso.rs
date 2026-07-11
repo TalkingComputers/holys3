@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use holys3_sigv4::{encode_query_component, read_sso_token, Credentials, SsoProfile};
+use std::time::Duration;
 use time::OffsetDateTime;
 
 /// Role credentials plus their expiry instant, for proactive refresh.
@@ -18,8 +19,12 @@ pub(crate) fn role_credentials(profile: &SsoProfile) -> Result<(Credentials, Off
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(30))
+        .build()?;
     let body: serde_json::Value = rt.block_on(async {
-        let response = reqwest::Client::new()
+        let response = client
             .get(url)
             .header("x-amz-sso_bearer_token", &token)
             .send()
