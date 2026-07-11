@@ -65,17 +65,17 @@ locally if you touch the `s3` or `sigv4` crates.
 
 Every PR is run through the same checks CI runs. Run them locally first:
 
-```console
-$ cargo fmt --all --check
-$ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-$ cargo test --locked --workspace --all-features
-$ cargo test --locked --release --workspace --all-features
-$ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace
-$ cargo deny check          # advisories, licenses, bans, sources
-$ cargo machete --with-metadata
-$ cargo package --locked --workspace
-$ actionlint
-$ typos
+```bash
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
+cargo test --locked --release --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items --workspace
+cargo deny check          # advisories, licenses, bans, sources
+cargo machete --with-metadata
+cargo package --locked --workspace
+actionlint
+typos
 ```
 
 In short, your change must:
