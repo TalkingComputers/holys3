@@ -4,4 +4,5 @@ extend-exclude = ["crates/xbench/runs/*.json"]
 [default.extend-words]
 AIMD = "AIMD"
 Aimd = "Aimd"
+CACH = "CACH"
 ERRO = "ERRO"
