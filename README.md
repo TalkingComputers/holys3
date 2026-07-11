@@ -152,10 +152,11 @@ SigV4 implementation, tested against AWS signature vectors.
 1. The query planner extracts gram constraints from the regex — prefix,
    suffix, **and required inner literals** (Cox-style), so `.*ERROR.*` prunes
    instead of scanning.
-2. The term dictionary (an FST) maps each gram to its postings offset _and_
-   doc count, so selectivity is known before any fetch: absent grams answer
-   instantly, only the rarest grams per AND-group are fetched, and grams
-   present in every doc cost zero bytes on disk and zero fetches.
+2. The term dictionary (an FST, adaptively prefix-sharded for dense trigram
+   spaces) maps each gram to its postings offset _and_ doc count, so
+   selectivity is known before any fetch: absent grams answer instantly, only
+   the rarest grams per AND-group are fetched, and grams present in every doc
+   cost zero bytes on disk and zero fetches.
 3. Posting blocks are read with coalesced ranged GETs; candidates are pruned
    by key scope before a single object is fetched.
 4. Candidate physical sources stream through concurrent conditional GETs

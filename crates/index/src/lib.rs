@@ -6,6 +6,7 @@ mod eval;
 mod format;
 mod search;
 mod segment;
+mod terms;
 
 pub use search::{
     search_collect, search_streaming, DocResult, KeyScope, MatchSink, NullSink, SinkFlow,
@@ -48,7 +49,7 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 8;
+const INDEX_FORMAT: u32 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -233,13 +234,13 @@ pub(crate) fn decode_posting_block(bytes: &[u8], count: u32, doc_count: u32) -> 
 /// Shared candidates pipeline: resolve grams against the term dict (no IO),
 /// fetch every needed posting block via `fetch_blocks`, evaluate purely.
 /// Returns local ids in `0..doc_count`.
-pub(crate) fn candidates_with<D: AsRef<[u8]>>(
-    map: &fst::Map<D>,
+pub(crate) fn candidates_with(
+    get: impl Fn(&[u8]) -> Option<u64>,
     doc_count: u32,
     q: &Query,
     fetch_blocks: impl FnOnce(&BTreeMap<u64, u32>) -> Result<BTreeMap<u64, Vec<DocId>>>,
 ) -> Result<Vec<DocId>> {
-    let resolved = eval::resolve(q, doc_count, &|gram| map.get(gram));
+    let resolved = eval::resolve(q, doc_count, &get);
     let mut needed = BTreeMap::new();
     eval::blocks_needed(&resolved, &mut needed);
     let blocks = fetch_blocks(&needed)?;
@@ -787,6 +788,29 @@ mod tests {
             std::fs::read(&actual[0]).unwrap(),
             std::fs::read(expected).unwrap()
         );
+    }
+
+    #[test]
+    fn trigram_term_map_shards_prefixes() {
+        let mut builder = terms::TermBuilder::new(Strategy::Trigram, true, Vec::new()).unwrap();
+        builder.insert(&[0x00, 0x01, 0x02], 1).unwrap();
+        builder.insert(&[0x7f, 0x03, 0x04], 2).unwrap();
+        builder.insert(&[0xff, 0x05, 0x06], 3).unwrap();
+        let bytes = builder.finish().unwrap();
+        assert_eq!(&bytes[..8], b"HS3TERM1");
+    }
+
+    #[test]
+    fn small_trigram_term_map_stays_single() {
+        let runs = write_posting_runs(
+            vec![(0, IndexedGrams::Trigram(vec![0x000102, 0x7f0304, 0xff0506]))],
+            Strategy::Trigram,
+            1024,
+        )
+        .unwrap();
+        let (terms, _) = merge_posting_runs(runs, Strategy::Trigram, 1).unwrap();
+        let bytes = std::fs::read(terms.path()).unwrap();
+        assert_ne!(&bytes[..8], b"HS3TERM1");
     }
 
     #[test]

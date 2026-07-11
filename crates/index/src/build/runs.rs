@@ -1,4 +1,5 @@
 use super::{HashWriter, TempBlob};
+use crate::terms::TermBuilder;
 use crate::{encode_posting_block, eval};
 use anyhow::{Context, Result};
 use holys3_core::{iterate_sparse_grams, start_sparse_gram_ranges, DocId, Strategy};
@@ -14,6 +15,11 @@ pub(crate) const SPARSE_FILE_CHUNK: usize = 1024 * 1024;
 const SPARSE_TRIGRAM_BITMAP_MIN: usize = 512 * 1024;
 const TRIGRAM_RADIX_ENTRIES_CAP: usize = 4 * 1024 * 1024;
 const TRIGRAM_BITMAP_WORDS: usize = (1 << 24) / 64;
+const TRIGRAM_SHARD_RUN_BYTES: u64 = 7 * 1024 * 1024;
+
+fn uses_sharded_terms(strategy: Strategy, run_bytes: u64) -> bool {
+    strategy == Strategy::Trigram && run_bytes >= TRIGRAM_SHARD_RUN_BYTES
+}
 
 fn read_file_trigrams(file: &mut File, len: u64, mut visit: impl FnMut(u32)) -> Result<()> {
     const CHUNK_BYTES: usize = 1024 * 1024;
@@ -518,7 +524,7 @@ fn write_sparse_run(entries: &rapidhash::RapidHashSet<Vec<u8>>, id: DocId) -> Re
 }
 
 fn insert_posting_file<W: Write>(
-    builder: &mut fst::MapBuilder<W>,
+    builder: &mut TermBuilder<W>,
     postings: &mut impl Write,
     offset: &mut u64,
     gram: &[u8],
@@ -696,7 +702,17 @@ pub(crate) fn merge_posting_runs(
     let fst = tempfile::NamedTempFile::new()?;
     let postings = tempfile::NamedTempFile::new()?;
     let mut postings_writer = BufWriter::new(HashWriter::new(postings.reopen()?));
-    let mut builder = fst::MapBuilder::new(BufWriter::new(HashWriter::new(fst.reopen()?)))?;
+    let run_bytes = paths.iter().try_fold(0u64, |total, path| -> Result<u64> {
+        total
+            .checked_add(std::fs::metadata(path)?.len())
+            .context("posting run bytes overflow u64")
+    })?;
+    let is_sharded = uses_sharded_terms(strategy, run_bytes);
+    let mut builder = TermBuilder::new(
+        strategy,
+        is_sharded,
+        BufWriter::new(HashWriter::new(fst.reopen()?)),
+    )?;
     let mut postings_len = 0u64;
     let mut current_gram: Option<Vec<u8>> = None;
     let mut ids = Vec::new();
@@ -730,7 +746,7 @@ pub(crate) fn merge_posting_runs(
             doc_count,
         )?;
     }
-    let mut fst_writer = builder.into_inner()?;
+    let mut fst_writer = builder.finish()?;
     fst_writer.flush()?;
     postings_writer.flush()?;
     let (_, fst_hash) = fst_writer
@@ -759,4 +775,25 @@ pub(crate) fn merge_posting_runs(
             hash: postings_hash,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shards_only_large_trigram_runs() {
+        assert!(!uses_sharded_terms(
+            Strategy::Trigram,
+            TRIGRAM_SHARD_RUN_BYTES - 1
+        ));
+        assert!(uses_sharded_terms(
+            Strategy::Trigram,
+            TRIGRAM_SHARD_RUN_BYTES
+        ));
+        assert!(!uses_sharded_terms(
+            Strategy::Sparse,
+            TRIGRAM_SHARD_RUN_BYTES
+        ));
+    }
 }

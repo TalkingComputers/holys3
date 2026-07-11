@@ -19,6 +19,7 @@
 #[cfg(test)]
 use crate::format::DocEntry;
 use crate::format::{parse_dead, parse_tables, DeadSet, SegmentTables, SourceEntry};
+use crate::terms::TermMap;
 use crate::{candidates_with, INDEX_FORMAT};
 use anyhow::{Context, Result};
 use cache::{cached_blob, cached_file, map_file};
@@ -599,7 +600,7 @@ fn put_segment_files(
 
 struct Segment {
     meta: SegmentMeta,
-    map: fst::Map<memmap2::Mmap>,
+    map: TermMap,
     dead: DeadSet,
     tables: OnceLock<SegmentTables>,
 }
@@ -622,15 +623,16 @@ impl SegmentedReader {
             .context("reading segments.bin")?
             .context("no index found — run `holys3 index` first")?;
         let list = parse_segment_list(&bytes)?;
+        let strategy = list.strategy;
         let mut segments = Vec::with_capacity(list.segments.len());
         for meta in list.segments {
             // A corrupt cached blob (same length, damaged bytes) self-heals:
             // wipe this segment's cache and refetch once.
-            let segment = match load_segment(store.as_ref(), cache_dir, &meta) {
+            let segment = match load_segment(store.as_ref(), cache_dir, &meta, strategy) {
                 Ok(segment) => segment,
                 Err(_) => {
                     std::fs::remove_dir_all(cache_dir.join(&meta.seg_id)).ok();
-                    load_segment(store.as_ref(), cache_dir, &meta)?
+                    load_segment(store.as_ref(), cache_dir, &meta, strategy)?
                 }
             };
             segments.push(segment);
@@ -640,7 +642,7 @@ impl SegmentedReader {
             store,
             cache_dir: cache_dir.to_path_buf(),
             root_version,
-            strategy: list.strategy,
+            strategy,
             segments,
         })
     }
@@ -734,7 +736,7 @@ impl SegmentedReader {
             }
             let postings_name = segment_blob(&segment.meta.seg_id, "postings.bin");
             let ids = self.classify_index_result(candidates_with(
-                &segment.map,
+                |gram| segment.map.get(gram),
                 segment.meta.doc_count,
                 q,
                 |needed| {
@@ -833,7 +835,12 @@ fn posting_ranges(
         .collect()
 }
 
-fn load_segment(store: &dyn BlobStore, cache_dir: &Path, meta: &SegmentMeta) -> Result<Segment> {
+fn load_segment(
+    store: &dyn BlobStore,
+    cache_dir: &Path,
+    meta: &SegmentMeta,
+    strategy: Strategy,
+) -> Result<Segment> {
     let path = cached_file(
         store,
         cache_dir,
@@ -846,7 +853,7 @@ fn load_segment(store: &dyn BlobStore, cache_dir: &Path, meta: &SegmentMeta) -> 
     let bytes = map_file(&path)?;
     #[cfg(unix)]
     bytes.advise(memmap2::Advice::Random)?;
-    let map = fst::Map::new(bytes)?;
+    let map = TermMap::open(bytes, strategy)?;
     Ok(Segment {
         map,
         dead,

@@ -4,6 +4,7 @@ use super::{
     MERGE_TERMS_CAP, SEGMENT_COUNT_TARGET, SEGMENT_DOC_CAP,
 };
 use crate::format::{DeadSet, DocEntry, SegmentTables, SourceEntry};
+use crate::terms::TermMap;
 use anyhow::{Context, Result};
 use holys3_core::{BlobStore, DocId, Strategy};
 use std::io::{BufWriter, Write};
@@ -85,11 +86,10 @@ fn write_compaction_run(
         terms.advise(memmap2::Advice::Sequential)?;
         postings.advise(memmap2::Advice::Sequential)?;
     }
-    let map = fst::Map::new(terms)?;
-    let mut stream = map.stream();
+    let map = TermMap::open(terms, strategy)?;
     let mut file = tempfile::NamedTempFile::new()?;
     let mut writer = BufWriter::new(file.as_file_mut());
-    while let Some((gram, packed)) = fst::Streamer::next(&mut stream) {
+    map.visit(|gram, packed| {
         let (offset, count) = crate::eval::unpack_posting(packed);
         anyhow::ensure!(count > 0, "term map contains an empty posting list");
         anyhow::ensure!(
@@ -121,7 +121,8 @@ fn write_compaction_run(
         for id in ids {
             crate::build::write_posting_record(&mut writer, strategy, gram, id)?;
         }
-    }
+        Ok(())
+    })?;
     writer.flush()?;
     drop(writer);
     Ok(file.into_temp_path())
