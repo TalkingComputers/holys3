@@ -98,12 +98,15 @@ jobs:
             | jq -r '.packages[] | select(.name == "holys3") | .rust_version')
           echo "version=$MSRV" | tee -a "$GITHUB_OUTPUT"
       - name: Install Rust (${{ steps.msrv.outputs.version }})
+        id: toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Check on MSRV
-        run: cargo check --locked --workspace --all-targets
+        env:
+          MSRV_TOOLCHAIN: ${{ steps.toolchain.outputs.name }}
+        run: cargo "+$MSRV_TOOLCHAIN" check --locked --workspace --all-targets
 
   rustfmt:
     name: rustfmt
