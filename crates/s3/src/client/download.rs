@@ -130,6 +130,24 @@ impl S3Client {
         Ok(Some(body))
     }
 
+    async fn head_etag(&self, bucket: &str, key: &str) -> Result<Option<String>> {
+        let request = S3Request {
+            method: "HEAD",
+            bucket,
+            key: Some(key),
+            canonical_query: "",
+            range: None,
+            body: None,
+            precondition: None,
+        };
+        let Some((_, etag, _)) = self.send_resilient(&request, None).await? else {
+            return Ok(None);
+        };
+        Ok(Some(etag.with_context(|| {
+            format!("HEAD s3://{bucket}/{key}: no ETag")
+        })?))
+    }
+
     async fn fetch_source_parts(
         &self,
         bucket: &str,
@@ -251,11 +269,19 @@ impl S3Client {
             anyhow::ensure!(body.is_empty(), "S3 object length changed while copying");
             output.set_len(0)?;
         } else {
+            let etag = if size > SOURCE_RANGE_SIZE {
+                let Some(etag) = self.0.rt.block_on(self.head_etag(bucket, key))? else {
+                    return Ok(false);
+                };
+                Some(etag)
+            } else {
+                None
+            };
             output.set_len(size)?;
             let found = self.0.rt.block_on(self.fetch_source_parts(
                 bucket,
                 key,
-                None,
+                etag.as_deref(),
                 size,
                 SOURCE_RANGE_SIZE,
                 &mut |start, part| {

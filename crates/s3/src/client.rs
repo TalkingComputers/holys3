@@ -493,10 +493,14 @@ impl S3Client {
             http
         };
         let builder = match req.method {
+            "GET" => http.get(url),
+            "HEAD" => http.head(url),
             "PUT" => http.put(url),
             "POST" => http.post(url),
             "DELETE" => http.delete(url),
-            _ => http.get(url),
+            method => {
+                return Outcome::Fatal(anyhow::anyhow!("unsupported S3 request method {method}"));
+            }
         };
         let mut builder = apply_signed(builder, &signed, &host, creds.session_token.as_deref());
         if let Some(range) = &range_header {
@@ -1302,6 +1306,87 @@ mod tests {
         let range = format!("range: bytes=0-{}\r\n", body.len() - 1);
         assert!(request.contains(&range), "{request}");
         assert!(!request.contains("if-match:"), "{request}");
+    }
+
+    #[test]
+    fn rejects_object_overwrite_between_file_ranges() {
+        let part_len = 8 * 1024 * 1024usize;
+        let size = 2 * part_len;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let (mut first_stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let read = first_stream.read(&mut request).unwrap();
+            let first = String::from_utf8_lossy(&request[..read]).into_owned();
+            let has_head = first.starts_with("HEAD ");
+            if has_head {
+                write!(
+                    first_stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            } else {
+                write!(
+                    first_stream,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {part_len}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                first_stream.write_all(&vec![b'a'; part_len]).unwrap();
+            }
+            requests.push(first);
+
+            let range_requests = if has_head { 2 } else { 1 };
+            for part in 0..range_requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                if has_head && part == 1 {
+                    write!(
+                        stream,
+                        "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {part_len}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    stream.write_all(&vec![b'b'; part_len]).unwrap();
+                }
+                requests.push(request);
+            }
+            requests
+        });
+        let client = S3Client::new(
+            "us-east-1".into(),
+            Credentials {
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                session_token: None,
+            },
+            Some(endpoint),
+            FetchConfig::default(),
+        )
+        .unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        let result = client.get_file("bucket", "key", &mut output, u64::try_from(size).unwrap());
+        let requests = server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            error.is::<holys3_core::StaleSource>(),
+            "{error:#}\n{requests:#?}"
+        );
+        assert!(requests[0].starts_with("HEAD "), "{}", requests[0]);
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1..].iter().all(|request| {
+            let request = request.to_ascii_lowercase();
+            request.contains("if-match: \"v1\"\r\n")
+                && request
+                    .contains("signedheaders=host;if-match;range;x-amz-content-sha256;x-amz-date")
+        }));
     }
 
     #[test]
