@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::mem::size_of;
+use std::ops::Range;
 
 const RADIX_SORT_MIN: usize = 512;
 
@@ -69,40 +70,78 @@ fn pair_weight(a: u8, b: u8) -> u32 {
     rapidhash::v3::rapidhash_v3(&[a, b]) as u32
 }
 
-pub fn iterate_sparse_grams(data: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let pair_count = data.len().saturating_sub(1);
-    let mut start = 0usize;
-    let mut end = 0usize;
-    let mut interior_max = 0u32;
-    let mut start_weight = 0u32;
-    let mut emit_pair = true;
-    std::iter::from_fn(move || loop {
-        if start >= pair_count {
-            return None;
+pub fn iterate_sparse_gram_ranges(
+    len: usize,
+    mut byte: impl FnMut(usize) -> u8,
+) -> impl Iterator<Item = Range<usize>> {
+    let mut ranges = start_sparse_gram_ranges(len);
+    std::iter::from_fn(move || {
+        match ranges.next_with(|index| Ok::<u8, std::convert::Infallible>(byte(index))) {
+            Ok(range) => range,
+            Err(error) => match error {},
         }
-        if emit_pair {
-            emit_pair = false;
-            end = start + 1;
-            interior_max = 0;
-            start_weight = pair_weight(data[start], data[start + 1]);
-            return Some(&data[start..start + 2]);
-        }
-        while end < pair_count {
-            if end > start + 1 {
-                interior_max = interior_max.max(pair_weight(data[end - 1], data[end]));
-            }
-            if interior_max >= start_weight {
-                break;
-            }
-            let current = end;
-            end += 1;
-            if pair_weight(data[current], data[current + 1]) > interior_max {
-                return Some(&data[start..current + 2]);
-            }
-        }
-        start += 1;
-        emit_pair = true;
     })
+}
+
+pub struct SparseGramRanges {
+    pair_count: usize,
+    start: usize,
+    end: usize,
+    interior_max: u32,
+    start_weight: u32,
+    emit_pair: bool,
+}
+
+pub fn start_sparse_gram_ranges(len: usize) -> SparseGramRanges {
+    SparseGramRanges {
+        pair_count: len.saturating_sub(1),
+        start: 0,
+        end: 0,
+        interior_max: 0,
+        start_weight: 0,
+        emit_pair: true,
+    }
+}
+
+impl SparseGramRanges {
+    pub fn next_with<E>(
+        &mut self,
+        mut byte: impl FnMut(usize) -> Result<u8, E>,
+    ) -> Result<Option<Range<usize>>, E> {
+        loop {
+            if self.start >= self.pair_count {
+                return Ok(None);
+            }
+            if self.emit_pair {
+                self.emit_pair = false;
+                self.end = self.start + 1;
+                self.interior_max = 0;
+                self.start_weight = pair_weight(byte(self.start)?, byte(self.start + 1)?);
+                return Ok(Some(self.start..self.start + 2));
+            }
+            while self.end < self.pair_count {
+                if self.end > self.start + 1 {
+                    self.interior_max = self
+                        .interior_max
+                        .max(pair_weight(byte(self.end - 1)?, byte(self.end)?));
+                }
+                if self.interior_max >= self.start_weight {
+                    break;
+                }
+                let current = self.end;
+                self.end += 1;
+                if pair_weight(byte(current)?, byte(current + 1)?) > self.interior_max {
+                    return Ok(Some(self.start..current + 2));
+                }
+            }
+            self.start += 1;
+            self.emit_pair = true;
+        }
+    }
+}
+
+pub fn iterate_sparse_grams(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    iterate_sparse_gram_ranges(data.len(), |index| data[index]).map(move |range| &data[range])
 }
 
 /// `build_all` as raw gram byte strings (sorted, deduped). Index-time.
@@ -279,12 +318,58 @@ mod sparse_tests {
     use super::*;
     use std::collections::HashSet;
 
+    fn collect_sparse_reference(data: &[u8]) -> Vec<Vec<u8>> {
+        let mut grams = Vec::new();
+        if data.len() < 2 {
+            return grams;
+        }
+        let weights = data
+            .windows(2)
+            .map(|window| pair_weight(window[0], window[1]))
+            .collect::<Vec<_>>();
+        for start in 0..weights.len() {
+            grams.push(data[start..start + 2].to_vec());
+            let mut interior_max = 0;
+            for end in start + 1..weights.len() {
+                if end > start + 1 {
+                    interior_max = interior_max.max(weights[end - 1]);
+                }
+                if interior_max >= weights[start] {
+                    break;
+                }
+                if weights[end] > interior_max {
+                    grams.push(data[start..end + 2].to_vec());
+                }
+            }
+        }
+        grams
+    }
+
     #[test]
     fn sparse_short_input() {
         assert!(extract_sparse_ngrams_all(b"a").is_empty());
         assert!(!extract_sparse_ngrams_all(b"ab").is_empty());
         assert!(extract_sparse_ngrams_covering(b"a").is_empty());
         assert!(!extract_sparse_ngrams_covering(b"ab").is_empty());
+    }
+
+    #[test]
+    fn sparse_iterator_matches_reference_emissions() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for len in 0..256 {
+            let input = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[0]
+                })
+                .collect::<Vec<_>>();
+            let actual = iterate_sparse_grams(&input)
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, collect_sparse_reference(&input), "length {len}");
+        }
     }
 
     #[test]

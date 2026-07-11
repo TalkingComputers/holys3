@@ -16,16 +16,23 @@
 //! against the union of segment doc tables, build bounded segments over the
 //! changes, mark superseded entries dead, and atomically swap segments.bin.
 
-use crate::format::{parse_dead, parse_tables, DeadSet, DocEntry, SegmentTables, SourceEntry};
+#[cfg(test)]
+use crate::format::DocEntry;
+use crate::format::{parse_dead, parse_tables, DeadSet, SegmentTables, SourceEntry};
 use crate::{candidates_with, INDEX_FORMAT};
 use anyhow::{Context, Result};
-use holys3_core::{BlobStore, Corpus, DocAddress, DocId, Strategy};
+use cache::{cached_blob, cached_file, map_file};
+use compact::maybe_compact;
+use holys3_core::{BlobStore, Corpus, DocAddress, Strategy};
 use holys3_query::Query;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+mod cache;
+mod compact;
 
 /// Per-segment doc cap: keeps every per-gram posting list far below the
 /// 2^24 `pack_posting` ceiling, and bounds build memory.
@@ -34,6 +41,8 @@ const SEGMENT_DOC_CAP: usize = 4_000_000;
 const SEGMENT_COUNT_TARGET: usize = 8;
 /// Never merge segments whose combined postings exceed this many bytes.
 const MERGE_POSTINGS_CAP: u64 = 256 * 1024 * 1024;
+const MERGE_TERMS_CAP: u64 = 64 * 1024 * 1024;
+const MERGE_DOCS_CAP: u64 = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SegmentMeta {
@@ -155,85 +164,6 @@ fn load_segment_list(store: &dyn BlobStore) -> Result<(RootState, Option<String>
             Err(err) => Ok((RootState::Unreadable(format!("{err:#}")), Some(version))),
         },
     }
-}
-
-/// Read a segment blob through the local content-addressed cache. Cache
-/// entries are immutable by construction (the path embeds a content hash),
-/// so a cache hit never refetches; writes are atomic (temp + rename).
-fn cached_blob(
-    store: &dyn BlobStore,
-    cache_dir: &Path,
-    seg_id: &str,
-    name: &str,
-    expected_len: u64,
-    expected_hash: &str,
-) -> Result<Vec<u8>> {
-    let cache_path = cache_dir.join(seg_id).join(name);
-    if let Ok(bytes) = std::fs::read(&cache_path) {
-        set_cache_path_mode(&cache_path).ok();
-        if bytes.len() as u64 == expected_len && sha256_hex(&[&bytes]) == expected_hash {
-            return Ok(bytes);
-        }
-        std::fs::remove_file(&cache_path).ok();
-    }
-    let bytes = store
-        .get(&segment_blob(seg_id, name))?
-        .with_context(|| format!("segment blob {name} of {seg_id} missing from the store"))?;
-    anyhow::ensure!(
-        bytes.len() as u64 == expected_len,
-        "segment blob {name} of {seg_id} is {} bytes, expected {expected_len}",
-        bytes.len()
-    );
-    anyhow::ensure!(
-        sha256_hex(&[&bytes]) == expected_hash,
-        "segment blob {name} of {seg_id} failed its SHA-256 check"
-    );
-    // Cache population is best-effort: a concurrent eviction (another search
-    // process opening a newer index) may yank this directory mid-write, and
-    // that must not fail a search that already holds the bytes.
-    let cache = || -> std::io::Result<()> {
-        if let Some(parent) = cache_path.parent() {
-            std::fs::create_dir_all(parent)?;
-            set_cache_dir_mode(cache_dir)?;
-            set_cache_dir_mode(parent)?;
-        }
-        let tmp = cache_path.with_file_name(format!("{name}.tmp.{}", std::process::id()));
-        let mut file = std::fs::File::create(&tmp)?;
-        set_cache_file_mode(&file)?;
-        std::io::Write::write_all(&mut file, &bytes)?;
-        std::fs::rename(&tmp, &cache_path)
-    };
-    cache().ok();
-    Ok(bytes)
-}
-
-#[cfg(unix)]
-fn set_cache_dir_mode(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn set_cache_dir_mode(path: &Path) -> std::io::Result<()> {
-    let _ = path;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_cache_file_mode(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_cache_file_mode(file: &std::fs::File) -> std::io::Result<()> {
-    let _ = file;
-    Ok(())
-}
-
-fn set_cache_path_mode(path: &Path) -> std::io::Result<()> {
-    let file = std::fs::OpenOptions::new().read(true).open(path)?;
-    set_cache_file_mode(&file)
 }
 
 /// What an index run did; everything the CLI needs to report.
@@ -424,7 +354,7 @@ pub fn update_index(
         }
     }
 
-    let compacted = maybe_compact(store, cache_dir, &mut keep)?;
+    let compacted = maybe_compact(store, cache_dir, strategy, &mut keep)?;
 
     if added == 0 && removed == 0 && !forced && !root_missing && !compacted {
         return Ok(UpdateReport {
@@ -573,8 +503,9 @@ fn build_segment_files(
     corpus: &dyn Corpus,
     strategy: Strategy,
     docs: &[(String, String, u64)],
+    document_cap: usize,
 ) -> Result<crate::BuiltIndexFiles> {
-    let mut built = crate::build_index_files(corpus, strategy)?;
+    let mut built = crate::build_index_files(corpus, strategy, Some(document_cap))?;
     anyhow::ensure!(
         built.tables.sources.len() == docs.len(),
         "corpus source count differs from its listing"
@@ -600,18 +531,19 @@ fn write_bounded_segments(
     anyhow::ensure!(doc_cap > 0, "segment document cap must be greater than 0");
     anyhow::ensure!(!docs.is_empty(), "refusing to build an empty segment shard");
     let corpus = make_corpus(docs)?;
-    let built = build_segment_files(corpus.as_ref(), strategy, docs)?;
-    if built.tables.documents.len() <= doc_cap {
-        let meta = put_segment_files(store, &built.fst, &built.postings, &built.tables)?;
-        return Ok(vec![meta]);
+    match build_segment_files(corpus.as_ref(), strategy, docs, doc_cap) {
+        Ok(built) => {
+            let meta = put_segment_files(store, &built.fst, &built.postings, &built.tables)?;
+            return Ok(vec![meta]);
+        }
+        Err(error) if error.is::<crate::DocumentCapExceeded>() => {}
+        Err(error) => return Err(error),
     }
     anyhow::ensure!(
         docs.len() > 1,
-        "source {} expands to {} documents, exceeding the segment cap of {doc_cap}",
-        docs[0].0,
-        built.tables.documents.len()
+        "source {} expands beyond the segment cap of {doc_cap}",
+        docs[0].0
     );
-    drop(built);
     let split = docs.len() / 2;
     let mut segments =
         write_bounded_segments(store, strategy, &docs[..split], doc_cap, make_corpus)?;
@@ -665,197 +597,9 @@ fn put_segment_files(
     Ok(meta)
 }
 
-/// Content-address and PUT a segment's three blobs. Shared by fresh builds
-/// and compaction merges.
-fn put_segment_blobs(
-    store: &dyn BlobStore,
-    fst_bytes: &[u8],
-    postings_buf: &[u8],
-    tables: &SegmentTables,
-) -> Result<SegmentMeta> {
-    anyhow::ensure!(
-        !tables.sources.is_empty(),
-        "refusing to write a segment without sources"
-    );
-    tables.validate()?;
-    let docs_bytes = postcard::to_allocvec(tables)?;
-    let terms_fst_hash = sha256_hex(&[fst_bytes]);
-    let postings_hash = sha256_hex(&[postings_buf]);
-    let docs_hash = sha256_hex(&[&docs_bytes]);
-    let seg_id = sha256_hex(&[
-        terms_fst_hash.as_bytes(),
-        postings_hash.as_bytes(),
-        docs_hash.as_bytes(),
-    ]);
-    store.put(&segment_blob(&seg_id, "terms.fst"), fst_bytes)?;
-    store.put(&segment_blob(&seg_id, "postings.bin"), postings_buf)?;
-    store.put(&segment_blob(&seg_id, "docs.bin"), &docs_bytes)?;
-    let meta = SegmentMeta {
-        seg_id,
-        doc_count: u32::try_from(tables.documents.len())?,
-        terms_fst_len: fst_bytes.len() as u64,
-        terms_fst_hash,
-        postings_len: postings_buf.len() as u64,
-        postings_hash,
-        docs_len: docs_bytes.len() as u64,
-        docs_hash,
-        min_key: tables.sources[0].key.clone(),
-        max_key: tables.sources[tables.sources.len() - 1].key.clone(),
-        dead_hash: String::new(),
-        dead_len: 0,
-    };
-    Ok(meta)
-}
-
-/// At most one merge per run: the two smallest ADJACENT segments whose
-/// combined size fits the caps. Compaction exists only to bound segment
-/// count — dead ids in large segments cost almost nothing at search time.
-fn maybe_compact(
-    store: &dyn BlobStore,
-    cache_dir: &Path,
-    segments: &mut Vec<(SegmentMeta, DeadSet)>,
-) -> Result<bool> {
-    if segments.len() <= SEGMENT_COUNT_TARGET {
-        return Ok(false);
-    }
-    let live =
-        |entry: &(SegmentMeta, DeadSet)| entry.0.doc_count as usize - entry.1.documents.len();
-    let Some(victim) = (0..segments.len() - 1)
-        .filter(|&i| {
-            segments[i]
-                .0
-                .postings_len
-                .saturating_add(segments[i + 1].0.postings_len)
-                <= MERGE_POSTINGS_CAP
-                && live(&segments[i]).saturating_add(live(&segments[i + 1])) <= SEGMENT_DOC_CAP
-        })
-        .min_by_key(|&i| live(&segments[i]).saturating_add(live(&segments[i + 1])))
-    else {
-        return Ok(false);
-    };
-    let (first_meta, first_dead) = segments[victim].clone();
-    let (second_meta, second_dead) = segments[victim + 1].clone();
-    let merged = merge_segments(
-        store,
-        cache_dir,
-        &[(first_meta, first_dead), (second_meta, second_dead)],
-    )?;
-    segments.splice(victim..=victim + 1, [(merged, DeadSet::default())]);
-    Ok(true)
-}
-
-/// Merge segments WITHOUT refetching any objects: decode every gram's
-/// posting list, drop dead ids, remap survivors into one combined table.
-fn merge_segments(
-    store: &dyn BlobStore,
-    cache_dir: &Path,
-    victims: &[(SegmentMeta, DeadSet)],
-) -> Result<SegmentMeta> {
-    type MergedSource = (SourceEntry, Vec<(DocEntry, u32)>, usize);
-
-    let mut tables = SegmentTables {
-        sources: Vec::new(),
-        documents: Vec::new(),
-    };
-    let mut remaps: Vec<Vec<Option<u32>>> = Vec::with_capacity(victims.len());
-    let mut entries: Vec<MergedSource> = Vec::new();
-    for (seg_idx, (meta, dead)) in victims.iter().enumerate() {
-        let victim_tables = parse_tables(&cached_blob(
-            store,
-            cache_dir,
-            &meta.seg_id,
-            "docs.bin",
-            meta.docs_len,
-            &meta.docs_hash,
-        )?)?;
-        remaps.push(vec![None; victim_tables.documents.len()]);
-        for (source_id, source) in victim_tables.sources.into_iter().enumerate() {
-            if dead.sources.binary_search(&(source_id as u32)).is_ok() {
-                continue;
-            }
-            let start = source.first_doc as usize;
-            let end = start + source.doc_count as usize;
-            let documents = victim_tables.documents[start..end]
-                .iter()
-                .cloned()
-                .enumerate()
-                .filter_map(|(offset, document)| {
-                    let old_id = u32::try_from(start + offset).ok()?;
-                    dead.documents
-                        .binary_search(&old_id)
-                        .is_err()
-                        .then_some((document, old_id))
-                })
-                .collect();
-            entries.push((source, documents, seg_idx));
-        }
-    }
-    entries.sort_unstable_by(|(left, _, _), (right, _, _)| left.key.cmp(&right.key));
-    for (mut source, documents, seg_idx) in entries {
-        let source_id = u32::try_from(tables.sources.len())?;
-        source.first_doc = u32::try_from(tables.documents.len())?;
-        source.doc_count = u32::try_from(documents.len())?;
-        for (mut document, old_id) in documents {
-            let new_id = u32::try_from(tables.documents.len())?;
-            remaps[seg_idx][old_id as usize] = Some(new_id);
-            document.source_id = source_id;
-            tables.documents.push(document);
-        }
-        tables.sources.push(source);
-    }
-
-    let mut postings: std::collections::BTreeMap<Vec<u8>, Vec<DocId>> =
-        std::collections::BTreeMap::new();
-    for (seg_idx, (meta, _)) in victims.iter().enumerate() {
-        let fst_bytes = cached_blob(
-            store,
-            cache_dir,
-            &meta.seg_id,
-            "terms.fst",
-            meta.terms_fst_len,
-            &meta.terms_fst_hash,
-        )?;
-        let postings_bytes = store
-            .get(&segment_blob(&meta.seg_id, "postings.bin"))?
-            .with_context(|| format!("postings.bin of {} missing from the store", meta.seg_id))?;
-        anyhow::ensure!(
-            postings_bytes.len() as u64 == meta.postings_len,
-            "postings.bin of {} is {} bytes, expected {}",
-            meta.seg_id,
-            postings_bytes.len(),
-            meta.postings_len
-        );
-        anyhow::ensure!(
-            sha256_hex(&[&postings_bytes]) == meta.postings_hash,
-            "postings.bin of {} failed its SHA-256 check",
-            meta.seg_id
-        );
-        let map = fst::Map::new(fst_bytes)?;
-        let mut stream = map.stream();
-        while let Some((gram, packed)) = fst::Streamer::next(&mut stream) {
-            let (offset, count) = crate::eval::unpack_posting(packed);
-            let start = usize::try_from(offset)?;
-            let end = start + usize::try_from(crate::posting_block_len(count, meta.doc_count))?;
-            let block = postings_bytes
-                .get(start..end)
-                .context("truncated postings.bin during merge")?;
-            let ids = crate::decode_posting_block(block, count, meta.doc_count)?;
-            let remap = &remaps[seg_idx];
-            postings
-                .entry(gram.to_vec())
-                .or_default()
-                .extend(ids.into_iter().filter_map(|id| remap[id as usize]));
-        }
-    }
-    tables.validate()?;
-    let (fst_bytes, postings_buf) =
-        crate::serialize_postings(postings, u32::try_from(tables.documents.len())?)?;
-    put_segment_blobs(store, &fst_bytes, &postings_buf, &tables)
-}
-
 struct Segment {
     meta: SegmentMeta,
-    map: fst::Map<Vec<u8>>,
+    map: fst::Map<memmap2::Mmap>,
     dead: DeadSet,
     tables: OnceLock<SegmentTables>,
 }
@@ -995,12 +739,7 @@ impl SegmentedReader {
                 q,
                 |needed| {
                     let doc_count = segment.meta.doc_count;
-                    let ranges = needed
-                        .iter()
-                        .map(|(&offset, &count)| {
-                            (offset, crate::posting_block_len(count, doc_count))
-                        })
-                        .collect::<Vec<_>>();
+                    let ranges = posting_ranges(needed, doc_count, segment.meta.postings_len)?;
                     let blocks = self.store.get_ranges(&postings_name, &ranges)?;
                     anyhow::ensure!(
                         blocks.len() == ranges.len(),
@@ -1068,37 +807,34 @@ impl SegmentedReader {
     }
 }
 
-fn validate_term_map(meta: &SegmentMeta, map: &fst::Map<Vec<u8>>) -> Result<()> {
-    let mut expected_offset = 0u64;
-    let mut stream = map.stream();
-    while let Some((_, packed)) = fst::Streamer::next(&mut stream) {
-        let (offset, count) = crate::eval::unpack_posting(packed);
-        anyhow::ensure!(count > 0, "term map contains an empty posting list");
-        anyhow::ensure!(
-            count <= meta.doc_count,
-            "term map posting count exceeds its segment document count"
-        );
-        anyhow::ensure!(
-            offset == expected_offset,
-            "term map posting offsets are not contiguous"
-        );
-        expected_offset = expected_offset
-            .checked_add(crate::posting_block_len(count, meta.doc_count))
-            .context("term map posting length overflows")?;
-        anyhow::ensure!(
-            expected_offset <= meta.postings_len,
-            "term map posting extends beyond postings.bin"
-        );
-    }
-    anyhow::ensure!(
-        expected_offset == meta.postings_len,
-        "term map does not account for all of postings.bin"
-    );
-    Ok(())
+fn posting_ranges(
+    needed: &std::collections::BTreeMap<u64, u32>,
+    doc_count: u32,
+    postings_len: u64,
+) -> Result<Vec<(u64, u64)>> {
+    needed
+        .iter()
+        .map(|(&offset, &count)| {
+            anyhow::ensure!(count > 0, "term map contains an empty posting list");
+            anyhow::ensure!(
+                count <= doc_count,
+                "term map posting count exceeds its segment document count"
+            );
+            let len = crate::posting_block_len(count, doc_count);
+            let end = offset
+                .checked_add(len)
+                .context("term map posting length overflows")?;
+            anyhow::ensure!(
+                end <= postings_len,
+                "term map posting extends beyond postings.bin"
+            );
+            Ok((offset, len))
+        })
+        .collect()
 }
 
 fn load_segment(store: &dyn BlobStore, cache_dir: &Path, meta: &SegmentMeta) -> Result<Segment> {
-    let fst_bytes = cached_blob(
+    let path = cached_file(
         store,
         cache_dir,
         &meta.seg_id,
@@ -1107,8 +843,10 @@ fn load_segment(store: &dyn BlobStore, cache_dir: &Path, meta: &SegmentMeta) -> 
         &meta.terms_fst_hash,
     )?;
     let dead = load_dead(store, cache_dir, meta)?;
-    let map = fst::Map::new(fst_bytes)?;
-    validate_term_map(meta, &map)?;
+    let bytes = map_file(&path)?;
+    #[cfg(unix)]
+    bytes.advise(memmap2::Advice::Random)?;
+    let map = fst::Map::new(bytes)?;
     Ok(Segment {
         map,
         dead,
@@ -1266,16 +1004,22 @@ mod tests {
             b"good"
         );
         assert_eq!(std::fs::read(cached).unwrap(), b"good");
+
+        let name = "terms.fst";
+        store
+            .put(&segment_blob(&segment_id, name), b"good")
+            .unwrap();
+        let cached = cache_dir.path().join(&segment_id).join(name);
+        std::fs::write(&cached, b"baad").unwrap();
+        let path = cached_file(&store, cache_dir.path(), &segment_id, name, 4, &hash).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"good");
+        assert!(path.with_file_name("terms.fst.verified").is_file());
     }
 
     #[test]
-    fn term_map_rejects_impossible_posting_metadata() {
-        let mut builder = fst::MapBuilder::memory();
-        builder
-            .insert(b"abc", crate::eval::pack_posting(0, 2).unwrap())
-            .unwrap();
-        let map = fst::Map::new(builder.into_inner().unwrap()).unwrap();
-        assert!(validate_term_map(&segment(), &map).is_err());
+    fn posting_ranges_reject_impossible_metadata() {
+        let needed = std::collections::BTreeMap::from([(0, 2)]);
+        assert!(posting_ranges(&needed, 1, 1).is_err());
     }
 
     #[test]
@@ -1285,6 +1029,8 @@ mod tests {
         let store = holys3_core::LocalBlobStore::new(store_dir.path());
         let mut segments = Vec::new();
         let mut listing = Vec::new();
+        let (fst, postings) =
+            crate::build::merge_posting_runs(Vec::new(), Strategy::Trigram, 1).unwrap();
         for index in 0..=SEGMENT_COUNT_TARGET {
             let key = format!("doc-{index}");
             let tables = SegmentTables {
@@ -1305,7 +1051,7 @@ mod tests {
                     decoded_size: 1,
                 }],
             };
-            let mut meta = put_segment_blobs(&store, &[], &[], &tables).unwrap();
+            let mut meta = put_segment_files(&store, &fst, &postings, &tables).unwrap();
             meta.postings_len = MERGE_POSTINGS_CAP + 1;
             segments.push(meta);
             listing.push((key, "v1".to_owned(), 1));
@@ -1337,14 +1083,22 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let store = holys3_core::LocalBlobStore::new(store_dir.path());
-        let mut segments = (0..=SEGMENT_COUNT_TARGET)
-            .map(|_| {
-                let mut meta = segment();
-                meta.postings_len = u64::MAX;
-                (meta, DeadSet::default())
-            })
-            .collect();
-        assert!(!maybe_compact(&store, cache_dir.path(), &mut segments).unwrap());
+        for (terms_fst_len, postings_len, docs_len) in
+            [(u64::MAX, 0, 0), (0, u64::MAX, 0), (0, 0, u64::MAX)]
+        {
+            let mut segments = (0..=SEGMENT_COUNT_TARGET)
+                .map(|_| {
+                    let mut meta = segment();
+                    meta.terms_fst_len = terms_fst_len;
+                    meta.postings_len = postings_len;
+                    meta.docs_len = docs_len;
+                    (meta, DeadSet::default())
+                })
+                .collect();
+            assert!(
+                !maybe_compact(&store, cache_dir.path(), Strategy::Trigram, &mut segments).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -1377,5 +1131,28 @@ mod tests {
             vec![2, 1, 2]
         );
         assert!(segments.iter().all(|segment| segment.doc_count <= 2));
+    }
+
+    #[test]
+    fn segment_cap_stops_before_later_archive_failure() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = holys3_core::LocalBlobStore::new(store_dir.path());
+        let docs = vec![("bundle.zip".to_owned(), "v1".to_owned(), 1)];
+        let body = holys3_core::testutil::encode::zip(&[
+            ("a.log", b"a"),
+            ("b.log", b"b"),
+            ("c.log", b"c"),
+            ("../invalid.log", b"invalid"),
+        ]);
+        let factory = |shard: &[(String, String, u64)]| -> Result<Box<dyn Corpus>> {
+            Ok(Box::new(holys3_core::testutil::MemCorpus::new(
+                vec![shard[0].0.clone()],
+                vec![body.clone()],
+            )))
+        };
+        let error = write_bounded_segments(&store, Strategy::Trigram, &docs, 2, &factory)
+            .err()
+            .expect("one source exceeds the cap");
+        assert!(error.to_string().contains("segment cap of 2"), "{error:#}");
     }
 }

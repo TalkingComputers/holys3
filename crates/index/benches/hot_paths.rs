@@ -5,6 +5,7 @@ use holys3_core::{
 };
 use holys3_index::{update_index, IndexReader, SegmentedReader};
 use holys3_query::plan;
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -47,6 +48,15 @@ fn generated_corpus(objects: usize, size: usize) -> MemCorpus {
         bodies.push(body);
     }
     MemCorpus::new(keys, bodies)
+}
+
+fn source_positions(corpus: &dyn Corpus) -> HashMap<String, usize> {
+    corpus
+        .sources()
+        .iter()
+        .enumerate()
+        .map(|(index, source)| (source.key.clone(), index))
+        .collect()
 }
 
 fn bench_grams(c: &mut Criterion) {
@@ -126,6 +136,7 @@ fn bench_index_reader(c: &mut Criterion) {
             )
         })
         .collect();
+    let positions = source_positions(&corpus);
     update_index(
         &store,
         cache_dir.path(),
@@ -137,11 +148,7 @@ fn bench_index_reader(c: &mut Criterion) {
             let bodies = keys
                 .iter()
                 .map(|key| {
-                    let idx = corpus
-                        .sources()
-                        .iter()
-                        .position(|source| source.key == *key)
-                        .expect("listed key exists");
+                    let idx = positions.get(key).copied().expect("listed key exists");
                     Ok(corpus.fetch(idx)?.to_vec())
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -184,14 +191,16 @@ fn bench_index_build(c: &mut Criterion) {
                             )
                         })
                         .collect::<Vec<_>>();
+                    let positions = source_positions(&corpus);
                     (
                         corpus,
                         listing,
+                        positions,
                         tempfile::tempdir().expect("benchmark setup failed"),
                         tempfile::tempdir().expect("benchmark setup failed"),
                     )
                 },
-                |(corpus, listing, store_dir, cache_dir)| {
+                |(corpus, listing, positions, store_dir, cache_dir)| {
                     update_index(
                         &LocalBlobStore::new(store_dir.path()),
                         cache_dir.path(),
@@ -206,10 +215,9 @@ fn bench_index_build(c: &mut Criterion) {
                             let bodies = keys
                                 .iter()
                                 .map(|key| {
-                                    let idx = corpus
-                                        .sources()
-                                        .iter()
-                                        .position(|source| source.key == *key)
+                                    let idx = positions
+                                        .get(key)
+                                        .copied()
                                         .expect("benchmark setup failed");
                                     Ok(corpus.fetch(idx)?.to_vec())
                                 })

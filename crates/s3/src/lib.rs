@@ -8,7 +8,8 @@ mod sso;
 
 use anyhow::Context;
 use holys3_core::{
-    decode_requested, BlobStore, Corpus, DocAddress, DocFetcher, DocId, SourceObject,
+    decode_requested_body, BlobStore, Corpus, DocAddress, DocFetcher, DocId, DocumentBody,
+    SourceObject,
 };
 use holys3_sigv4::Credentials;
 use std::ops::Range;
@@ -419,6 +420,38 @@ impl S3Corpus {
             sources,
         }
     }
+
+    fn fetch_body_batch(
+        &self,
+        sources: Range<usize>,
+    ) -> anyhow::Result<Vec<(usize, DocumentBody)>> {
+        let keys = sources
+            .map(|idx| {
+                Ok((
+                    DocId::try_from(idx)?,
+                    self.sources[idx].key.clone(),
+                    self.sources[idx].version.clone(),
+                    self.sources[idx].encoded_size,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut fetched = Vec::with_capacity(keys.len());
+        self.client
+            .get_each_bodies_if_match(&self.bucket, keys, &mut |idx, body| match body {
+                Some(body) => {
+                    fetched.push((idx as usize, body));
+                    Ok(())
+                }
+                None => {
+                    eprintln!(
+                        "warning: s3://{}/{} vanished since listing; skipping",
+                        self.bucket, self.sources[idx as usize].key
+                    );
+                    Ok(())
+                }
+            })?;
+        Ok(fetched)
+    }
 }
 
 impl Corpus for S3Corpus {
@@ -436,32 +469,14 @@ impl Corpus for S3Corpus {
     /// Concurrent batch fetch. Objects deleted since listing (404) are
     /// skipped with a warning.
     fn fetch_many(&self, sources: Range<usize>) -> anyhow::Result<Vec<(usize, bytes::Bytes)>> {
-        let keys = sources
-            .map(|idx| {
-                Ok((
-                    DocId::try_from(idx)?,
-                    self.sources[idx].key.clone(),
-                    self.sources[idx].version.clone(),
-                    self.sources[idx].encoded_size,
-                ))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut fetched = Vec::with_capacity(keys.len());
-        self.client
-            .get_each_if_match(&self.bucket, keys, &mut |idx, bytes| match bytes {
-                Some(bytes) => {
-                    fetched.push((idx as usize, bytes));
-                    Ok(())
-                }
-                None => {
-                    eprintln!(
-                        "warning: s3://{}/{} vanished since listing; skipping",
-                        self.bucket, self.sources[idx as usize].key
-                    );
-                    Ok(())
-                }
-            })?;
-        Ok(fetched)
+        self.fetch_body_batch(sources)?
+            .into_iter()
+            .map(|(idx, body)| Ok((idx, body.into_bytes()?)))
+            .collect()
+    }
+
+    fn fetch_bodies(&self, sources: Range<usize>) -> anyhow::Result<Vec<(usize, DocumentBody)>> {
+        self.fetch_body_batch(sources)
     }
 }
 
@@ -505,7 +520,7 @@ impl DocFetcher for S3Fetcher {
     fn fetch_each(
         &self,
         documents: &[DocAddress],
-        consume: &mut dyn FnMut(usize, bytes::Bytes) -> anyhow::Result<()>,
+        consume: &mut dyn FnMut(usize, DocumentBody) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let mut grouped = std::collections::BTreeMap::new();
         for (idx, document) in documents.iter().enumerate() {
@@ -536,7 +551,7 @@ impl DocFetcher for S3Fetcher {
                 &mut |idx, body| {
                     let ((key, version, encoded_size), requests) = &groups[idx];
                     match body {
-                        Some(bytes) => decode_requested(key, requests, bytes, consume),
+                        Some(body) => decode_requested_body(key, requests, body, consume),
                         None => {
                             indexed_keys.push((
                                 DocId::try_from(idx)?,
@@ -563,20 +578,23 @@ impl DocFetcher for S3Fetcher {
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
         }
-        self.client
-            .get_each_if_match(&self.bucket, indexed_keys, &mut |idx, bytes| match bytes {
-                Some(bytes) => {
+        self.client.get_each_bodies_if_match(
+            &self.bucket,
+            indexed_keys,
+            &mut |idx, body| match body {
+                Some(body) => {
                     let ((key, version, _), requests) = &groups[idx as usize];
-                    decode_requested(key, requests, bytes.clone(), consume)?;
-                    if let Some(cache) = &self.cache {
-                        cache.put(
+                    let cached = self.cache.as_ref().map(|_| body.try_clone()).transpose()?;
+                    decode_requested_body(key, requests, body, consume)?;
+                    if let (Some(cache), Some(cached)) = (&self.cache, cached) {
+                        cache.put_body(
                             &CacheKey {
                                 endpoint: &self.endpoint,
                                 bucket: &self.bucket,
                                 key,
                                 version,
                             },
-                            &bytes,
+                            cached,
                         )?;
                     }
                     Ok(())
@@ -589,7 +607,8 @@ impl DocFetcher for S3Fetcher {
                     );
                     Ok(())
                 }
-            })
+            },
+        )
     }
 }
 
@@ -689,8 +708,8 @@ mod tests {
             S3Fetcher::with_cache(client.clone(), "bucket".into(), config.clone()).unwrap();
         let mut first = Vec::new();
         fetcher
-            .fetch_each(&documents, &mut |idx, bytes| {
-                first.push((idx, bytes));
+            .fetch_each(&documents, &mut |idx, body| {
+                first.push((idx, body.into_bytes()?));
                 Ok(())
             })
             .unwrap();
@@ -708,8 +727,8 @@ mod tests {
         let fetcher = S3Fetcher::with_cache(client, "bucket".into(), config).unwrap();
         let mut warm = Vec::new();
         fetcher
-            .fetch_each(&documents, &mut |idx, bytes| {
-                warm.push((idx, bytes));
+            .fetch_each(&documents, &mut |idx, body| {
+                warm.push((idx, body.into_bytes()?));
                 Ok(())
             })
             .unwrap();

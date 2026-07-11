@@ -1,16 +1,26 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use fs4::FileExt;
+use holys3_core::{DocumentBody, DocumentSpool};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 const MAGIC: &[u8; 8] = b"HS3CACH2";
 const STATE_MAGIC: &[u8; 8] = b"HS3SIZE1";
-// magic (8) + body length (8) + blake3 checksum (32) + insertion stamp (8)
 const HEADER_LEN: usize = 56;
+#[cfg(not(test))]
+const CACHE_MEMORY_LIMIT: u64 = 8 * 1024 * 1024;
+#[cfg(test)]
+const CACHE_MEMORY_LIMIT: u64 = 1024;
+
+enum CacheBody {
+    Missing,
+    Valid(DocumentBody),
+    Invalid(u64),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectCacheConfig {
@@ -70,34 +80,39 @@ impl ObjectCache {
     }
 
     pub fn get(&self, key: &CacheKey<'_>) -> Result<Option<Bytes>> {
+        self.get_body(key)?
+            .map(DocumentBody::into_bytes)
+            .transpose()
+    }
+
+    pub(crate) fn get_body(&self, key: &CacheKey<'_>) -> Result<Option<DocumentBody>> {
         let path = self.path(key);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if read_entry(&bytes).is_ok() {
-            return Ok(Some(Bytes::from(bytes).slice(HEADER_LEN..)));
+        match read_cache_body(&path)? {
+            CacheBody::Missing => return Ok(None),
+            CacheBody::Valid(body) => return Ok(Some(body)),
+            CacheBody::Invalid(_) => {}
         }
         let lock = self.lock()?;
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let len = match read_cache_body(&path)? {
+            CacheBody::Missing => return Ok(None),
+            CacheBody::Valid(body) => return Ok(Some(body)),
+            CacheBody::Invalid(len) => len,
         };
-        if read_entry(&bytes).is_ok() {
-            return Ok(Some(Bytes::from(bytes).slice(HEADER_LEN..)));
-        }
         let total = self.read_total()?;
         self.write_total(None)?;
         std::fs::remove_file(&path)?;
-        self.write_total(Some(total.saturating_sub(u64::try_from(bytes.len())?)))?;
+        self.write_total(Some(total.saturating_sub(len)))?;
         drop(lock);
         Ok(None)
     }
 
     pub fn put(&self, key: &CacheKey<'_>, body: &Bytes) -> Result<()> {
-        if u64::try_from(HEADER_LEN)? + u64::try_from(body.len())? > self.cap_bytes {
+        self.put_body(key, DocumentBody::from_bytes(body.clone()))
+    }
+
+    pub(crate) fn put_body(&self, key: &CacheKey<'_>, body: DocumentBody) -> Result<()> {
+        let body_len = body.len();
+        if u64::try_from(HEADER_LEN)? + body_len > self.cap_bytes {
             return Ok(());
         }
         let lock = self.lock()?;
@@ -107,15 +122,34 @@ impl ObjectCache {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error.into()),
         };
-        let new_len = u64::try_from(HEADER_LEN)? + u64::try_from(body.len())?;
+        let new_len = u64::try_from(HEADER_LEN)? + body_len;
         let total = self.read_total()?;
         self.write_total(None)?;
         let mut temp = tempfile::NamedTempFile::new_in(&self.objects)?;
         temp.write_all(MAGIC)?;
-        temp.write_all(&u64::try_from(body.len())?.to_le_bytes())?;
-        temp.write_all(blake3::hash(body).as_bytes())?;
+        temp.write_all(&body_len.to_le_bytes())?;
+        temp.write_all(&[0; 32])?;
         temp.write_all(&insertion_stamp().to_le_bytes())?;
-        temp.write_all(body)?;
+        let mut reader = body.into_reader();
+        let mut hasher = blake3::Hasher::new();
+        let mut written = 0u64;
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            let bytes = &chunk[..read];
+            hasher.update(bytes);
+            temp.write_all(bytes)?;
+            written = written
+                .checked_add(u64::try_from(read)?)
+                .context("object cache body length overflows")?;
+        }
+        anyhow::ensure!(written == body_len, "object cache body length changed");
+        temp.seek(SeekFrom::Start(16))?;
+        temp.write_all(hasher.finalize().as_bytes())?;
+        temp.flush()?;
         set_file_mode(temp.as_file())?;
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -141,7 +175,7 @@ impl ObjectCache {
         &self,
         keys: &[CacheKey<'_>],
         concurrency: usize,
-        consume: &mut dyn FnMut(usize, Option<Bytes>) -> Result<()>,
+        consume: &mut dyn FnMut(usize, Option<DocumentBody>) -> Result<()>,
     ) -> Result<()> {
         anyhow::ensure!(
             concurrency > 0,
@@ -158,7 +192,7 @@ impl ObjectCache {
         let next = AtomicUsize::new(0);
         let cancelled = AtomicBool::new(false);
         let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<Result<(usize, Option<Bytes>)>>(workers * 2);
+            std::sync::mpsc::sync_channel::<Result<(usize, Option<DocumentBody>)>>(workers * 2);
         let failure = std::thread::scope(|scope| {
             let next = &next;
             let cancelled = &cancelled;
@@ -171,7 +205,7 @@ impl ObjectCache {
                             break;
                         };
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            self.get(key)
+                            self.get_body(key)
                         }))
                         .unwrap_or_else(|_| {
                             Err(anyhow::anyhow!("an object cache worker panicked"))
@@ -334,6 +368,79 @@ fn hash_key(key: &CacheKey<'_>) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+fn read_cache_body(path: &Path) -> Result<CacheBody> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CacheBody::Missing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let file_len = metadata.len();
+    if file_len <= u64::try_from(HEADER_LEN)? + CACHE_MEMORY_LIMIT {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CacheBody::Missing);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        return if read_entry(&bytes).is_ok() {
+            Ok(CacheBody::Valid(DocumentBody::from_bytes(
+                Bytes::from(bytes).slice(HEADER_LEN..),
+            )))
+        } else {
+            Ok(CacheBody::Invalid(file_len))
+        };
+    }
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CacheBody::Missing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut header = [0u8; HEADER_LEN];
+    if let Err(error) = file.read_exact(&mut header) {
+        return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            Ok(CacheBody::Invalid(file_len))
+        } else {
+            Err(error.into())
+        };
+    }
+    if &header[..8] != MAGIC {
+        return Ok(CacheBody::Invalid(file_len));
+    }
+    let body_len = u64::from_le_bytes(header[8..16].try_into()?);
+    if u64::try_from(HEADER_LEN)?
+        .checked_add(body_len)
+        .is_none_or(|expected| expected != file_len)
+    {
+        return Ok(CacheBody::Invalid(file_len));
+    }
+    let mut body = DocumentSpool::new(body_len)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut at = 0u64;
+    let mut chunk = [0u8; 64 * 1024];
+    while at < body_len {
+        let read = usize::try_from((body_len - at).min(chunk.len() as u64))?;
+        if let Err(error) = file.read_exact(&mut chunk[..read]) {
+            return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                Ok(CacheBody::Invalid(file_len))
+            } else {
+                Err(error.into())
+            };
+        }
+        hasher.update(&chunk[..read]);
+        body.write_at(at, &chunk[..read])?;
+        at += u64::try_from(read)?;
+    }
+    if hasher.finalize().as_bytes() != &header[16..48] {
+        return Ok(CacheBody::Invalid(file_len));
+    }
+    Ok(CacheBody::Valid(body.finish()?))
+}
+
 fn read_entry(bytes: &[u8]) -> Result<()> {
     anyhow::ensure!(bytes.len() >= HEADER_LEN, "cache entry header is truncated");
     anyhow::ensure!(&bytes[..8] == MAGIC, "cache entry magic is invalid");
@@ -428,6 +535,21 @@ mod tests {
     }
 
     #[test]
+    fn cache_streams_large_bodies() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let bytes = Bytes::from(vec![b'x'; usize::try_from(CACHE_MEMORY_LIMIT)? + 1]);
+        let cache = ObjectCache::open(
+            dir.path(),
+            u64::try_from(HEADER_LEN)? + u64::try_from(bytes.len())?,
+        )?;
+        cache.put(&key("large"), &bytes)?;
+        let body = cache.get_body(&key("large"))?.context("cached body")?;
+        assert!(body.is_file());
+        assert_eq!(body.into_bytes()?, bytes);
+        Ok(())
+    }
+
+    #[test]
     fn cache_counts_headers_and_repairs_truncated_entries_on_open() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let cap = u64::try_from(HEADER_LEN)?;
@@ -474,7 +596,7 @@ mod tests {
         keys.push(key("missing"));
         let mut seen = Vec::new();
         cache.get_each(&keys, 8, &mut |index, body| {
-            seen.push((index, body));
+            seen.push((index, body.map(DocumentBody::into_bytes).transpose()?));
             Ok(())
         })?;
         seen.sort_unstable_by_key(|entry| entry.0);

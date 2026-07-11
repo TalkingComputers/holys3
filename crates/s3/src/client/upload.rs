@@ -92,6 +92,7 @@ impl S3Client {
             )
             .await?
             .with_context(|| format!("initiate multipart s3://{bucket}/{key}: HTTP 404"))?;
+        let body = body.into_bytes()?;
         read_xml_text(&body, b"UploadId")?
             .with_context(|| format!("initiate multipart s3://{bucket}/{key}: no UploadId"))
     }
@@ -130,6 +131,7 @@ impl S3Client {
             .await;
         match completed {
             Ok(Some((_, _, response))) => {
+                let response = response.into_bytes()?;
                 if let Err(error) = validate_complete_multipart(&response) {
                     self.abort_multipart(bucket, key, upload_id).await;
                     return Err(error).with_context(|| {

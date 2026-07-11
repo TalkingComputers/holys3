@@ -108,7 +108,7 @@ Fetchers group addresses by `(source_key, source_version)`, fetch each source on
 
 ## Segment Format
 
-Index format 7 stores two tables per segment:
+Index format 8 stores two tables per segment:
 
 1. A source table keyed by physical source key, containing source version, encoded size, detected encoding, decode status, and the logical-document ID range.
 2. A logical-document table keyed by local document ID, containing display key, source-table ID, optional member path, and decoded size.
@@ -166,7 +166,7 @@ The first implementation benchmarks these candidates on identical corpora:
 2. K-way merge of already-sorted per-document gram vectors.
 3. The current comparison-sort implementation as the control.
 
-The selected implementation must preserve sorted unique grams and ascending document IDs. Stable radix sorting can sort flattened entries by gram only because documents enter the batch in ascending ID order; equal grams retain ID order.
+The selected implementation preserves sorted unique grams and ascending document IDs. Bounded batches use stable radix sorting. Oversized packed batches switch to the byte-identical k-way merge, and high-cardinality file-backed inputs retain a fixed trigram bitmap that streams directly into a posting run.
 
 ### Local freshness
 
@@ -191,7 +191,7 @@ Compression readers feed chunks into consumers:
 - Trigram indexing retains only the previous two bytes between chunks.
 - Search verification retains one line plus the required context ring.
 - Structured readers emit one projected record batch at a time.
-- Sparse indexing may spool decoded bytes to a temporary file and memory-map it because sparse grams can span beyond a fixed-size boundary.
+- Sparse indexing spools decoded bytes to a temporary file and uses a bounded file window with resumable gram state because sparse grams can span beyond a fixed-size boundary.
 
 Single pathological lines remain exact: the line buffer can grow to the line length, but the full source body is not retained.
 
@@ -199,7 +199,7 @@ Single pathological lines remain exact: the line buffer can grow to the line len
 
 ### Shared response buffers
 
-S3 response bodies use `bytes::Bytes` through the client, corpus, cache, and decoder boundaries. Coalesced range reads return `Bytes::slice` views into one merged response instead of allocating a new vector per requested block.
+Small S3 response bodies use shared `bytes::Bytes`; large source ranges and cache entries use sealed file-backed `DocumentBody` values. Coalesced index reads retain bounded shared buffers, while immutable term dictionaries populate the local cache through ranged reads and remain memory-mapped for lookup.
 
 ### Request identity
 
@@ -207,9 +207,9 @@ Every candidate carries the indexed source version. S3 `GetObject` sends `If-Mat
 
 ### Connections, retries, and ranges
 
-The existing reusable reqwest client, horizontal concurrency, adaptive throttling, request hedging, and range coalescing remain. Changes are accepted only with cold MinIO and real-Speedtrain evidence because higher concurrency or forced HTTP/2 is not universally faster across S3-compatible endpoints.
+The existing reusable reqwest client, horizontal concurrency, adaptive throttling, request hedging, and range coalescing remain. Transport changes require cold MinIO and representative in-region S3 evidence because higher concurrency or forced HTTP/2 is not universally faster across S3-compatible endpoints.
 
-Large file-backed index uploads use concurrent multipart parts. Raw sources above 16 MiB use ordered concurrent range GETs selected from measured 8 MiB and 16 MiB candidates. The fetcher keeps at most twice the active range concurrency out of order before applying backpressure, then feeds the streaming line verifier in byte order. Every range carries the indexed `If-Match` precondition. Compressed and container sources remain whole-object GETs because their streams are not independently seekable.
+Large file-backed index uploads use concurrent multipart parts. Sources of at least 64 MiB use four concurrent 8 MiB range GETs whose response chunks spool to sealed temporary files. Every range carries the indexed `If-Match` precondition. The canonical decoder consumes the assembled file-backed body, so raw and encoded sources share one bounded transport path.
 
 ### Object cache
 

@@ -10,8 +10,8 @@
 
 ## Global Constraints
 
-- Never make a live AWS request without an explicit `AWS_PROFILE=speedtrain` environment assignment.
-- Never inspect, source, or use the PAM AWS profile.
+- Never make a live provider request without an explicit operator-approved profile assignment.
+- Never inspect, source, or use unrelated cloud profiles.
 - Sign `if-match` and `range` exactly as transmitted.
 - Treat HTTP 412 as a typed stale-index result; never retry it.
 - Fetch one physical source once per search batch even when several logical documents reference it.

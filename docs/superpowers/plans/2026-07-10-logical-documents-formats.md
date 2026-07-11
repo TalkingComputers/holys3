@@ -4,7 +4,7 @@
 
 **Goal:** Make one source object produce multiple exact searchable documents and add ZIP, TAR, nested compression, Arrow IPC, ORC, Brotli, and zlib support.
 
-**Architecture:** Introduce physical source identity, logical document identity, and a streaming decoder sink. Index format 7 stores source and document tables separately; archive members become typed candidate addresses and are fetched by parent source only once.
+**Architecture:** Introduce physical source identity, logical document identity, and a streaming decoder sink. Index format 8 stores source and document tables separately; archive members become typed candidate addresses and are fetched by parent source only once.
 
 **Tech Stack:** Rust 1.88, bytes 1.x, zip 8.6.0, tar 0.4.46, arrow-ipc 59.1, arrow-json 59.1, orc-rust 0.8.0 with isolated Arrow 58 types, brotli 8.0.4, flate2 1.1.9.
 
@@ -35,11 +35,11 @@
 - Create `crates/core/src/codec/orc.rs`: isolated ORC/Arrow-58 adapter.
 - Modify `crates/core/src/store.rs`: replace bare document keys with source objects and typed addresses.
 - Modify `crates/core/src/lib.rs`: export new source, address, decoder, and sink contracts.
-- Create `crates/index/src/format.rs`: source/document tables for format 7.
+- Create `crates/index/src/format.rs`: source/document tables for format 8.
 - Modify `crates/index/src/build/mod.rs`: decode sources into logical-document postings and segment batches.
 - Modify `crates/index/src/segment.rs`: incremental source replacement, source-level tombstones, compaction, and typed candidates.
 - Modify `crates/index/src/search.rs`: typed candidate filtering and grouped document fetching.
-- Modify `crates/index/src/lib.rs`: set `INDEX_FORMAT = 7` and expose typed APIs.
+- Modify `crates/index/src/lib.rs`: set `INDEX_FORMAT = 8` and expose typed APIs.
 - Modify `crates/index/src/local.rs`: source listings and virtual-member fetching.
 - Modify `crates/s3/src/lib.rs`: source listings and grouped virtual-member fetching.
 - Modify `crates/cli/src/main.rs`: use typed candidates while preserving displayed virtual keys.
@@ -447,7 +447,7 @@ git add Cargo.toml Cargo.lock crates/core/Cargo.toml crates/core/src/codec
 git commit -m "feat: search Arrow ORC Brotli and zlib data"
 ```
 
-## Task 5: Index Format 7
+## Task 5: Index Format 8
 
 **Files:**
 - Create: `crates/index/src/format.rs`
@@ -462,7 +462,7 @@ Reject unsorted/duplicate sources, noncontiguous document ranges, wrong source I
 
 - [ ] **Step 2: Implement source/document table serialization**
 
-Set `INDEX_FORMAT` to 7. Parse and validate `SegmentTables` before exposing entries.
+Set `INDEX_FORMAT` to 8. Parse and validate `SegmentTables` before exposing entries.
 
 - [ ] **Step 3: Build logical-document postings**
 
@@ -484,7 +484,7 @@ Merge source tables in source-key order, append each source's live documents con
 
 Cover adding/removing/replacing one member, changing nested archive paths, empty archives, failed archives, compaction, garbage collection, and stale reader retry.
 
-- [ ] **Step 8: Commit format 7**
+- [ ] **Step 8: Commit format 8**
 
 ```bash
 git add crates/index/src crates/index/tests/segmented.rs

@@ -32,6 +32,7 @@ quick-xml = "0.41.0"
 clap = { version = "4", features = ["derive"] }
 fs4 = { version = "1.1.0", features = ["sync"] }
 tempfile = "3.27.0"
+memmap2 = "0.9.11"
 radsort = "0.1.1"
 rapidhash = "4.5.1"
 blake3 = "1.8.5"

@@ -112,7 +112,10 @@ pub(super) fn detect_codec_for_key(key: &str, bytes: &[u8]) -> Codec {
 }
 
 fn is_arrow_ipc(bytes: &[u8]) -> bool {
-    bytes.len() >= 12 && bytes.starts_with(b"ARROW1") && bytes.ends_with(b"ARROW1")
+    bytes.len() >= 12
+        && bytes.starts_with(b"ARROW1")
+        && bytes.ends_with(b"ARROW1")
+        && arrow_ipc::reader::FileReader::try_new(std::io::Cursor::new(bytes), None).is_ok()
 }
 
 fn is_orc(bytes: &[u8]) -> bool {
@@ -181,7 +184,19 @@ fn is_arrow_ipc_stream(bytes: &[u8], allow_legacy: bool) -> bool {
 }
 
 fn is_tar(bytes: &[u8]) -> bool {
-    bytes.get(257..262).is_some_and(|magic| magic == b"ustar")
+    let Some(header_bytes) = bytes.get(..512) else {
+        return false;
+    };
+    if header_bytes.get(257..262) != Some(b"ustar") {
+        return false;
+    }
+    let header = tar::Header::from_byte_slice(header_bytes);
+    let Ok(stored) = header.cksum() else {
+        return false;
+    };
+    let mut expected = header.clone();
+    expected.set_cksum();
+    expected.cksum().is_ok_and(|checksum| checksum == stored)
 }
 
 fn is_parquet(bytes: &[u8]) -> bool {

@@ -3,16 +3,18 @@
 
 use crate::{IndexReader, SearchStats};
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use holys3_core::{
-    can_search_as_document, grep_bytes, grep_bytes_fast, has_line_match, has_line_match_fast,
-    DocAddress, DocFetcher, LineEvent, MatchOptions,
+    bounded_match_len, can_search_as_document, grep_bytes, grep_bytes_fast, has_line_match,
+    has_line_match_fast, DocAddress, DocFetcher, DocumentBody, LineEvent, MatchOptions,
 };
 use rayon::iter::{ParallelBridge, ParallelIterator};
+use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 const SEARCH_CANDIDATE_BATCH: usize = 16_384;
+const FILE_MATCH_CHUNK: usize = 1024 * 1024;
+const FILE_MATCH_OVERLAP_MAX: usize = 1024 * 1024;
 
 /// Key-level search scope. `prefix` is authoritative for both segment
 /// pruning in readers and per-key filtering here; `matches` carries any
@@ -87,11 +89,47 @@ fn lock<'a, T>(mutex: &'a Mutex<T>) -> Result<MutexGuard<'a, T>> {
         .map_err(|_| anyhow::anyhow!("a search worker panicked"))
 }
 
+fn has_bounded_reader_match(
+    reader: &mut impl Read,
+    len: u64,
+    re: &regex::bytes::Regex,
+    match_len: usize,
+) -> Result<bool> {
+    if len == 0 {
+        return Ok(false);
+    }
+    if match_len == 0 {
+        return Ok(true);
+    }
+    let overlap = match_len - 1;
+    anyhow::ensure!(
+        overlap <= FILE_MATCH_OVERLAP_MAX,
+        "streaming regex overlap exceeds its limit"
+    );
+    let chunk_bytes = usize::try_from(len.min(u64::try_from(FILE_MATCH_CHUNK)?))?;
+    let mut chunk = vec![0u8; chunk_bytes + overlap];
+    let mut carry = 0usize;
+    let mut remaining = len;
+    while remaining > 0 {
+        let read = usize::try_from(remaining.min(u64::try_from(chunk_bytes)?))?;
+        reader.read_exact(&mut chunk[carry..carry + read])?;
+        let end = carry + read;
+        if re.is_match(&chunk[..end]) {
+            return Ok(true);
+        }
+        carry = end.min(overlap);
+        chunk.copy_within(end - carry..end, 0);
+        remaining -= u64::try_from(read)?;
+    }
+    Ok(false)
+}
+
 fn search_batch(
     documents: &[DocAddress],
     fetcher: &dyn DocFetcher,
     re: &regex::bytes::Regex,
     whole_document: bool,
+    bounded_len: Option<usize>,
     options: MatchOptions,
     sink: &dyn MatchSink,
 ) -> Result<(Vec<String>, usize, bool)> {
@@ -101,16 +139,18 @@ fn search_batch(
 
     let bytes_fetched = AtomicUsize::new(0);
     let hits: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Bytes)>(workers * 2);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, DocumentBody)>(workers * 2);
 
     let wants_matches = sink.wants_matches();
     let documents_ref = documents;
     // `re` is cloned per rayon split: the meta engine's shared scratch Cache
     // contends under exactly this all-threads-search workload.
-    let verify = |re: &regex::bytes::Regex, idx: usize, text: Bytes| -> Result<()> {
+    let verify = |re: &regex::bytes::Regex, idx: usize, body: DocumentBody| -> Result<()> {
         let key = &documents_ref[idx].display_key;
         let started = std::time::Instant::now();
+        let bytes_searched = body.len();
         let events = if wants_matches {
+            let text = body.into_bytes()?;
             let events = if whole_document {
                 grep_bytes_fast(text.clone(), re, options)
             } else {
@@ -121,11 +161,24 @@ fn search_batch(
             }
             events
         } else {
-            // line semantics, same as grep_doc: no lines in an empty doc
-            let matched = if whole_document {
-                has_line_match_fast(&text, re)
+            let can_stream =
+                body.is_file() && bounded_len.is_some_and(|len| len <= FILE_MATCH_OVERLAP_MAX + 1);
+            let matched = if can_stream {
+                let len = body.len();
+                let mut reader = body.into_reader();
+                has_bounded_reader_match(
+                    &mut reader,
+                    len,
+                    re,
+                    bounded_len.expect("bounded length"),
+                )?
             } else {
-                has_line_match(&text, re)
+                let text = body.into_bytes()?;
+                if whole_document {
+                    has_line_match_fast(&text, re)
+                } else {
+                    has_line_match(&text, re)
+                }
             };
             if !matched {
                 return Ok(());
@@ -135,7 +188,7 @@ fn search_batch(
         lock(&hits)?.push(key.clone());
         let doc = DocResult {
             events: &events,
-            bytes_searched: text.len() as u64,
+            bytes_searched,
             elapsed: started.elapsed(),
         };
         if sink.on_doc(key, &doc)? == SinkFlow::Stop {
@@ -162,11 +215,9 @@ fn search_batch(
                 },
             )
         });
-        let feed = fetcher.fetch_each(documents_ref, &mut |idx, bytes| {
-            bytes_fetched.fetch_add(bytes.len(), Ordering::Relaxed);
-            // The channel only closes when the consumer short-circuited, so
-            // a failed send is the same sentinel: not a real fetch failure.
-            tx.send((idx, bytes))
+        let feed = fetcher.fetch_each(documents_ref, &mut |idx, body| {
+            bytes_fetched.fetch_add(usize::try_from(body.len())?, Ordering::Relaxed);
+            tx.send((idx, body))
                 .map_err(|_| anyhow::Error::new(StopEarly))
         });
         drop(tx);
@@ -229,6 +280,7 @@ pub fn search_streaming(
     let query = holys3_query::plan(pattern, reader.strategy())?;
     let re = regex::bytes::Regex::new(pattern)?;
     let whole_document = can_search_as_document(pattern)?;
+    let bounded_len = bounded_match_len(pattern)?;
     let mut hits = Vec::new();
     let mut candidates = 0usize;
     let mut bytes_fetched = 0usize;
@@ -244,8 +296,15 @@ pub fn search_streaming(
             if documents.is_empty() {
                 return Ok(true);
             }
-            let (batch_hits, batch_bytes, stopped) =
-                search_batch(&documents, fetcher, &re, whole_document, options, sink)?;
+            let (batch_hits, batch_bytes, stopped) = search_batch(
+                &documents,
+                fetcher,
+                &re,
+                whole_document,
+                bounded_len,
+                options,
+                sink,
+            )?;
             hits.extend(batch_hits);
             bytes_fetched = bytes_fetched
                 .checked_add(batch_bytes)
@@ -338,6 +397,32 @@ mod tests {
     use holys3_core::{DocAddress, SourceEncoding, Strategy};
     use holys3_query::Query;
 
+    #[test]
+    fn bounded_file_search_matches_in_memory_across_chunks() {
+        use std::io::{Seek, Write};
+        let mut bytes = vec![b'x'; FILE_MATCH_CHUNK * 2 + 17];
+        let at = FILE_MATCH_CHUNK - 3;
+        bytes[at..at + 6].copy_from_slice(b"needle");
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        for pattern in ["needle", "missing", "x{16}needle", "", "needle|other"] {
+            file.rewind().unwrap();
+            let re = regex::bytes::Regex::new(pattern).unwrap();
+            let match_len = bounded_match_len(pattern).unwrap().unwrap();
+            assert_eq!(
+                has_bounded_reader_match(
+                    &mut file,
+                    u64::try_from(bytes.len()).unwrap(),
+                    &re,
+                    match_len,
+                )
+                .unwrap(),
+                has_line_match_fast(&bytes, &re),
+                "{pattern}"
+            );
+        }
+    }
+
     struct BatchReader {
         documents: Vec<DocAddress>,
     }
@@ -391,11 +476,14 @@ mod tests {
         fn fetch_each(
             &self,
             documents: &[DocAddress],
-            consume: &mut dyn FnMut(usize, Bytes) -> Result<()>,
+            consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
         ) -> Result<()> {
             self.largest.fetch_max(documents.len(), Ordering::Relaxed);
             for index in 0..documents.len() {
-                consume(index, Bytes::from_static(b"needle\n"))?;
+                consume(
+                    index,
+                    DocumentBody::from_bytes(bytes::Bytes::from_static(b"needle\n")),
+                )?;
             }
             Ok(())
         }

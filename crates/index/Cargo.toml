@@ -27,12 +27,12 @@ radsort.workspace = true
 rapidhash.workspace = true
 blake3.workspace = true
 bytes.workspace = true
+memmap2.workspace = true
 
 [dev-dependencies]
 holys3-core = { path = "../core", version = "0.4.0", features = ["testutil"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
-tempfile = "3.27.0"
 
 [[bench]]
 name = "hot_paths"

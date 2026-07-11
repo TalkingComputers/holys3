@@ -6,8 +6,8 @@ use anyhow::Result;
 use holys3_core::{
     decode_body, decode_requested, scan_matching_docs,
     testutil::{encode, MemCorpus},
-    Corpus, DocAddress, DocFetcher, LocalBlobStore, MatchOptions, SourceEncoding, SourceObject,
-    Strategy,
+    Corpus, DocAddress, DocFetcher, DocumentBody, LocalBlobStore, MatchOptions, SourceEncoding,
+    SourceObject, Strategy,
 };
 use holys3_index::{
     search_collect, search_streaming, update_index, IndexChanged, IndexReader, KeyScope, NullSink,
@@ -64,7 +64,7 @@ impl DocFetcher for BucketFetcher<'_> {
     fn fetch_each(
         &self,
         documents: &[DocAddress],
-        consume: &mut dyn FnMut(usize, bytes::Bytes) -> Result<()>,
+        consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
     ) -> Result<()> {
         let mut groups = BTreeMap::new();
         for (idx, document) in documents.iter().enumerate() {
@@ -94,7 +94,7 @@ impl DocFetcher for CountingBucketFetcher<'_> {
     fn fetch_each(
         &self,
         documents: &[DocAddress],
-        consume: &mut dyn FnMut(usize, bytes::Bytes) -> Result<()>,
+        consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
     ) -> Result<()> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         BucketFetcher(self.bucket).fetch_each(documents, consume)

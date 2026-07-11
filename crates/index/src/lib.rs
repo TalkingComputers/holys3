@@ -1,6 +1,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! Index construction and local or store-backed index readers.
 
+mod build;
 mod eval;
 mod format;
 mod search;
@@ -11,55 +12,38 @@ pub use search::{
 };
 pub use segment::{update_index, CorpusFactory, IndexChanged, SegmentedReader, UpdateReport};
 
+#[cfg(test)]
+use build::{
+    build_chunks, collapse_posting_runs, collect_file_trigrams, merge_posting_runs,
+    pack_file_trigrams, write_posting_record, write_posting_runs, write_trigram_run_merge,
+    write_trigram_run_radix, IndexedGrams, PostingRun, MAX_OPEN_POSTING_RUNS, SPARSE_FILE_CHUNK,
+};
+pub(crate) use build::{build_index_files, BuiltIndexFiles, DocumentCapExceeded, TempBlob};
+
 use anyhow::{Context, Result};
 use eval::Selection;
-use format::{DocEntry, SegmentTables, SourceEntry};
+#[cfg(test)]
+use holys3_core::pack_trigram_grams;
 use holys3_core::{
-    decode_source, is_raw_source, iterate_sparse_grams, pack_trigram_grams, Corpus, DecodeSink,
-    DocFetcher, DocId, LogicalDocumentMeta, SourceEncoding, SourceObject, Strategy, DECODE_LIMITS,
+    Corpus, DocFetcher, DocId, DocumentBody, DocumentSpool, SourceEncoding, SourceObject, Strategy,
 };
 use holys3_query::Query;
 use rayon::prelude::*;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::mem::size_of;
+use std::io::Read;
+#[cfg(test)]
+use std::io::{BufReader, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Docs are fetched and gram-extracted in chunks bounded BOTH by doc count
-/// and by total (compressed) bytes, so neither many-small nor few-huge
-/// objects blow build memory.
-const BUILD_FETCH_CHUNK: usize = 1280;
-const BUILD_FETCH_BYTES: u64 = 64 * 1024 * 1024;
-const SPARSE_RUN_BYTES: usize = 16 * 1024 * 1024;
-
-/// Greedy chunk boundaries over `docs()` positions respecting both caps; a
-/// single over-budget doc still forms its own chunk.
-fn build_chunks(sources: &[SourceObject]) -> impl Iterator<Item = Range<usize>> + '_ {
-    let mut start = 0usize;
-    std::iter::from_fn(move || {
-        if start >= sources.len() {
-            return None;
-        }
-        let mut end = start;
-        let mut bytes = 0u64;
-        while end < sources.len() && end - start < BUILD_FETCH_CHUNK {
-            let size = sources[end].encoded_size;
-            if end > start && size > BUILD_FETCH_BYTES.saturating_sub(bytes) {
-                break;
-            }
-            bytes = bytes.saturating_add(size);
-            end += 1;
-        }
-        let chunk = start..end;
-        start = end;
-        Some(chunk)
-    })
-}
+#[cfg(not(test))]
+const LOCAL_BODY_MEMORY_LIMIT: u64 = 8 * 1024 * 1024;
+#[cfg(test)]
+const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
@@ -265,639 +249,6 @@ pub(crate) fn candidates_with<D: AsRef<[u8]>>(
     }
 }
 
-/// Build terms.fst + postings.bin over the corpus. Also returns the ids of
-/// docs that contributed NO grams because they vanished mid-build (404) or
-/// failed to decompress. Transient fetch misses retry on the next run;
-/// unchanged decode failures wait for the object to change.
-pub(crate) struct TempBlob {
-    file: tempfile::NamedTempFile,
-    len: u64,
-    hash: String,
-}
-
-impl TempBlob {
-    pub(crate) fn path(&self) -> &Path {
-        self.file.path()
-    }
-
-    pub(crate) fn len(&self) -> u64 {
-        self.len
-    }
-
-    pub(crate) fn hash(&self) -> &str {
-        &self.hash
-    }
-}
-
-struct HashWriter<W> {
-    inner: W,
-    hasher: Sha256,
-}
-
-impl<W> HashWriter<W> {
-    fn new(inner: W) -> HashWriter<W> {
-        HashWriter {
-            inner,
-            hasher: Sha256::new(),
-        }
-    }
-
-    fn finish(self) -> (W, String) {
-        let hash = self
-            .hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        (self.inner, hash)
-    }
-}
-
-impl<W: Write> Write for HashWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let written = self.inner.write(bytes)?;
-        self.hasher.update(&bytes[..written]);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-pub(crate) struct BuiltIndexFiles {
-    pub fst: TempBlob,
-    pub postings: TempBlob,
-    pub tables: SegmentTables,
-}
-
-struct BuiltDocument {
-    meta: LogicalDocumentMeta,
-    grams: IndexedGrams,
-    decoded_size: u64,
-}
-
-struct IndexDecodeSink {
-    strategy: Strategy,
-    current_meta: Option<LogicalDocumentMeta>,
-    current_bytes: Vec<bytes::Bytes>,
-    documents: Vec<BuiltDocument>,
-}
-
-impl IndexDecodeSink {
-    fn new(strategy: Strategy) -> Self {
-        Self {
-            strategy,
-            current_meta: None,
-            current_bytes: Vec::new(),
-            documents: Vec::new(),
-        }
-    }
-}
-
-impl DecodeSink for IndexDecodeSink {
-    fn begin(&mut self, document: &LogicalDocumentMeta) -> Result<()> {
-        anyhow::ensure!(
-            self.current_meta.is_none(),
-            "decoder began a document before finishing the previous document"
-        );
-        self.current_meta = Some(document.clone());
-        Ok(())
-    }
-
-    fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        anyhow::ensure!(
-            self.current_meta.is_some(),
-            "decoder wrote bytes before beginning a document"
-        );
-        self.current_bytes
-            .push(bytes::Bytes::copy_from_slice(bytes));
-        Ok(())
-    }
-
-    fn write_bytes(&mut self, bytes: bytes::Bytes) -> Result<()> {
-        anyhow::ensure!(
-            self.current_meta.is_some(),
-            "decoder wrote bytes before beginning a document"
-        );
-        self.current_bytes.push(bytes);
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        let meta = self
-            .current_meta
-            .take()
-            .context("decoder finished without beginning a document")?;
-        let mut chunks = std::mem::take(&mut self.current_bytes);
-        let bytes = match chunks.len() {
-            0 => bytes::Bytes::new(),
-            1 => chunks.pop().expect("one chunk"),
-            _ => {
-                let len = chunks.iter().try_fold(0usize, |len, chunk| {
-                    len.checked_add(chunk.len())
-                        .context("decoded document length overflows")
-                })?;
-                let mut joined = bytes::BytesMut::with_capacity(len);
-                for chunk in chunks {
-                    joined.extend_from_slice(&chunk);
-                }
-                joined.freeze()
-            }
-        };
-        let decoded_size = u64::try_from(bytes.len())?;
-        let grams = match self.strategy {
-            Strategy::Trigram => IndexedGrams::Trigram(pack_trigram_grams(&bytes)),
-            Strategy::Sparse => IndexedGrams::Sparse(bytes),
-        };
-        self.documents.push(BuiltDocument {
-            meta,
-            grams,
-            decoded_size,
-        });
-        Ok(())
-    }
-}
-
-enum SourceBuild {
-    Decoded {
-        encoding: SourceEncoding,
-        documents: Vec<BuiltDocument>,
-    },
-    Failed,
-}
-
-fn build_source(source: &SourceObject, bytes: bytes::Bytes, strategy: Strategy) -> SourceBuild {
-    let mut sink = IndexDecodeSink::new(strategy);
-    match decode_source(&source.key, bytes, DECODE_LIMITS, &mut sink) {
-        Ok(summary) => SourceBuild::Decoded {
-            encoding: summary.encoding,
-            documents: sink.documents,
-        },
-        Err(err) => {
-            eprintln!("warning: {err:#}; object excluded from index");
-            SourceBuild::Failed
-        }
-    }
-}
-
-fn build_index_files(corpus: &dyn Corpus, strategy: Strategy) -> Result<BuiltIndexFiles> {
-    let sources = corpus.sources();
-    let mut tables = SegmentTables {
-        sources: Vec::with_capacity(sources.len()),
-        documents: Vec::new(),
-    };
-    let mut failed = 0usize;
-    let mut runs = Vec::new();
-    for chunk in build_chunks(sources) {
-        let chunk_start = chunk.start;
-        let fetched = corpus.fetch_many(chunk.clone())?;
-        let mut bodies = (0..chunk.len()).map(|_| None).collect::<Vec<_>>();
-        for (idx, bytes) in fetched {
-            let position = idx
-                .checked_sub(chunk_start)
-                .filter(|position| *position < bodies.len())
-                .with_context(|| format!("fetch_many returned out-of-range document {idx}"))?;
-            anyhow::ensure!(
-                bodies[position].is_none(),
-                "fetch_many returned document {idx} twice"
-            );
-            bodies[position] = Some(bytes);
-        }
-        let mut raw = bodies
-            .par_iter()
-            .enumerate()
-            .map(|(offset, bytes)| {
-                let source = &sources[chunk_start + offset];
-                bytes
-                    .as_ref()
-                    .filter(|bytes| is_raw_source(&source.key, bytes))
-                    .map(|bytes| build_source(source, bytes.clone(), strategy))
-            })
-            .collect::<Vec<_>>();
-        let mut grammed = Vec::new();
-        for offset in 0..bodies.len() {
-            let source = &sources[chunk_start + offset];
-            let expanding = bodies[offset]
-                .as_ref()
-                .is_some_and(|bytes| !is_raw_source(&source.key, bytes));
-            if expanding && !grammed.is_empty() {
-                runs.extend(write_posting_runs(
-                    std::mem::take(&mut grammed),
-                    strategy,
-                    SPARSE_RUN_BYTES,
-                )?);
-            }
-            let outcome = match (raw[offset].take(), bodies[offset].take()) {
-                (Some(outcome), _) => Some(outcome),
-                (None, Some(bytes)) => Some(build_source(source, bytes, strategy)),
-                (None, None) => None,
-            };
-            let source_id = u32::try_from(tables.sources.len())?;
-            let first_doc = u32::try_from(tables.documents.len())?;
-            let (encoding, retry, source_failed, mut documents) = match outcome {
-                Some(SourceBuild::Decoded {
-                    encoding,
-                    documents,
-                }) => (encoding, false, false, documents),
-                Some(SourceBuild::Failed) => {
-                    failed += 1;
-                    (SourceEncoding::Raw, false, true, Vec::new())
-                }
-                None => {
-                    failed += 1;
-                    (SourceEncoding::Raw, true, true, Vec::new())
-                }
-            };
-            documents
-                .sort_unstable_by(|left, right| left.meta.display_key.cmp(&right.meta.display_key));
-            for document in documents {
-                let doc_id = tables.documents.len();
-                grammed.push((doc_id, document.grams));
-                tables.documents.push(DocEntry {
-                    display_key: document.meta.display_key,
-                    source_id,
-                    member_path: document.meta.member_path,
-                    decoded_size: document.decoded_size,
-                });
-            }
-            tables.sources.push(SourceEntry {
-                key: source.key.clone(),
-                version: source.version.clone(),
-                encoded_size: source.encoded_size,
-                encoding,
-                first_doc,
-                doc_count: u32::try_from(tables.documents.len())? - first_doc,
-                failed: source_failed,
-                retry,
-            });
-            if expanding && !grammed.is_empty() {
-                runs.extend(write_posting_runs(
-                    std::mem::take(&mut grammed),
-                    strategy,
-                    SPARSE_RUN_BYTES,
-                )?);
-            }
-        }
-        if !grammed.is_empty() {
-            runs.extend(write_posting_runs(grammed, strategy, SPARSE_RUN_BYTES)?);
-        }
-    }
-    if failed > 0 {
-        eprintln!(
-            "warning: {} objects vanished or could not be decompressed and were excluded",
-            failed
-        );
-    }
-    tables.validate()?;
-    let (fst, postings) =
-        merge_posting_runs(runs, strategy, u32::try_from(tables.documents.len())?)?;
-    Ok(BuiltIndexFiles {
-        fst,
-        postings,
-        tables,
-    })
-}
-
-enum IndexedGrams {
-    Trigram(Vec<u32>),
-    Sparse(bytes::Bytes),
-}
-
-fn write_posting_runs(
-    grammed: Vec<(usize, IndexedGrams)>,
-    strategy: Strategy,
-    sparse_run_bytes: usize,
-) -> Result<Vec<File>> {
-    match strategy {
-        Strategy::Trigram => Ok(vec![write_trigram_run(grammed)?]),
-        Strategy::Sparse => {
-            let mut runs = Vec::new();
-            for (idx, grams) in grammed {
-                let IndexedGrams::Sparse(text) = grams else {
-                    anyhow::bail!("mixed gram strategies in build chunk");
-                };
-                runs.extend(write_sparse_runs(idx, &text, sparse_run_bytes)?);
-            }
-            Ok(runs)
-        }
-    }
-}
-
-fn write_trigram_run(grammed: Vec<(usize, IndexedGrams)>) -> Result<File> {
-    let documents = grammed
-        .into_iter()
-        .map(|(idx, grams)| {
-            let IndexedGrams::Trigram(grams) = grams else {
-                anyhow::bail!("mixed gram strategies in build chunk");
-            };
-            Ok((idx, grams))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    write_trigram_run_radix(documents)
-}
-
-fn write_trigram_run_radix(grammed: Vec<(usize, Vec<u32>)>) -> Result<File> {
-    let mut file = tempfile::tempfile()?;
-    let mut writer = BufWriter::new(&mut file);
-    let mut entries = Vec::new();
-    for (idx, grams) in grammed {
-        let id = DocId::try_from(idx)?;
-        entries.extend(
-            grams
-                .into_iter()
-                .map(|gram| u64::from(gram) << 32 | u64::from(id)),
-        );
-    }
-    radsort::sort(&mut entries);
-    entries.dedup();
-    for entry in entries {
-        let gram = (entry >> 32) as u32;
-        let id = entry as DocId;
-        writer.write_all(&gram.to_be_bytes()[1..])?;
-        writer.write_all(&id.to_be_bytes())?;
-    }
-    writer.flush()?;
-    drop(writer);
-    file.seek(SeekFrom::Start(0))?;
-    Ok(file)
-}
-
-#[cfg(test)]
-fn write_trigram_run_merge(grammed: Vec<(usize, Vec<u32>)>) -> Result<File> {
-    let mut documents = grammed
-        .into_iter()
-        .map(|(idx, grams)| Ok((DocId::try_from(idx)?, grams)))
-        .collect::<Result<Vec<_>>>()?;
-    documents.sort_unstable_by_key(|(id, _)| *id);
-    let mut pending = BinaryHeap::new();
-    for (document_index, (id, grams)) in documents.iter().enumerate() {
-        if let Some(&gram) = grams.first() {
-            pending.push(Reverse((gram, *id, document_index, 0usize)));
-        }
-    }
-    let mut file = tempfile::tempfile()?;
-    let mut writer = BufWriter::new(&mut file);
-    let mut previous = None;
-    while let Some(Reverse((gram, id, document_index, gram_index))) = pending.pop() {
-        let record = (gram, id);
-        if previous != Some(record) {
-            writer.write_all(&gram.to_be_bytes()[1..])?;
-            writer.write_all(&id.to_be_bytes())?;
-            previous = Some(record);
-        }
-        let next_index = gram_index + 1;
-        if let Some(&next_gram) = documents[document_index].1.get(next_index) {
-            pending.push(Reverse((next_gram, id, document_index, next_index)));
-        }
-    }
-    writer.flush()?;
-    drop(writer);
-    file.seek(SeekFrom::Start(0))?;
-    Ok(file)
-}
-
-fn write_sparse_runs(idx: usize, text: &[u8], run_bytes: usize) -> Result<Vec<File>> {
-    anyhow::ensure!(run_bytes > 0, "sparse posting run size must be positive");
-    let id = DocId::try_from(idx)?;
-    let mut runs = Vec::new();
-    let mut entries = rapidhash::RapidHashSet::default();
-    let mut bytes = 0usize;
-    let mut recent: [Option<&[u8]>; 2] = [None, None];
-    let mut recent_index = 0usize;
-    for gram in iterate_sparse_grams(text) {
-        if recent.iter().flatten().any(|previous| *previous == gram) {
-            continue;
-        }
-        recent[recent_index] = Some(gram);
-        recent_index = (recent_index + 1) % recent.len();
-        if entries.contains(gram) {
-            continue;
-        }
-        bytes = bytes
-            .saturating_add(size_of::<Vec<u8>>() + size_of::<usize>())
-            .saturating_add(gram.len());
-        entries.insert(gram.to_vec());
-        if bytes >= run_bytes {
-            runs.push(write_sparse_run(&entries, id)?);
-            entries.clear();
-            bytes = 0;
-        }
-    }
-    if !entries.is_empty() {
-        runs.push(write_sparse_run(&entries, id)?);
-    }
-    Ok(runs)
-}
-
-fn write_sparse_run(entries: &rapidhash::RapidHashSet<Vec<u8>>, id: DocId) -> Result<File> {
-    let mut ordered = entries.iter().collect::<Vec<_>>();
-    ordered.sort_unstable();
-    let mut file = tempfile::tempfile()?;
-    let mut writer = BufWriter::new(&mut file);
-    for gram in ordered {
-        writer.write_all(&u32::try_from(gram.len())?.to_be_bytes())?;
-        writer.write_all(gram)?;
-        writer.write_all(&id.to_be_bytes())?;
-    }
-    writer.flush()?;
-    drop(writer);
-    file.seek(SeekFrom::Start(0))?;
-    Ok(file)
-}
-
-fn insert_posting(
-    builder: &mut fst::MapBuilder<Vec<u8>>,
-    postings_buf: &mut Vec<u8>,
-    gram: &[u8],
-    mut ids: Vec<DocId>,
-    doc_count: u32,
-) -> Result<()> {
-    ids.sort_unstable();
-    ids.dedup();
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let offset = postings_buf.len() as u64;
-    encode_posting_block(postings_buf, &ids, doc_count);
-    builder.insert(gram, eval::pack_posting(offset, ids.len())?)?;
-    Ok(())
-}
-
-fn insert_posting_file<W: Write>(
-    builder: &mut fst::MapBuilder<W>,
-    postings: &mut impl Write,
-    offset: &mut u64,
-    gram: &[u8],
-    mut ids: Vec<DocId>,
-    doc_count: u32,
-) -> Result<()> {
-    ids.sort_unstable();
-    ids.dedup();
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let mut block = Vec::new();
-    encode_posting_block(&mut block, &ids, doc_count);
-    builder.insert(gram, eval::pack_posting(*offset, ids.len())?)?;
-    postings.write_all(&block)?;
-    *offset += u64::try_from(block.len())?;
-    Ok(())
-}
-
-struct PostingRun {
-    reader: BufReader<File>,
-    strategy: Strategy,
-}
-
-impl PostingRun {
-    fn read_record(&mut self) -> Result<Option<(Vec<u8>, DocId)>> {
-        match self.strategy {
-            Strategy::Trigram => {
-                let mut record = [0u8; 7];
-                if !read_exact_or_eof(&mut self.reader, &mut record)? {
-                    return Ok(None);
-                }
-                Ok(Some((
-                    record[..3].to_vec(),
-                    DocId::from_be_bytes(record[3..].try_into()?),
-                )))
-            }
-            Strategy::Sparse => {
-                let mut length = [0u8; 4];
-                if !read_exact_or_eof(&mut self.reader, &mut length)? {
-                    return Ok(None);
-                }
-                let mut gram = vec![0; usize::try_from(u32::from_be_bytes(length))?];
-                self.reader
-                    .read_exact(&mut gram)
-                    .context("truncated temporary posting run")?;
-                let mut id = [0u8; 4];
-                self.reader
-                    .read_exact(&mut id)
-                    .context("truncated temporary posting run")?;
-                Ok(Some((gram, DocId::from_be_bytes(id))))
-            }
-        }
-    }
-}
-
-fn read_exact_or_eof(reader: &mut impl Read, bytes: &mut [u8]) -> Result<bool> {
-    match reader.read(&mut bytes[..1])? {
-        0 => Ok(false),
-        1 => {
-            reader
-                .read_exact(&mut bytes[1..])
-                .context("truncated temporary posting run")?;
-            Ok(true)
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn merge_posting_runs(
-    runs: Vec<File>,
-    strategy: Strategy,
-    doc_count: u32,
-) -> Result<(TempBlob, TempBlob)> {
-    let mut runs = runs
-        .into_iter()
-        .map(|file| PostingRun {
-            reader: BufReader::new(file),
-            strategy,
-        })
-        .collect::<Vec<_>>();
-    let mut heap = BinaryHeap::new();
-    for (run_idx, run) in runs.iter_mut().enumerate() {
-        if let Some((gram, id)) = run.read_record()? {
-            heap.push(Reverse((gram, id, run_idx)));
-        }
-    }
-    let fst = tempfile::NamedTempFile::new()?;
-    let postings = tempfile::NamedTempFile::new()?;
-    let mut postings_writer = BufWriter::new(HashWriter::new(postings.reopen()?));
-    let mut builder = fst::MapBuilder::new(BufWriter::new(HashWriter::new(fst.reopen()?)))?;
-    let mut postings_len = 0u64;
-    let mut current_gram: Option<Vec<u8>> = None;
-    let mut ids = Vec::new();
-    while let Some(Reverse((gram, id, run_idx))) = heap.pop() {
-        if current_gram.as_deref() != Some(gram.as_slice()) {
-            if let Some(current) = current_gram.replace(gram) {
-                insert_posting_file(
-                    &mut builder,
-                    &mut postings_writer,
-                    &mut postings_len,
-                    &current,
-                    std::mem::take(&mut ids),
-                    doc_count,
-                )?;
-            }
-        }
-        if ids.last() != Some(&id) {
-            ids.push(id);
-        }
-        if let Some((next_gram, next_id)) = runs[run_idx].read_record()? {
-            heap.push(Reverse((next_gram, next_id, run_idx)));
-        }
-    }
-    if let Some(current) = current_gram {
-        insert_posting_file(
-            &mut builder,
-            &mut postings_writer,
-            &mut postings_len,
-            &current,
-            ids,
-            doc_count,
-        )?;
-    }
-    let mut fst_writer = builder.into_inner()?;
-    fst_writer.flush()?;
-    postings_writer.flush()?;
-    let (_, fst_hash) = fst_writer
-        .into_inner()
-        .map_err(std::io::IntoInnerError::into_error)?
-        .finish();
-    let (_, postings_hash) = postings_writer
-        .into_inner()
-        .map_err(std::io::IntoInnerError::into_error)?
-        .finish();
-    let fst_len = fst.as_file().metadata()?.len();
-    let written_postings_len = postings.as_file().metadata()?.len();
-    anyhow::ensure!(
-        postings_len == written_postings_len,
-        "postings writer tracked {postings_len} bytes but wrote {written_postings_len}"
-    );
-    Ok((
-        TempBlob {
-            file: fst,
-            len: fst_len,
-            hash: fst_hash,
-        },
-        TempBlob {
-            file: postings,
-            len: written_postings_len,
-            hash: postings_hash,
-        },
-    ))
-}
-
-/// THE postings format: per gram, a density-classed block in postings.bin
-/// (see `posting_block_len`); the fst maps gram -> packed (offset, count).
-/// Shared by fresh builds and compaction merges so the format is defined
-/// once. Dense grams cost zero bytes — the query path never fetches them
-/// (`resolve` short-circuits them to ALL) and decode reconstructs them.
-pub(crate) fn serialize_postings(
-    postings: BTreeMap<Vec<u8>, Vec<DocId>>,
-    doc_count: u32,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    let mut postings_buf: Vec<u8> = Vec::new();
-    let mut builder = fst::MapBuilder::new(Vec::new())?;
-    for (gram, ids) in postings {
-        insert_posting(&mut builder, &mut postings_buf, &gram, ids, doc_count)?;
-    }
-    Ok((builder.into_inner()?, postings_buf))
-}
-
 pub struct LocalCorpus {
     sources: Vec<SourceObject>,
     paths: Vec<PathBuf>,
@@ -1003,6 +354,53 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn read_local_body(
+    path: &Path,
+    key: &str,
+    expected_version: &str,
+    expected_size: u64,
+) -> Result<DocumentBody> {
+    let stale = || {
+        anyhow::Error::new(holys3_core::StaleSource {
+            key: key.to_owned(),
+            expected: expected_version.to_owned(),
+        })
+    };
+    let size = std::fs::metadata(path)?.len();
+    if size != expected_size {
+        return Err(stale());
+    }
+    if size <= LOCAL_BODY_MEMORY_LIMIT {
+        let bytes = bytes::Bytes::from(std::fs::read(path)?);
+        if blake3::hash(&bytes).to_hex().as_str() != expected_version {
+            return Err(stale());
+        }
+        return Ok(DocumentBody::from_bytes(bytes));
+    }
+    let mut input = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut body = DocumentSpool::new(size)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = [0u8; 64 * 1024];
+    let mut at = 0u64;
+    loop {
+        let read = input
+            .read(&mut chunk)
+            .with_context(|| format!("read local document {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+        body.write_at(at, &chunk[..read])?;
+        at = at
+            .checked_add(u64::try_from(read)?)
+            .context("local document length overflows")?;
+    }
+    if at != size || hasher.finalize().to_hex().as_str() != expected_version {
+        return Err(stale());
+    }
+    body.finish()
+}
+
 impl Corpus for LocalCorpus {
     fn sources(&self) -> &[SourceObject] {
         &self.sources
@@ -1013,15 +411,8 @@ impl Corpus for LocalCorpus {
             .paths
             .get(idx)
             .with_context(|| format!("document index {idx} is out of range"))?;
-        let bytes = bytes::Bytes::from(std::fs::read(path)?);
-        let current = blake3::hash(&bytes).to_hex().to_string();
-        if current != self.sources[idx].version {
-            return Err(anyhow::Error::new(holys3_core::StaleSource {
-                key: self.sources[idx].key.clone(),
-                expected: self.sources[idx].version.clone(),
-            }));
-        }
-        Ok(bytes)
+        let source = &self.sources[idx];
+        read_local_body(path, &source.key, &source.version, source.encoded_size)?.into_bytes()
     }
 
     fn fetch_many(&self, sources: Range<usize>) -> Result<Vec<(usize, bytes::Bytes)>> {
@@ -1032,18 +423,29 @@ impl Corpus for LocalCorpus {
                     .paths
                     .get(idx)
                     .with_context(|| format!("document index {idx} is out of range"))?;
-                let bytes = std::fs::read(path)
-                    .with_context(|| format!("read local document {}", path.display()))?;
-                let bytes = bytes::Bytes::from(bytes);
                 let source = &self.sources[idx];
-                let current = blake3::hash(&bytes).to_hex().to_string();
-                if current != source.version {
-                    return Err(anyhow::Error::new(holys3_core::StaleSource {
-                        key: source.key.clone(),
-                        expected: source.version.clone(),
-                    }));
-                }
-                Ok((idx, bytes))
+                Ok((
+                    idx,
+                    read_local_body(path, &source.key, &source.version, source.encoded_size)?
+                        .into_bytes()?,
+                ))
+            })
+            .collect()
+    }
+
+    fn fetch_bodies(&self, sources: Range<usize>) -> Result<Vec<(usize, DocumentBody)>> {
+        sources
+            .into_par_iter()
+            .map(|idx| {
+                let path = self
+                    .paths
+                    .get(idx)
+                    .with_context(|| format!("document index {idx} is out of range"))?;
+                let source = &self.sources[idx];
+                Ok((
+                    idx,
+                    read_local_body(path, &source.key, &source.version, source.encoded_size)?,
+                ))
             })
             .collect()
     }
@@ -1076,30 +478,26 @@ struct LocalFetchGroup {
 
 fn read_local_group(
     group: &LocalFetchGroup,
-    consume: &mut dyn FnMut(usize, bytes::Bytes) -> Result<()>,
+    consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
 ) -> Result<()> {
-    let bytes =
-        std::fs::read(&group.key).with_context(|| format!("read local document {}", group.key))?;
-    let bytes = bytes::Bytes::from(bytes);
-    let current = blake3::hash(&bytes).to_hex().to_string();
-    if current != group.version {
-        return Err(anyhow::Error::new(holys3_core::StaleSource {
-            key: group.key.clone(),
-            expected: group.version.clone(),
-        }));
-    }
-    holys3_core::decode_requested(&group.key, &group.requests, bytes, consume)
+    let body = read_local_body(
+        Path::new(&group.key),
+        &group.key,
+        &group.version,
+        group.encoded_size,
+    )?;
+    holys3_core::decode_requested_body(&group.key, &group.requests, body, consume)
 }
 
 fn fetch_local_parallel(
     groups: &[&LocalFetchGroup],
     workers: usize,
-    consume: &mut dyn FnMut(usize, bytes::Bytes) -> Result<()>,
+    consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
 ) -> Result<()> {
     let next = AtomicUsize::new(0);
     let cancelled = AtomicBool::new(false);
     let (sender, receiver) =
-        std::sync::mpsc::sync_channel::<Result<(usize, bytes::Bytes)>>(workers * 2);
+        std::sync::mpsc::sync_channel::<Result<(usize, DocumentBody)>>(workers * 2);
     let failure = std::thread::scope(|scope| {
         let next = &next;
         let cancelled = &cancelled;
@@ -1150,7 +548,7 @@ impl DocFetcher for LocalFetcher {
     fn fetch_each(
         &self,
         documents: &[holys3_core::DocAddress],
-        consume: &mut dyn FnMut(usize, bytes::Bytes) -> Result<()>,
+        consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
     ) -> Result<()> {
         let mut groups = BTreeMap::new();
         for (idx, document) in documents.iter().enumerate() {
@@ -1319,7 +717,7 @@ mod tests {
                 encoded_size: 8,
             }],
         };
-        let error = build_index_files(&corpus, Strategy::Trigram)
+        let error = build_index_files(&corpus, Strategy::Trigram, None)
             .err()
             .expect("out-of-range fetch result should fail");
         assert!(
@@ -1336,7 +734,7 @@ mod tests {
             vec!["a.log".to_owned(), "b.log".to_owned()],
             vec![b"alpha needle".to_vec(), b"beta needle".to_vec()],
         );
-        let built = build_index_files(&corpus, Strategy::Trigram).unwrap();
+        let built = build_index_files(&corpus, Strategy::Trigram, None).unwrap();
         assert_eq!(
             built.fst.len(),
             std::fs::metadata(built.fst.path()).unwrap().len()
@@ -1355,6 +753,40 @@ mod tests {
                 .collect::<String>();
             assert_eq!(blob.hash(), expected);
         }
+    }
+
+    #[test]
+    fn file_trigrams_match_memory_trigrams() {
+        for len in [0usize, 1, 2, 3, 65_535, 65_536, 65_537, 1_100_003] {
+            let bytes = (0..len)
+                .map(|index| u8::try_from((index * 31 + index / 7) % 251).unwrap())
+                .collect::<Vec<_>>();
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&bytes).unwrap();
+            assert_eq!(
+                pack_file_trigrams(&mut file, u64::try_from(len).unwrap()).unwrap(),
+                pack_trigram_grams(&bytes),
+                "length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_trigram_bitmap_run_matches_packed_run() {
+        let bytes = (0..1_100_003usize)
+            .map(|index| u8::try_from((index * 31 + index / 7) % 251).unwrap())
+            .collect::<Vec<_>>();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        let indexed =
+            collect_file_trigrams(&mut file, u64::try_from(bytes.len()).unwrap()).unwrap();
+        assert!(matches!(indexed, IndexedGrams::TrigramBitmap(_)));
+        let actual = write_posting_runs(vec![(0, indexed)], Strategy::Trigram, 1024).unwrap();
+        let expected = write_trigram_run_radix(vec![(0, pack_trigram_grams(&bytes))]).unwrap();
+        assert_eq!(
+            std::fs::read(&actual[0]).unwrap(),
+            std::fs::read(expected).unwrap()
+        );
     }
 
     #[test]
@@ -1387,6 +819,78 @@ mod tests {
     }
 
     #[test]
+    fn sparse_file_runs_match_memory_across_chunks() {
+        let text = (0..SPARSE_FILE_CHUNK + 17)
+            .map(|index| if index % 2 == 0 { b'a' } else { b'b' })
+            .collect::<Vec<_>>();
+        let memory = write_posting_runs(
+            vec![(0, IndexedGrams::Sparse(text.clone().into()))],
+            Strategy::Sparse,
+            1024,
+        )
+        .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&text).unwrap();
+        let streamed = write_posting_runs(
+            vec![(0, IndexedGrams::SparseFile(file))],
+            Strategy::Sparse,
+            1024,
+        )
+        .unwrap();
+        let (memory_fst, memory_postings) =
+            merge_posting_runs(memory, Strategy::Sparse, 1).unwrap();
+        let (streamed_fst, streamed_postings) =
+            merge_posting_runs(streamed, Strategy::Sparse, 1).unwrap();
+        assert_eq!(
+            std::fs::read(memory_fst.path()).unwrap(),
+            std::fs::read(streamed_fst.path()).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(memory_postings.path()).unwrap(),
+            std::fs::read(streamed_postings.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn posting_run_merge_bounds_open_files() {
+        let runs = (0..MAX_OPEN_POSTING_RUNS * 4)
+            .map(|id| {
+                let mut file = tempfile::NamedTempFile::new().unwrap();
+                write_posting_record(
+                    &mut file,
+                    Strategy::Trigram,
+                    b"abc",
+                    DocId::try_from(id).unwrap(),
+                )
+                .unwrap();
+                file.flush().unwrap();
+                file.into_temp_path()
+            })
+            .collect();
+        let collapsed = collapse_posting_runs(runs, Strategy::Trigram).unwrap();
+        assert!(collapsed.len() <= MAX_OPEN_POSTING_RUNS);
+        let mut ids = collapsed
+            .into_iter()
+            .flat_map(|path| {
+                let mut run = PostingRun {
+                    reader: BufReader::new(File::open(&path).unwrap()),
+                    strategy: Strategy::Trigram,
+                };
+                let mut ids = Vec::new();
+                while let Some((_, id)) = run.read_record().unwrap() {
+                    ids.push(id);
+                }
+                ids
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..DocId::try_from(MAX_OPEN_POSTING_RUNS * 4).unwrap()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn trigram_run_algorithms_are_byte_identical() {
         let documents = (0..257usize)
             .rev()
@@ -1397,12 +901,10 @@ mod tests {
                 (id, grams)
             })
             .collect::<Vec<_>>();
-        let mut radix = write_trigram_run_radix(documents.clone()).unwrap();
-        let mut merged = write_trigram_run_merge(documents).unwrap();
-        let mut radix_bytes = Vec::new();
-        let mut merged_bytes = Vec::new();
-        radix.read_to_end(&mut radix_bytes).unwrap();
-        merged.read_to_end(&mut merged_bytes).unwrap();
+        let radix = write_trigram_run_radix(documents.clone()).unwrap();
+        let merged = write_trigram_run_merge(documents).unwrap();
+        let radix_bytes = std::fs::read(radix).unwrap();
+        let merged_bytes = std::fs::read(merged).unwrap();
         assert_eq!(radix_bytes, merged_bytes);
     }
 
@@ -1624,6 +1126,37 @@ mod tests {
                 (1, bytes::Bytes::from_static(b"beta"))
             ]
         );
+    }
+
+    #[test]
+    fn local_large_sources_stay_file_backed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.log");
+        let expected = vec![b'x'; usize::try_from(LOCAL_BODY_MEMORY_LIMIT).unwrap() + 1];
+        std::fs::write(&path, &expected).unwrap();
+        let corpus = LocalCorpus::new(root.path()).unwrap();
+        let mut bodies = corpus.fetch_bodies(0..1).unwrap();
+        let (_, body) = bodies.pop().unwrap();
+        assert!(body.is_file());
+        assert_eq!(body.into_bytes().unwrap(), expected);
+
+        let source = &corpus.sources()[0];
+        let document = holys3_core::DocAddress {
+            display_key: source.key.clone(),
+            source_key: source.key.clone(),
+            source_version: source.version.clone(),
+            encoded_size: source.encoded_size,
+            encoding: SourceEncoding::Raw,
+            member_path: None,
+        };
+        LocalFetcher::new(1)
+            .unwrap()
+            .fetch_each(&[document], &mut |_, body| {
+                assert!(body.is_file());
+                assert_eq!(body.into_bytes()?, expected);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

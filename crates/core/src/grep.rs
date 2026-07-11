@@ -193,6 +193,28 @@ pub fn can_search_as_document(pattern: &str) -> anyhow::Result<bool> {
     Ok(!needs_line_isolation(&hir))
 }
 
+pub fn bounded_match_len(pattern: &str) -> anyhow::Result<Option<usize>> {
+    let hir = regex_syntax::ParserBuilder::new()
+        .utf8(false)
+        .build()
+        .parse(pattern)?;
+    if needs_line_isolation(&hir) || has_look(&hir) {
+        return Ok(None);
+    }
+    Ok(hir.properties().maximum_len())
+}
+
+fn has_look(hir: &regex_syntax::hir::Hir) -> bool {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        HirKind::Look(_) => true,
+        HirKind::Repetition(repetition) => has_look(&repetition.sub),
+        HirKind::Capture(capture) => has_look(&capture.sub),
+        HirKind::Concat(children) | HirKind::Alternation(children) => children.iter().any(has_look),
+        HirKind::Empty | HirKind::Literal(_) | HirKind::Class(_) => false,
+    }
+}
+
 fn needs_line_isolation(hir: &regex_syntax::hir::Hir) -> bool {
     use regex_syntax::hir::{Class, HirKind, Look};
     match hir.kind() {
@@ -405,5 +427,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn bounded_match_lengths_exclude_unbounded_and_contextual_patterns() {
+        assert_eq!(bounded_match_len("needle").unwrap(), Some(6));
+        assert_eq!(bounded_match_len("a{2,5}").unwrap(), Some(5));
+        assert_eq!(bounded_match_len("a+").unwrap(), None);
+        assert_eq!(bounded_match_len(r"\bword\b").unwrap(), None);
+        assert_eq!(bounded_match_len("^word").unwrap(), None);
+        assert_eq!(bounded_match_len("line\\nnext").unwrap(), None);
     }
 }

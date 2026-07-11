@@ -1,4 +1,4 @@
-use super::{content_version, Corpus, SourceObject};
+use super::{content_version, Corpus, SourceObject, StaleSource};
 use anyhow::Result;
 use bytes::Bytes;
 
@@ -37,7 +37,7 @@ impl crate::DocFetcher for MemCorpus {
     fn fetch_each(
         &self,
         documents: &[crate::DocAddress],
-        consume: &mut dyn FnMut(usize, Bytes) -> Result<()>,
+        consume: &mut dyn FnMut(usize, crate::DocumentBody) -> Result<()>,
     ) -> Result<()> {
         let mut groups = std::collections::BTreeMap::new();
         for (idx, document) in documents.iter().enumerate() {
@@ -46,12 +46,18 @@ impl crate::DocFetcher for MemCorpus {
                 .or_insert_with(Vec::new)
                 .push((idx, document.member_path.clone()));
         }
-        for ((key, _), requests) in groups {
+        for ((key, version), requests) in groups {
             let pos = self
                 .sources
                 .iter()
                 .position(|source| source.key == key)
                 .ok_or_else(|| anyhow::anyhow!("unknown key {key}"))?;
+            if self.sources[pos].version != version {
+                return Err(anyhow::Error::new(StaleSource {
+                    key,
+                    expected: version,
+                }));
+            }
             crate::decode_requested(
                 &key,
                 &requests,

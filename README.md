@@ -161,7 +161,7 @@ SigV4 implementation, tested against AWS signature vectors.
 4. Candidate physical sources stream through concurrent conditional GETs
    (`If-Match` against the indexed ETag), with adaptive AIMD concurrency,
    retries, request hedging, and a 512 MiB in-flight byte budget. Sources of
-   at least 64 MiB use four concurrent 16 MiB conditional ranges. One archive
+   at least 64 MiB use four concurrent streamed 8 MiB conditional ranges. One archive
    is fetched and decoded once even when many members are candidates. Sources
    are then regex-verified on a worker pool — results print as they complete,
    unordered across objects like rg's parallel mode, pipe-friendly
@@ -217,7 +217,13 @@ their same-run controls, validates exact end-to-end hit counts, indexes 25,000
 objects, and enforces hosted-run time plus a 300 MiB peak-RSS ceiling for
 high-cardinality and 256 MiB decoded workloads under both index strategies.
 Segment construction also enforces its cap on logical documents, including
-archive members, rather than only on physical source objects.
+archive members, rather than only on physical source objects. A separate 512
+MiB compressed-expansion gate caps trigram/sparse index and files-only search
+RSS at 96 MiB. A 512 MiB raw-object MinIO gate applies the same ceiling to S3
+indexing and files-only search with both strategies. A separate 64 MiB
+high-entropy gzip gate exercises ranged source download, streaming decode,
+bitmap-backed trigram construction, cold term-cache population, and mmap lookup
+under the same 96 MiB ceiling. Workspace line coverage is gated at 80%.
 
 <!-- BENCH:START -->
 | scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
@@ -243,9 +249,16 @@ from CI's `bench-micro` artifact so measurements stay on the same runner class.
   output) are detected and rejected loudly rather than decoded.
 - No multiline mode: patterns that would match across line boundaries are
   line-restricted exactly like rg without `-U`.
-- Decoding is in-memory. Expansion is capped at 64 GiB per physical source,
-  100,000 regular archive members, and four nested format layers; compressed
-  streams stop at the cap instead of allocating the complete expansion.
+- Decoded output above 8 MiB spills to private temporary files. Trigram indexing
+  and files-only bounded regex verification stream those files; sparse indexing
+  reads them through a bounded 1 MiB window. Expansion is capped at 64 GiB per
+  physical source, 100,000 regular archive members, and four nested format
+  layers.
+- Oversized local sources, S3 sources of at least 64 MiB, and large optional
+  object-cache entries remain file-backed through indexing and verification
+  instead of materializing the full body in memory. File-backed gzip, zstd,
+  bzip2, Snappy, Brotli, and zlib sources decode through bounded readers rather
+  than whole-source mappings.
 - A search that races segment garbage collection reopens the new index root
   once before emitting results. Continuous write churn can still require a
   manual rerun; no incorrect matches are returned.

@@ -1,9 +1,9 @@
-use crate::codec::{decode_source, DecodeSink, LogicalDocumentMeta, DECODE_LIMITS};
+use crate::codec::{decode_source, DecodeSink, DocumentBody, LogicalDocumentMeta, DECODE_LIMITS};
 use crate::grep::has_line_match;
 use anyhow::Result as AnyhowResult;
 use bytes::Bytes;
 use fs4::FileExt;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -42,12 +42,12 @@ impl std::fmt::Display for StaleSource {
 
 impl std::error::Error for StaleSource {}
 
-/// A source of documents for INDEX BUILDS, which need full enumeration.
+/// A source of objects for INDEX BUILDS, which need full enumeration.
 /// Implemented by a local dir (tests) and S3 (prod).
 pub trait Corpus {
-    /// All documents; a doc's id is its position in this slice.
+    /// All sources; a source's id is its position in this slice.
     fn sources(&self) -> &[SourceObject];
-    /// Fetch the full bytes of one document by position.
+    /// Fetch the full bytes of one source by position.
     fn fetch(&self, idx: usize) -> AnyhowResult<Bytes>;
     /// Fetch a contiguous run of docs concurrently. Result order is NOT
     /// guaranteed; each item carries its position. Implementations may
@@ -56,10 +56,16 @@ pub trait Corpus {
     fn fetch_many(&self, docs: Range<usize>) -> AnyhowResult<Vec<(usize, Bytes)>> {
         docs.map(|idx| Ok((idx, self.fetch(idx)?))).collect()
     }
+    fn fetch_bodies(&self, docs: Range<usize>) -> AnyhowResult<Vec<(usize, DocumentBody)>> {
+        self.fetch_many(docs)?
+            .into_iter()
+            .map(|(idx, bytes)| Ok((idx, DocumentBody::from_bytes(bytes))))
+            .collect()
+    }
 }
 
-/// Fetches documents by key for SEARCH verification — no enumeration, no
-/// doc table. `consume` receives the index into `keys` plus the body, as
+/// Fetches sources by key for SEARCH verification without enumeration.
+/// `consume` receives the index into `documents` plus the body, as
 /// fetches complete (order NOT guaranteed). Implementations may fetch
 /// concurrently and may skip vanished docs; the first `consume` error
 /// aborts the remaining fetches.
@@ -67,13 +73,46 @@ pub trait DocFetcher {
     fn fetch_each(
         &self,
         documents: &[DocAddress],
-        consume: &mut dyn FnMut(usize, Bytes) -> AnyhowResult<()>,
+        consume: &mut dyn FnMut(usize, DocumentBody) -> AnyhowResult<()>,
     ) -> AnyhowResult<()>;
 }
 
 pub trait BlobStore {
     fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()>;
     fn put_file(&self, name: &str, path: &Path) -> AnyhowResult<()>;
+    fn get_file(&self, name: &str, file: &mut std::fs::File, len: u64) -> AnyhowResult<()> {
+        const PART_SIZE: u64 = 8 * 1024 * 1024;
+        const PARTS_PER_BATCH: usize = 2;
+
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let mut start = 0u64;
+        while start < len {
+            let mut ranges = Vec::with_capacity(PARTS_PER_BATCH);
+            while ranges.len() < PARTS_PER_BATCH && start < len {
+                let part_len = PART_SIZE.min(len - start);
+                ranges.push((start, part_len));
+                start += part_len;
+            }
+            let parts = self.get_ranges(name, &ranges)?;
+            anyhow::ensure!(
+                parts.len() == ranges.len(),
+                "get_ranges returned {} blocks for {} ranges",
+                parts.len(),
+                ranges.len()
+            );
+            for ((_, expected), part) in ranges.into_iter().zip(parts) {
+                anyhow::ensure!(
+                    part.len() as u64 == expected,
+                    "blob range is {} bytes, expected {expected}",
+                    part.len()
+                );
+                file.write_all(&part)?;
+            }
+        }
+        file.flush()?;
+        Ok(())
+    }
     /// `Ok(None)` = blob does not exist. Transient store failures are `Err`
     /// so callers never mistake an outage for an empty store.
     fn get(&self, name: &str) -> AnyhowResult<Option<Vec<u8>>>;
@@ -183,6 +222,16 @@ impl BlobStore for LocalBlobStore {
         std::io::copy(&mut input, &mut temp)?;
         temp.as_file().sync_all()?;
         temp.persist(path).map_err(|err| err.error)?;
+        Ok(())
+    }
+
+    fn get_file(&self, name: &str, output: &mut std::fs::File, len: u64) -> AnyhowResult<()> {
+        let mut input = std::fs::File::open(self.root.join(name))?;
+        output.set_len(0)?;
+        output.seek(std::io::SeekFrom::Start(0))?;
+        let copied = std::io::copy(&mut input, output)?;
+        anyhow::ensure!(copied == len, "blob is {copied} bytes, expected {len}");
+        output.flush()?;
         Ok(())
     }
 
@@ -330,6 +379,8 @@ mod tests {
 
     #[test]
     fn local_blob_store_puts_files_atomically() -> AnyhowResult<()> {
+        use std::io::Read;
+
         let root = tempfile::tempdir()?;
         let mut source = tempfile::NamedTempFile::new()?;
         source.write_all(b"file-backed index blob")?;
@@ -340,6 +391,12 @@ mod tests {
             store.get("segments/a/postings.bin")?.as_deref(),
             Some(b"file-backed index blob".as_slice())
         );
+        let mut output = tempfile::tempfile()?;
+        store.get_file("segments/a/postings.bin", &mut output, 22)?;
+        output.seek(std::io::SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"file-backed index blob");
         Ok(())
     }
 
@@ -370,8 +427,8 @@ mod tests {
             },
         ];
         let mut seen = Vec::new();
-        c.fetch_each(&documents, &mut |idx, bytes| {
-            seen.push((idx, bytes));
+        c.fetch_each(&documents, &mut |idx, body| {
+            seen.push((idx, body.into_bytes()?));
             Ok(())
         })
         .unwrap();
@@ -383,6 +440,23 @@ mod tests {
                 (1, Bytes::from_static(b"one"))
             ]
         );
+    }
+
+    #[test]
+    fn doc_fetcher_rejects_stale_versions() {
+        let corpus = MemCorpus::new(vec!["a".into()], vec![b"current".to_vec()]);
+        let documents = vec![DocAddress {
+            display_key: "a".into(),
+            source_key: "a".into(),
+            source_version: "stale".into(),
+            encoded_size: 7,
+            encoding: crate::SourceEncoding::Raw,
+            member_path: None,
+        }];
+        let error = corpus
+            .fetch_each(&documents, &mut |_, _| Ok(()))
+            .unwrap_err();
+        assert!(error.is::<StaleSource>(), "{error:#}");
     }
 
     #[test]
