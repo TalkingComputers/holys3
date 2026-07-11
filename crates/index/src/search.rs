@@ -139,7 +139,6 @@ fn search_batch(
 
     let bytes_fetched = AtomicUsize::new(0);
     let hits: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, DocumentBody)>(workers * 2);
 
     let wants_matches = sink.wants_matches();
     let documents_ref = documents;
@@ -197,35 +196,47 @@ fn search_batch(
         Ok(())
     };
 
-    // One consumer thread drives the rayon pool over the channel. When any
-    // doc errors (Stop, sink error, panic), try_for_each short-circuits,
-    // the bridge drops `rx`, and the feeder's next blocking send fails —
-    // so the feeder can never deadlock against dead consumers.
-    let (feed_result, verify_result) = std::thread::scope(|scope| {
-        let consumer = scope.spawn(|| {
-            rx.into_iter().par_bridge().try_for_each_init(
-                || re.clone(),
-                |re, (idx, bytes)| {
-                    // map panics to errors so rayon short-circuits: queued
-                    // docs are discarded, not handed to a broken sink
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        verify(re, idx, bytes)
-                    }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")))
-                },
-            )
-        });
+    let verify_caught = |re: &regex::bytes::Regex, idx: usize, body: DocumentBody| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify(re, idx, body)))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")))
+    };
+
+    let (feed_result, verify_result) = if workers == 1 {
+        let mut verified = Ok(());
         let feed = fetcher.fetch_each(documents_ref, &mut |idx, body| {
             bytes_fetched.fetch_add(usize::try_from(body.len())?, Ordering::Relaxed);
-            tx.send((idx, body))
-                .map_err(|_| anyhow::Error::new(StopEarly))
+            match verify_caught(re, idx, body) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    verified = Err(error);
+                    Err(anyhow::Error::new(StopEarly))
+                }
+            }
         });
-        drop(tx);
-        let verified = consumer
-            .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")));
         (feed, verified)
-    });
+    } else {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, DocumentBody)>(workers * 2);
+        // One consumer thread drives the rayon pool over the channel. When any
+        // doc errors, the bridge drops `rx`, so the feeder cannot deadlock.
+        std::thread::scope(|scope| {
+            let consumer = scope.spawn(|| {
+                rx.into_iter().par_bridge().try_for_each_init(
+                    || re.clone(),
+                    |re, (idx, bytes)| verify_caught(re, idx, bytes),
+                )
+            });
+            let feed = fetcher.fetch_each(documents_ref, &mut |idx, body| {
+                bytes_fetched.fetch_add(usize::try_from(body.len())?, Ordering::Relaxed);
+                tx.send((idx, body))
+                    .map_err(|_| anyhow::Error::new(StopEarly))
+            });
+            drop(tx);
+            let verified = consumer
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")));
+            (feed, verified)
+        })
+    };
 
     let stopped = match verify_result {
         Err(err) if err.is::<StopEarly>() => {
@@ -487,6 +498,53 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn single_candidate_does_not_start_rayon_pool() {
+        const PROBE: &str = "HOLYS3_SINGLE_CANDIDATE_RAYON_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "search::tests::single_candidate_does_not_start_rayon_pool",
+                    "--test-threads=1",
+                ])
+                .env(PROBE, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let documents = [DocAddress {
+            display_key: "doc".into(),
+            source_key: "doc".into(),
+            source_version: "v1".into(),
+            encoded_size: 7,
+            encoding: SourceEncoding::Raw,
+            member_path: None,
+        }];
+        let fetcher = RecordingFetcher {
+            largest: AtomicUsize::new(0),
+        };
+        let re = regex::bytes::Regex::new("needle").unwrap();
+        let (hits, bytes, stopped) = search_batch(
+            &documents,
+            &fetcher,
+            &re,
+            true,
+            Some(6),
+            MatchOptions::default(),
+            &NullSink,
+        )
+        .unwrap();
+        assert_eq!(hits, ["doc"]);
+        assert_eq!(bytes, 7);
+        assert!(!stopped);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build_global()
+            .expect("single-candidate search initialized Rayon's global pool");
     }
 
     #[test]
