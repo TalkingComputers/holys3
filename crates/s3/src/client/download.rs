@@ -2,7 +2,7 @@ use super::{S3Client, S3Request, BYTE_PERMIT_SIZE, SMALL_READ_HEDGE, SMALL_READ_
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use holys3_core::{DocId, DocumentBody, DocumentSpool};
+use holys3_core::{DocId, DocumentBody, DocumentSpool, StaleSource};
 use reqwest::StatusCode;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -65,14 +65,34 @@ fn byte_range(start: u64, len: u64) -> Result<(u64, u64)> {
     ))
 }
 
+fn check_range_version(
+    expected: &mut Option<String>,
+    fetched: Option<String>,
+    bucket: &str,
+    key: &str,
+) -> Result<()> {
+    let fetched = fetched.with_context(|| format!("range GET s3://{bucket}/{key}: no ETag"))?;
+    match expected {
+        Some(expected) if expected != &fetched => {
+            return Err(anyhow::Error::new(StaleSource {
+                key: key.to_owned(),
+                expected: expected.clone(),
+            }));
+        }
+        Some(_) => {}
+        None => *expected = Some(fetched),
+    }
+    Ok(())
+}
+
 impl S3Client {
-    pub(super) async fn fetch_hedged(
+    async fn fetch_hedged_version(
         &self,
         bucket: &str,
         key: &str,
         range: Option<(u64, u64)>,
         etag: Option<&str>,
-    ) -> Result<Option<DocumentBody>> {
+    ) -> Result<Option<(DocumentBody, Option<String>)>> {
         let hedge_after = match range {
             Some((start, end)) if end.saturating_sub(start) < SMALL_READ_MAX => {
                 SMALL_READ_HEDGE.min(self.0.cfg.hedge_after)
@@ -112,7 +132,7 @@ impl S3Client {
                 }
             }
         };
-        let Some((status, _, body)) = result? else {
+        let Some((status, version, body)) = result? else {
             return Ok(None);
         };
         if let Some((start, end)) = range {
@@ -127,25 +147,20 @@ impl S3Client {
                 body.len()
             );
         }
-        Ok(Some(body))
+        Ok(Some((body, version)))
     }
 
-    async fn head_etag(&self, bucket: &str, key: &str) -> Result<Option<String>> {
-        let request = S3Request {
-            method: "HEAD",
-            bucket,
-            key: Some(key),
-            canonical_query: "",
-            range: None,
-            body: None,
-            precondition: None,
-        };
-        let Some((_, etag, _)) = self.send_resilient(&request, None).await? else {
-            return Ok(None);
-        };
-        Ok(Some(etag.with_context(|| {
-            format!("HEAD s3://{bucket}/{key}: no ETag")
-        })?))
+    pub(super) async fn fetch_hedged(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<(u64, u64)>,
+        etag: Option<&str>,
+    ) -> Result<Option<DocumentBody>> {
+        Ok(self
+            .fetch_hedged_version(bucket, key, range, etag)
+            .await?
+            .map(|(body, _)| body))
     }
 
     async fn fetch_source_parts(
@@ -163,6 +178,7 @@ impl S3Client {
             "source range part size must be greater than 0"
         );
         let parts = size.div_ceil(part_size);
+        let mut version = None;
         let mut fetches = stream::iter((0..parts).map(|part| async move {
             let start = part
                 .checked_mul(part_size)
@@ -172,15 +188,20 @@ impl S3Client {
                     .context("source range starts after object end")?,
             );
             let range = byte_range(start, len)?;
-            let bytes = self.fetch_hedged(bucket, key, Some(range), etag).await?;
-            Ok::<_, anyhow::Error>((start, bytes))
+            let response = self
+                .fetch_hedged_version(bucket, key, Some(range), etag)
+                .await?;
+            Ok::<_, anyhow::Error>((start, response))
         }))
         .buffer_unordered(SOURCE_RANGE_CONCURRENCY.min(self.0.cfg.cap));
         while let Some(result) = fetches.next().await {
-            let (start, part) = result?;
-            let Some(part) = part else {
+            let (start, response) = result?;
+            let Some((part, fetched_version)) = response else {
                 return Ok(false);
             };
+            if parts > 1 && etag.is_none() {
+                check_range_version(&mut version, fetched_version, bucket, key)?;
+            }
             consume(start, part)?;
         }
         Ok(true)
@@ -269,19 +290,11 @@ impl S3Client {
             anyhow::ensure!(body.is_empty(), "S3 object length changed while copying");
             output.set_len(0)?;
         } else {
-            let etag = if size > SOURCE_RANGE_SIZE {
-                let Some(etag) = self.0.rt.block_on(self.head_etag(bucket, key))? else {
-                    return Ok(false);
-                };
-                Some(etag)
-            } else {
-                None
-            };
             output.set_len(size)?;
             let found = self.0.rt.block_on(self.fetch_source_parts(
                 bucket,
                 key,
-                etag.as_deref(),
+                None,
                 size,
                 SOURCE_RANGE_SIZE,
                 &mut |start, part| {
@@ -336,20 +349,29 @@ impl S3Client {
         let merged = &coalesced.ranges;
         let blobs = self.0.rt.block_on(async {
             let mut blobs: Vec<Option<Bytes>> = vec![None; merged.len()];
+            let mut version = None;
             let mut fetches = stream::iter(merged.iter().enumerate().map(
                 |(index, &(start, len))| async move {
                     let range = byte_range(start, len)?;
-                    let body = self.fetch_hedged(bucket, key, Some(range), None).await?;
-                    let bytes = body.map(DocumentBody::into_bytes).transpose()?;
-                    Ok::<_, anyhow::Error>((index, bytes))
+                    let response = self
+                        .fetch_hedged_version(bucket, key, Some(range), None)
+                        .await?;
+                    let (body, version) = match response {
+                        Some((body, version)) => (Some(body.into_bytes()?), version),
+                        None => (None, None),
+                    };
+                    Ok::<_, anyhow::Error>((index, body, version))
                 },
             ))
             .buffer_unordered(self.0.cfg.cap);
             while let Some(result) = fetches.next().await {
-                let (index, bytes) = result?;
+                let (index, bytes, fetched_version) = result?;
                 match bytes {
                     Some(bytes) => blobs[index] = Some(bytes),
                     None => return Ok(None),
+                }
+                if merged.len() > 1 {
+                    check_range_version(&mut version, fetched_version, bucket, key)?;
                 }
             }
             drop(fetches);
