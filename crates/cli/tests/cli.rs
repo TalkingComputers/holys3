@@ -46,6 +46,66 @@ fn holys3() -> Command {
     Command::cargo_bin("holys3").unwrap()
 }
 
+#[test]
+fn index_watch_flags_are_paired() {
+    let target = tempfile::tempdir().unwrap();
+    holys3()
+        .arg("index")
+        .arg(target.path())
+        .arg("--watch")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--interval"));
+    holys3()
+        .arg("index")
+        .arg(target.path())
+        .args(["--interval", "1"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--watch"));
+    holys3()
+        .arg("index")
+        .arg(target.path())
+        .args(["--watch", "--interval", "0"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("greater than 0"));
+}
+
+#[test]
+fn index_json_reports_update() {
+    let target = tempfile::tempdir().unwrap();
+    let index = tempfile::tempdir().unwrap();
+    std::fs::write(target.path().join("event.log"), "needle\n").unwrap();
+    let output = holys3()
+        .arg("index")
+        .arg(target.path())
+        .arg("--out")
+        .arg(index.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let lines = String::from_utf8(output.stdout).unwrap();
+    let events = lines
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    let event = events.first().unwrap().as_object().unwrap();
+    assert_eq!(event.len(), 10);
+    assert_eq!(event["type"], "indexed");
+    assert_eq!(event["cycle"], 1);
+    assert_eq!(event["target"], target.path().to_str().unwrap());
+    assert!(event["duration_ms"].as_u64().is_some());
+    assert_eq!(event["added"], 1);
+    assert_eq!(event["removed"], 0);
+    assert_eq!(event["total_docs"], 1);
+    assert_eq!(event["segments"], 1);
+    assert_eq!(event["compacted"], false);
+    assert_eq!(event["up_to_date"], false);
+}
+
 fn search(c: &Corpus) -> Command {
     let mut cmd = holys3();
     cmd.arg("ERROR")

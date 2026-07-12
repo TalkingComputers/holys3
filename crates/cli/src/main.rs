@@ -22,6 +22,7 @@ use holys3_s3::{
 use scope::Scope;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -58,6 +59,18 @@ enum Cmd {
         /// Ignore any existing index and re-ingest everything.
         #[arg(long)]
         rebuild: bool,
+        #[arg(long, requires = "interval", help = "Continuously update the index")]
+        watch: bool,
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            requires = "watch",
+            value_parser = parse_positive_u64,
+            help = "Wait SECONDS after each index attempt"
+        )]
+        interval: Option<u64>,
+        #[arg(long, help = "Emit one JSON status object per line")]
+        json: bool,
         #[command(flatten)]
         connect: ConnectArgs,
     },
@@ -332,7 +345,12 @@ fn build_local_key_prefix(dir: &Path) -> Result<String> {
     Ok(prefix)
 }
 
-fn build_local(dir: &Path, out: &Path, strategy: Strategy, rebuild: bool) -> Result<()> {
+fn build_local(
+    dir: &Path,
+    out: &Path,
+    strategy: Strategy,
+    rebuild: bool,
+) -> Result<index::IndexResult> {
     // Canonical target root: `./logs` and `logs` must produce identical
     // index keys, or invocation spelling would churn the incremental diff.
     let dir = std::fs::canonicalize(dir)?;
@@ -349,25 +367,10 @@ fn build_local(dir: &Path, out: &Path, strategy: Strategy, rebuild: bool) -> Res
     let report = update_index(&store, &cache_dir, strategy, &listing, rebuild, &|shard| {
         Ok(Box::new(LocalCorpus::from_listing(shard)))
     })?;
-    if report.up_to_date {
-        eprintln!(
-            "index up to date: {} docs in {} segments at {}",
-            report.total_docs,
-            report.segments,
-            out.display()
-        );
-    } else {
-        eprintln!(
-            "indexed +{} -{} -> {} docs in {} segments{} at {}",
-            report.added,
-            report.removed,
-            report.total_docs,
-            report.segments,
-            if report.compacted { " (compacted)" } else { "" },
-            out.display()
-        );
-    }
-    Ok(())
+    Ok(index::IndexResult {
+        report,
+        location: out.display().to_string(),
+    })
 }
 
 fn list_user_objects(src: &S3Source) -> Result<Vec<ObjectMeta>> {
@@ -379,10 +382,10 @@ fn list_user_objects(src: &S3Source) -> Result<Vec<ObjectMeta>> {
         .collect())
 }
 
-fn build_s3(src: S3Source, strategy: Strategy, rebuild: bool) -> Result<()> {
+fn build_s3(src: &S3Source, strategy: Strategy, rebuild: bool) -> Result<index::IndexResult> {
     // Real sizes ride the listing so the build bounds its fetch chunks by
     // bytes, not just doc count — a bucket of huge objects must not OOM.
-    let listing = list_user_objects(&src)?
+    let listing = list_user_objects(src)?
         .into_iter()
         .map(|object| (object.key, object.etag, object.size))
         .collect::<Vec<_>>();
@@ -398,23 +401,10 @@ fn build_s3(src: S3Source, strategy: Strategy, rebuild: bool) -> Result<()> {
         )))
     })?;
     let namespace = build_index_namespace(&src.prefix);
-    if report.up_to_date {
-        eprintln!(
-            "index up to date: {} docs in {} segments at s3://{}/{namespace}",
-            report.total_docs, report.segments, src.bucket
-        );
-    } else {
-        eprintln!(
-            "indexed +{} -{} -> {} docs in {} segments{} at s3://{}/{namespace}",
-            report.added,
-            report.removed,
-            report.total_docs,
-            report.segments,
-            if report.compacted { " (compacted)" } else { "" },
-            src.bucket
-        );
-    }
-    Ok(())
+    Ok(index::IndexResult {
+        report,
+        location: format!("s3://{}/{namespace}", src.bucket),
+    })
 }
 
 /// Run one search against the opened source. Scope filtering, the optional
@@ -632,16 +622,31 @@ fn run() -> Result<bool> {
             out,
             strategy,
             rebuild,
+            watch: _,
+            interval,
+            json,
             connect,
         }) => {
+            let interval = interval.map(Duration::from_secs);
+            let strategy = strategy.into();
+            let config = index::IndexConfig {
+                target: &target,
+                interval,
+                rebuild,
+                json,
+            };
             match open_source(parse_target(&target)?, &connect)? {
-                Source::Local(dir) => build_local(&dir, &out, strategy.into(), rebuild)?,
+                Source::Local(dir) => index::run_index(config, |cycle_rebuild| {
+                    build_local(&dir, &out, strategy, cycle_rebuild)
+                })?,
                 Source::S3(src) => {
                     anyhow::ensure!(
                         out == Path::new("holys3.idxdir"),
                         "--out only applies to local targets"
                     );
-                    build_s3(src, strategy.into(), rebuild)?;
+                    index::run_index(config, |cycle_rebuild| {
+                        build_s3(&src, strategy, cycle_rebuild)
+                    })?;
                 }
             }
             Ok(true)
