@@ -11,9 +11,9 @@ use std::ops::Range;
 pub(crate) const PACK_BLOCK_BYTES: usize = 128 * 1024;
 pub(crate) const PACK_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 const RANGE_BYTES: u64 = 8 * 1024 * 1024;
-const WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+const LARGE_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
+const WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 const WINDOW_DOCUMENTS: usize = 1024;
-const LARGE_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PackSlice {
@@ -356,6 +356,10 @@ fn run_batches(runs: &[PackRun], max_bytes: u64) -> impl Iterator<Item = Range<u
     })
 }
 
+fn is_large_request(request: &PackRequest) -> bool {
+    request.decoded_size >= LARGE_DOCUMENT_BYTES
+}
+
 fn fetch_window(
     store: &dyn BlobStore,
     packs: &[PackMeta],
@@ -378,7 +382,7 @@ fn fetch_window(
         packs,
         blocks,
         &runs,
-        u64::MAX,
+        RANGE_BYTES,
         &mut |block_id, bytes| {
             decoded.insert(block_id, bytes::Bytes::from(bytes));
             Ok(())
@@ -449,7 +453,7 @@ fn fetch_large(
         packs,
         blocks,
         &runs,
-        LARGE_BATCH_BYTES,
+        RANGE_BYTES,
         &mut |_block_id, decoded| {
             let available = decoded
                 .len()
@@ -475,7 +479,7 @@ pub(crate) fn fetch_documents(
     consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
 ) -> Result<()> {
     for window in request_windows(requests) {
-        if window.len() == 1 && requests[window.start].decoded_size > WINDOW_BYTES {
+        if window.len() == 1 && is_large_request(&requests[window.start]) {
             fetch_large(store, packs, blocks, &requests[window.start], consume)?;
         } else {
             fetch_window(store, packs, blocks, &requests[window], consume)?;
@@ -493,12 +497,18 @@ pub(crate) fn request_windows(requests: &[PackRequest]) -> impl Iterator<Item = 
         let mut end = start;
         let mut bytes = 0u64;
         while end < requests.len() && end - start < WINDOW_DOCUMENTS {
-            let next = requests[end].decoded_size;
-            if end > start && next > WINDOW_BYTES.saturating_sub(bytes) {
+            let request = &requests[end];
+            let next = request.decoded_size;
+            if end > start
+                && (is_large_request(request) || next > WINDOW_BYTES.saturating_sub(bytes))
+            {
                 break;
             }
             bytes = bytes.saturating_add(next);
             end += 1;
+            if is_large_request(request) {
+                break;
+            }
         }
         let window = start..end;
         start = end;
@@ -645,6 +655,38 @@ mod tests {
         assert_eq!(run_batches(&runs, 8).collect::<Vec<_>>(), [0..2, 2..3]);
         assert_eq!(
             run_batches(&runs, 3).collect::<Vec<_>>(),
+            [0..1, 1..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn treats_sixteen_mib_as_a_large_document() {
+        let request = PackRequest {
+            index: 0,
+            slice: PackSlice {
+                first_block: 0,
+                block_offset: 0,
+            },
+            decoded_size: 16 * 1024 * 1024,
+        };
+
+        assert!(is_large_request(&request));
+    }
+
+    #[test]
+    fn isolates_large_documents_from_request_windows() {
+        let sizes = [1, 16 * 1024 * 1024, 1];
+        let requests = sizes.map(|decoded_size| PackRequest {
+            index: 0,
+            slice: PackSlice {
+                first_block: 0,
+                block_offset: 0,
+            },
+            decoded_size,
+        });
+
+        assert_eq!(
+            request_windows(&requests).collect::<Vec<_>>(),
             [0..1, 1..2, 2..3]
         );
     }

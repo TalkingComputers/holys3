@@ -5,11 +5,40 @@ use super::{
 use anyhow::{Context, Result};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_smithy_types::byte_stream::Length;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use std::io::SeekFrom;
-use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::path::{Path, PathBuf};
+
+const FILE_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
+
+#[derive(Clone)]
+enum PartSource {
+    Bytes(Bytes),
+    File { path: PathBuf, start: u64, len: u64 },
+}
+
+impl PartSource {
+    fn count_bytes(&self) -> Result<usize> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes.len()),
+            Self::File { len, .. } => Ok(usize::try_from(*len)?),
+        }
+    }
+
+    async fn build_stream(&self) -> Result<ByteStream> {
+        match self {
+            Self::Bytes(bytes) => Ok(ByteStream::from(bytes.clone())),
+            Self::File { path, start, len } => Ok(ByteStream::read_from()
+                .path(path)
+                .offset(*start)
+                .length(Length::Exact(*len))
+                .buffer_size(FILE_STREAM_BUFFER_SIZE)
+                .build()
+                .await?),
+        }
+    }
+}
 
 impl S3Client {
     pub fn put(&self, bucket: &str, key: &str, body: &[u8]) -> Result<()> {
@@ -172,7 +201,7 @@ impl S3Client {
                     key,
                     upload_id,
                     number,
-                    Bytes::copy_from_slice(chunk),
+                    PartSource::Bytes(Bytes::copy_from_slice(chunk)),
                 )
                 .await
             },
@@ -201,17 +230,17 @@ impl S3Client {
             let path = path.to_path_buf();
             async move {
                 let start = part_index * part_len;
-                let read_len = usize::try_from((len - start).min(part_len))?;
-                let mut body = vec![0u8; read_len];
-                let mut file = tokio::fs::File::open(path).await?;
-                file.seek(SeekFrom::Start(start)).await?;
-                file.read_exact(&mut body).await?;
+                let read_len = (len - start).min(part_len);
                 self.upload_part(
                     bucket,
                     key,
                     upload_id,
                     i32::try_from(part_index + 1)?,
-                    Bytes::from(body),
+                    PartSource::File {
+                        path,
+                        start,
+                        len: read_len,
+                    },
                 )
                 .await
             }
@@ -231,23 +260,28 @@ impl S3Client {
         key: &str,
         upload_id: &str,
         number: i32,
-        body: Bytes,
+        source: PartSource,
     ) -> Result<CompletedPart> {
         let label = format!("upload part {number} of s3://{bucket}/{key}");
-        let body_len = body.len();
+        let deadline = upload_deadline(source.count_bytes()?);
         let output = self
             .run_resilient(&label, None, || {
-                let request = self
-                    .0
-                    .upload_sdk
-                    .upload_part()
-                    .bucket(bucket)
-                    .key(key)
-                    .upload_id(upload_id)
-                    .part_number(number)
-                    .body(ByteStream::from(body.clone()));
+                let source = source.clone();
                 async move {
-                    match tokio::time::timeout(upload_deadline(body_len), request.send()).await {
+                    let body = match source.build_stream().await {
+                        Ok(body) => body,
+                        Err(error) => return Outcome::Fatal(error),
+                    };
+                    let request = self
+                        .0
+                        .upload_sdk
+                        .upload_part()
+                        .bucket(bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .part_number(number)
+                        .body(body);
+                    match tokio::time::timeout(deadline, request.send()).await {
                         Ok(Ok(output)) => Outcome::Success(output),
                         Ok(Err(error)) => classify_sdk_error(error),
                         Err(error) => Outcome::Transient(error.into()),
