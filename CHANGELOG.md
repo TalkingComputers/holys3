@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-12
+
 ### Added
 
 - Dual MIT OR Apache-2.0 licensing.

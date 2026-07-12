@@ -71,6 +71,7 @@ jobs:
     outputs:
       releases: ${{ steps.release.outputs.releases }}
       releases_created: ${{ steps.release.outputs.releases_created }}
+      release_tag: ${{ steps.release-tag.outputs.tag }}
     permissions:
       contents: write
       id-token: write
@@ -90,51 +91,22 @@ jobs:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select release tag
+        id: release-tag
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: |
+          tag="$(jq -r 'first(.[] | select(.package_name == "holys3") | .tag) // empty' <<< "$RELEASES")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   release-assets:
-    if: needs.release-plz-release.outputs.releases_created == 'true'
+    if: needs.release-plz-release.outputs.release_tag != ''
     needs: release-plz-release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
     permissions:
       attestations: write
       contents: write
       id-token: write
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          persist-credentials: false
-      - id: upload
-        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
-        with:
-          bin: holys3
-          target: ${{ matrix.target }}
-          ref: refs/tags/${{ fromJSON(needs.release-plz-release.outputs.releases)[0].tag }}
-          tar: unix
-          zip: windows
-          checksum: sha256
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Attest Unix archive
-        if: runner.os != 'Windows'
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
-        with:
-          subject-path: ${{ steps.upload.outputs.tar }}
-      - name: Attest Windows archive
-        if: runner.os == 'Windows'
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
-        with:
-          subject-path: ${{ steps.upload.outputs.zip }}
+    uses: ./.github/workflows/release-assets.yml
+    with:
+      tag: ${{ needs.release-plz-release.outputs.release_tag }}
