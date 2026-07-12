@@ -170,11 +170,9 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
     let mut expected_hits = churn_paths
         .iter()
         .map(|path| {
-            let canonical = std::fs::canonicalize(path)
-                .with_context(|| format!("canonicalizing churn source {}", path.display()))?;
-            Ok(canonical
+            Ok(path
                 .to_str()
-                .with_context(|| format!("churn source is not UTF-8: {}", canonical.display()))?
+                .with_context(|| format!("churn source is not UTF-8: {}", path.display()))?
                 .replace('\\', "/"))
         })
         .collect::<Result<Vec<_>>>()?;
