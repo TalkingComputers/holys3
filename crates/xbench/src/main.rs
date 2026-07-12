@@ -1,3 +1,4 @@
+mod churn;
 mod gen;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -66,6 +67,12 @@ enum Command {
     Render {
         #[arg(long)]
         input: PathBuf,
+    },
+    Churn {
+        #[arg(long)]
+        cycles: usize,
+        #[arg(long)]
+        changes: usize,
     },
 }
 
@@ -158,6 +165,11 @@ fn main() -> Result<()> {
         } => run(&scenarios, iterations, warmup, concurrency),
         Command::Compare { base, candidate } => compare(&base, &candidate),
         Command::Render { input } => render(&input),
+        Command::Churn { cycles, changes } => {
+            let summary = churn::run(cycles, changes)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(())
+        }
     }
 }
 
@@ -484,7 +496,7 @@ fn measure_search(
     })
 }
 
-fn percentile_ms(values: &[Duration], percentile: usize) -> f64 {
+pub(crate) fn percentile_ms(values: &[Duration], percentile: usize) -> f64 {
     let len = values.len();
     let index = len
         .saturating_mul(percentile)

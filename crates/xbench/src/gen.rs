@@ -73,6 +73,10 @@ pub(crate) fn latest_run_path() -> PathBuf {
     reports_dir().join("latest.json")
 }
 
+pub(crate) fn churn_run_path() -> PathBuf {
+    reports_dir().join("churn.json")
+}
+
 pub(crate) fn read_manifest() -> Result<SeedManifest> {
     let file = std::fs::File::open(manifest_path())?;
     Ok(serde_json::from_reader(file)?)
