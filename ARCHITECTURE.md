@@ -60,4 +60,4 @@ S3 sources default to index data under `.holys3/` or `<prefix>/.holys3/` in the 
 
 ### Reader consistency
 
-The root swap is atomic and concurrent writers use compare-and-swap. Format 11 binds the root to its source identity and records the length and SHA-256 digest of each immutable FST, postings, document table, and content pack. Garbage collection runs after the root swap; readers detect a missing old segment or pack as an `IndexChanged` error, and the CLI reopens the new root once before emitting any result.
+The root swap is atomic and concurrent writers use compare-and-swap. Format 11 binds the root to its source identity and records the length and SHA-256 digest of each immutable FST, postings, document table, and content pack. Garbage collection runs after the root swap; readers detect a missing old segment or pack as an `IndexChanged` error. The CLI reopens once if this happens before candidate processing; after result batches begin, it errors and may have emitted partial valid output.

@@ -2,7 +2,6 @@
 
 > [!NOTE]
 > Historical planning record from 2026-07-11. It does not describe the current CLI or architecture. See [README](../../../README.md), [Architecture](../../../ARCHITECTURE.md), and [Changelog](../../../CHANGELOG.md).
-
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add provider-neutral continuous indexing with strict status events, graceful termination, post-start retries, crash-consistency coverage, and deterministic churn performance gates.
