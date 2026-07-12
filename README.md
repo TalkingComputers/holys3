@@ -51,6 +51,7 @@ attestations. Verify an archive with
 # S3, with an `aws sso login` session — holys3 reads SSO profiles directly
 AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2
 AWS_PROFILE=my-sso holys3 'level":"ERROR' s3://my-log-bucket/prod --region us-east-2
+AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2 --watch --interval 30
 
 # rg-style flags work
 holys3 'req-[0-9a-f]+' s3://my-log-bucket --json | jq .
@@ -59,6 +60,7 @@ holys3 -w -F 'foo(' s3://my-code-bucket -l
 # local directories work too
 holys3 index ./logs --out holys3.idxdir
 holys3 'TODO|FIXME' ./logs --index holys3.idxdir
+holys3 index ./logs --out holys3.idxdir --watch --interval 30
 ```
 
 The CLI follows ripgrep: `holys3 PATTERN TARGET`, where TARGET is
@@ -183,7 +185,15 @@ blobs upload as concurrent multipart parts. Every immutable segment blob has
 its own SHA-256 length/hash contract; readers reject truncation, corruption,
 duplicate segment IDs, and malformed metadata before using it.
 
-Local directories use the same format-8 physical-source/logical-document
+`--watch --interval SECONDS` repeats the same listing, diff, and atomic root
+swap without overlapping cycles; the interval starts after each attempt. A
+startup failure exits, while failures after the first successful cycle are
+reported and retried. `--rebuild` applies only to cycle 1. SIGINT, SIGTERM,
+SIGHUP, Ctrl-C, and Ctrl-Break finish any active cycle and stop cleanly.
+`--json` emits tagged `indexed`, `error`, and `stopped` JSON Lines on stdout;
+lower-layer notes and warnings remain on stderr.
+
+Local directories use the same format-9 physical-source/logical-document
 tables, written to `--out` (default `holys3.idxdir`) with BLAKE3 content
 freshness tokens. Local verification rechecks the token, local runs are
 incremental, and `--rebuild` re-ingests everything. Raw candidate files are
@@ -217,6 +227,9 @@ unbaselined microbenchmarks and hybrid sort paths more than 15% slower than
 their same-run controls, validates exact end-to-end hit counts, indexes 25,000
 objects, and enforces hosted-run time plus a 300 MiB peak-RSS ceiling for
 high-cardinality and 256 MiB decoded workloads under both index strategies.
+The scale job also replaces 250 of 25,000 objects per cycle for ten cycles and
+requires listing p95 at or below 2 seconds, update p95 at or below 5 seconds,
+exact additions/deletions, and churn peak RSS at or below 300 MiB.
 Segment construction also enforces its cap on logical documents, including
 archive members, rather than only on physical source objects. A separate 512
 MiB compressed-expansion gate caps trigram/sparse index and files-only search
@@ -264,9 +277,11 @@ reference. Refresh it only from CI's `bench-micro` artifact.
 - A search that races segment garbage collection reopens the new index root
   once before emitting results. Continuous write churn can still require a
   manual rerun; no incorrect matches are returned.
-- Concurrent `holys3 index` runs over one prefix are safe (the loser errors
-  cleanly and retries), but the design assumes occasional writers, not a
-  write-heavy pipeline.
+- Continuous indexing polls after each completed cycle; it does not consume
+  bucket notifications, daemonize itself, or install a system service.
+- Concurrent `holys3 index` runs over one prefix are safe. A losing one-shot
+  writer errors cleanly; watched mode retries only after an earlier successful
+  cycle. The design assumes occasional writers, not a write-heavy pipeline.
 - AWS general-purpose buckets and S3-compatible endpoints are supported. S3
   Express directory buckets require zonal endpoints and session credentials
   and are not yet supported.

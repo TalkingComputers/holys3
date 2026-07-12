@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Added
+
+- Continuous local and S3 indexing with paired `--watch --interval SECONDS` controls, graceful signal shutdown, and fail-fast startup followed by retry after a successful cycle.
+- Machine-readable `indexed`, `error`, and `stopped` JSON Lines for one-shot and watched indexing.
+- Deterministic incremental churn benchmarks and CI gates over 25,000 objects for listing latency, update latency, exact cardinality, and peak memory.
+
 ## [0.4.0] - 2026-07-12
 
 ### Added
@@ -22,7 +28,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 - README now documents the actual `index`, `search`, and `stats` CLI surface.
 - Index construction uses bounded external posting runs; large trigram and sparse inputs no longer materialize corpus-wide posting maps.
-- Index format 8 separates physical source identity from logical searchable documents and authenticates every immutable segment blob with its own length and SHA-256 digest.
+- Index format 9 separates physical source identity from logical searchable documents and authenticates every immutable segment blob with its own length and SHA-256 digest.
 - Local freshness uses parallel BLAKE3 content tokens, and local index writes use advisory locks plus atomic replacement.
 - S3 prefix, XML, multipart, retry, addressing, redirect, and credential handling now fail loudly on malformed or ambiguous protocol state.
 - Search and index bodies use shared `Bytes` ownership; match lines are zero-copy slices and S3 source concurrency is byte-bounded.
@@ -39,4 +45,4 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - High-cardinality trigram files stream fixed-size bitmaps directly into posting runs, avoiding flattened radix allocations.
 - File-backed gzip, zstd, bzip2, Snappy, Brotli, and zlib sources decode through bounded readers instead of scanning whole-source mappings.
 - Segment sharding enforces its limit on decoded logical documents, including archive members, and compaction arithmetic is overflow-safe.
-- Workspace version is now 0.4.0 because index format 8 and the expanded library APIs intentionally break compatibility with 0.3.0.
+- Workspace version is now 0.4.0 because index format 9 and the expanded library APIs intentionally break compatibility with 0.3.0.

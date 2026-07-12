@@ -14,6 +14,8 @@ The main boundary is IO. `holys3-core`, `holys3-query`, `holys3-index`, and `hol
 
 `holys3 index <DIR>` is the same pipeline over a local blob store rooted at `--out`: it walks the canonicalized directory, computes BLAKE3 content tokens, and runs the identical incremental diff — there is exactly one index format.
 
+`--watch --interval SECONDS` opens the target once, retains one refreshing S3 client when applicable, and serializes fresh listing/diff/CAS cycles through the same pipeline. The interval begins after an attempt completes. Continuous mode adds no daemon database, event-consumer path, or second index transaction.
+
 ### Search pipeline
 
 `holys3 <PATTERN> <DIR> --index ...` opens the segmented index in the local index directory, plans a gram query from the regex (prefix, suffix, AND inner literals), reads candidate ids, fetches local files, and renders rg-style verified results.
@@ -51,6 +53,8 @@ SigV4 changes are gated by deterministic AWS signature-vector tests. Signing sho
 ### Error handling
 
 Fallible boundaries return `anyhow::Result`. Format checks use explicit validation before trusting stored metadata. Environment variables are read at the CLI or credential boundary and fail loudly when required values are missing.
+
+Continuous indexing fails its first cycle so invalid targets, credentials, and index state cannot become a silently unhealthy process. After one successful cycle, later errors are emitted and retried after the configured interval. `--rebuild` is passed only to cycle 1. A stop signal interrupts the wait or lets an active cycle reach the atomic root-swap boundary before clean exit.
 
 ### The index lives in the bucket
 
