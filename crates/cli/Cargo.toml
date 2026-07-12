@@ -8,9 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
-description = "Indexed regex search for local files and private S3 buckets"
+description = "Indexed regex search for private S3 buckets"
 keywords = ["s3", "grep", "regex", "search", "trigram"]
-categories = ["command-line-utilities", "text-processing", "filesystem"]
+categories = ["command-line-utilities", "text-processing"]
 readme = "../../README.md"
 
 [[bin]]
@@ -35,9 +35,6 @@ termcolor = "1.4.1"
 time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
-assert_cmd = "2.2.2"
-holys3-core = { path = "../core", version = "0.6.0", features = ["testutil"] }
-predicates = "3.1.4"
 tempfile = "3.27.0"
 
 [lints]

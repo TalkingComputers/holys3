@@ -64,16 +64,11 @@ AWS_PROFILE=my-sso holys3 'level":"ERROR' s3://my-log-bucket/prod --region us-ea
 # rg-style flags work
 holys3 'req-[0-9a-f]+' s3://my-log-bucket --json | jq .
 holys3 -w -F 'foo(' s3://my-code-bucket -l
-
-# local directories work too
-holys3 index ./logs --index holys3.idxdir
-holys3 'TODO|FIXME' ./logs --index holys3.idxdir
-holys3 index ./logs --index holys3.idxdir --watch --interval 30
 ```
 
 The CLI follows ripgrep: `holys3 PATTERN TARGET`, where TARGET is
-`s3://bucket[/prefix]` or a local path. To search for a pattern named like a
-subcommand, use `-e`: `holys3 -e index s3://bucket`.
+`s3://bucket[/prefix]`. To search for a pattern named like a subcommand, use
+`-e`: `holys3 -e index s3://bucket`.
 
 ## What's supported
 
@@ -143,9 +138,8 @@ match the line terminator, and a literal `\n` in a pattern is an error.
   time scoping never silently hides data.
 - `--region`, `--endpoint` (MinIO, R2, any S3-compatible store),
   `--concurrency` (default 750)
-- `--index LOCATION` — local path or `s3://bucket/prefix`; S3 defaults to
-  `<source-prefix>/.holys3` in the source bucket and local defaults to
-  `holys3.idxdir`
+- `--index LOCATION` — `s3://bucket/prefix`; omitted defaults to
+  `<source-prefix>/.holys3` in the source bucket
 - `--index-region`, `--index-endpoint` — connection overrides for an S3 index
   in a different region or service
 
@@ -199,10 +193,10 @@ during compaction, or when `--purge-deleted` is supplied. Fully dead segments
 are removed without rereading their packs. `--rebuild` also removes all stale
 snapshot bytes. Searches never fall back to mutable source objects.
 
-The root records the indexed local directory or S3 endpoint, bucket, and
-prefix. Searches may select a narrower subtree of that source, but a broader
-or different source fails instead of returning an incomplete or out-of-scope
-result. `--rebuild` is required to repurpose an index location.
+The root records the indexed S3 endpoint, bucket, and prefix. Searches may
+select a narrower subtree of that source, but a broader or different source
+fails instead of returning an incomplete or out-of-scope result. `--rebuild`
+is required to repurpose an index location.
 
 `--watch --interval SECONDS` repeats the same listing, diff, and atomic root
 swap without overlapping cycles; the interval starts after each attempt. A
@@ -213,11 +207,6 @@ SIGHUP, Ctrl-C, and Ctrl-Break finish any active cycle and stop cleanly.
 lower-layer notes and warnings remain on stderr.
 With `--purge-deleted`, every watch cycle physically repacks touched segments;
 this explicit retention guarantee approaches eager-update cost under churn.
-
-Local directories use the same format-11 physical-source/logical-document
-tables, written to `--index` (default `holys3.idxdir`) with BLAKE3 content
-freshness tokens. Local runs are incremental, and `--rebuild` re-ingests
-everything. Searches verify the same packed snapshot as S3 searches.
 
 ## Performance
 
@@ -276,8 +265,8 @@ reference. Refresh it only from CI's `bench-micro` artifact.
   reads them through a bounded 1 MiB window. Expansion is capped at 64 GiB per
   physical source, 100,000 regular archive members, and four nested format
   layers.
-- Oversized local sources and S3 sources of at least 64 MiB remain file-backed
-  during indexing instead of materializing the full body in memory. File-backed
+- S3 sources of at least 64 MiB remain file-backed during indexing instead of
+  materializing the full body in memory. File-backed
   gzip, zstd, bzip2, Snappy, Brotli, zlib, TAR, and ZIP sources decode through
   bounded readers or seekable file handles rather than whole-source mappings.
 - A root race before candidate processing reopens once. If garbage collection

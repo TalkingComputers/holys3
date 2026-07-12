@@ -10,10 +10,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use holys3_core::{BlobStore, LocalBlobStore, MatchOptions, Strategy};
+use holys3_core::{BlobStore, MatchOptions, Strategy};
 use holys3_index::{
-    search_streaming, update_index, IndexChanged, IndexReader, KeyScope, LocalCorpus, MatchSink,
-    SearchStats, SegmentedReader, SourceIdentity, UpdateOptions,
+    search_streaming, update_index, IndexChanged, KeyScope, MatchSink, SearchStats,
+    SegmentedReader, SourceIdentity, UpdateOptions,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, is_index_key, list_prefix, ObjectMeta, S3BlobStore,
@@ -30,10 +30,10 @@ use std::time::Duration;
     version,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
-    about = "Indexed regex search over S3 buckets and local files",
+    about = "Indexed regex search over S3 buckets",
     long_about = "holys3 PATTERN TARGET searches a prebuilt index.\n\
-        TARGET is s3://bucket[/prefix] or a local path.\n\
-        To search for a pattern named like a subcommand (`index`, `stats`),\n\
+        TARGET is s3://bucket[/prefix].\n\
+        To search for a pattern named like the `index` subcommand,\n\
         use -e: `holys3 -e index s3://bucket`."
 )]
 struct Cli {
@@ -47,14 +47,12 @@ struct Cli {
 #[allow(clippy::doc_markdown)]
 #[derive(Subcommand)]
 enum Cmd {
-    /// Build or update the index for TARGET (s3://bucket[/prefix] or a local directory).
+    /// Build or update the index for TARGET (s3://bucket[/prefix]).
     Index {
         #[arg(value_name = "TARGET")]
         target: String,
         #[command(flatten)]
         index: IndexArgs,
-        #[arg(long, value_name = "PATH", conflicts_with = "location")]
-        out: Option<PathBuf>,
         #[arg(long, value_enum, default_value = "trigram")]
         strategy: StrategyArg,
         /// Ignore any existing index and re-ingest everything.
@@ -78,11 +76,6 @@ enum Cmd {
         #[command(flatten)]
         connect: ConnectArgs,
     },
-    /// Report distinct grams + term-dict bytes for a local index.
-    Stats {
-        #[arg(long, default_value = "holys3.idxdir")]
-        index: PathBuf,
-    },
 }
 
 // Doc comments on clap structs are --help text; markdown would leak into it.
@@ -102,7 +95,7 @@ struct ConnectArgs {
 
 #[derive(clap::Args)]
 struct IndexArgs {
-    /// Index location (local path or `s3://bucket/prefix`).
+    /// Index location (`s3://bucket/prefix`).
     #[arg(long = "index", value_name = "LOCATION")]
     location: Option<String>,
     /// AWS region for an s3:// index location.
@@ -221,29 +214,21 @@ struct SearchArgs {
     connect: ConnectArgs,
 }
 
-enum Target {
-    Local(PathBuf),
-    S3 { bucket: String, prefix: String },
+struct S3Target {
+    bucket: String,
+    prefix: String,
 }
 
-/// Single choke point turning a TARGET string into local-vs-S3.
-fn parse_target(raw: &str) -> Result<Target> {
-    match raw.strip_prefix("s3://") {
-        Some(rest) => {
-            let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-            anyhow::ensure!(!bucket.is_empty(), "s3:// target needs a bucket");
-            Ok(Target::S3 {
-                bucket: bucket.to_owned(),
-                prefix: prefix.to_owned(),
-            })
-        }
-        None => Ok(Target::Local(PathBuf::from(raw))),
-    }
-}
-
-enum Source {
-    Local(PathBuf),
-    S3(S3Source),
+fn parse_s3_target(raw: &str) -> Result<S3Target> {
+    let rest = raw
+        .strip_prefix("s3://")
+        .with_context(|| format!("S3 location must be s3://bucket[/prefix], got {raw}"))?;
+    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    anyhow::ensure!(!bucket.is_empty(), "s3:// target needs a bucket");
+    Ok(S3Target {
+        bucket: bucket.to_owned(),
+        prefix: prefix.to_owned(),
+    })
 }
 
 struct S3Source {
@@ -253,98 +238,61 @@ struct S3Source {
     prefix: String,
 }
 
-enum IndexStorage {
-    Local {
-        root: PathBuf,
-        cache: PathBuf,
-    },
-    S3 {
-        client: S3Client,
-        endpoint: String,
-        bucket: String,
-        root: String,
-        cache: PathBuf,
-    },
+struct IndexStorage {
+    client: S3Client,
+    endpoint: String,
+    bucket: String,
+    root: String,
+    cache: PathBuf,
 }
 
 impl IndexStorage {
     fn store(&self) -> Box<dyn BlobStore> {
-        match self {
-            Self::Local { root, .. } => Box::new(LocalBlobStore::new(root)),
-            Self::S3 {
-                client,
-                bucket,
-                root,
-                ..
-            } => Box::new(S3BlobStore::at(
-                client.clone(),
-                bucket.clone(),
-                root.clone(),
-            )),
-        }
+        Box::new(S3BlobStore::at(
+            self.client.clone(),
+            self.bucket.clone(),
+            self.root.clone(),
+        ))
     }
 
     fn cache(&self) -> &Path {
-        match self {
-            Self::Local { cache, .. } | Self::S3 { cache, .. } => cache,
-        }
+        &self.cache
     }
 
     fn location(&self) -> String {
-        match self {
-            Self::Local { root, .. } => root.display().to_string(),
-            Self::S3 { bucket, root, .. } if root.is_empty() => format!("s3://{bucket}"),
-            Self::S3 { bucket, root, .. } => format!("s3://{bucket}/{root}"),
+        if self.root.is_empty() {
+            format!("s3://{}", self.bucket)
+        } else {
+            format!("s3://{}/{}", self.bucket, self.root)
         }
     }
 
     fn contains_source_key(&self, source: &S3Source, key: &str) -> bool {
-        let Self::S3 {
-            endpoint,
-            bucket,
-            root,
-            ..
-        } = self
-        else {
-            return false;
-        };
-        is_same_s3_bucket(endpoint, bucket, &source.endpoint, &source.bucket)
-            && (key == root
-                || key
-                    .strip_prefix(root)
-                    .is_some_and(|relative| relative.starts_with('/')))
+        is_same_s3_bucket(
+            &self.endpoint,
+            &self.bucket,
+            &source.endpoint,
+            &source.bucket,
+        ) && (key == self.root
+            || key
+                .strip_prefix(&self.root)
+                .is_some_and(|relative| relative.starts_with('/')))
     }
 }
 
-fn open_source(target: Target, connect: &ConnectArgs) -> Result<Source> {
-    match target {
-        Target::Local(dir) => {
-            anyhow::ensure!(
-                connect.region.is_none() && connect.endpoint.is_none(),
-                "--region/--endpoint only apply to s3:// targets"
-            );
-            anyhow::ensure!(
-                dir.is_dir(),
-                "local target {} is not a directory",
-                dir.display()
-            );
-            Ok(Source::Local(dir))
-        }
-        Target::S3 { bucket, prefix } => {
-            let client = S3Client::connect(
-                connect.region.clone(),
-                connect.endpoint.clone(),
-                build_fetch_config(connect.concurrency),
-            )?;
-            let endpoint = client.endpoint_identity();
-            Ok(Source::S3(S3Source {
-                client,
-                endpoint,
-                bucket,
-                prefix,
-            }))
-        }
-    }
+fn open_source(target: S3Target, connect: &ConnectArgs) -> Result<S3Source> {
+    let client = S3Client::connect(
+        connect.region.clone(),
+        connect.endpoint.clone(),
+        build_fetch_config(connect.concurrency),
+    )?;
+    let endpoint = client.endpoint_identity();
+    Ok(S3Source {
+        client,
+        endpoint,
+        bucket: target.bucket,
+        prefix: target.prefix,
+    })
 }
 
 fn validate_index_namespace(
@@ -379,74 +327,44 @@ fn is_same_s3_bucket(
 }
 
 fn open_index_storage(
-    source: &Source,
+    source: &S3Source,
     index: &IndexArgs,
-    local_out: Option<&Path>,
     concurrency: usize,
-    create: bool,
 ) -> Result<IndexStorage> {
-    let target = match (index.location.as_deref(), local_out) {
-        (Some(location), None) => parse_target(location)?,
-        (None, Some(path)) => Target::Local(path.to_path_buf()),
-        (None, None) => match source {
-            Source::Local(_) => Target::Local(PathBuf::from("holys3.idxdir")),
-            Source::S3(source) => Target::S3 {
-                bucket: source.bucket.clone(),
-                prefix: build_index_namespace(&source.prefix),
-            },
+    let target = match index.location.as_deref() {
+        Some(location) => parse_s3_target(location)?,
+        None => S3Target {
+            bucket: source.bucket.clone(),
+            prefix: build_index_namespace(&source.prefix),
         },
-        (Some(_), Some(_)) => anyhow::bail!("--index conflicts with --out"),
     };
-    match target {
-        Target::Local(root) => {
-            anyhow::ensure!(
-                index.index_region.is_none() && index.index_endpoint.is_none(),
-                "--index-region/--index-endpoint require an s3:// index location"
-            );
-            if create {
-                std::fs::create_dir_all(&root)?;
-            }
-            let cache = local_cache_dir(&root)?;
-            Ok(IndexStorage::Local { root, cache })
-        }
-        Target::S3 { bucket, prefix } => {
-            let root = prefix.trim_matches('/').to_owned();
-            let client = match source {
-                Source::S3(source)
-                    if index.index_region.is_none() && index.index_endpoint.is_none() =>
-                {
-                    source.client.clone()
-                }
-                _ => S3Client::connect(
-                    index.index_region.clone(),
-                    index.index_endpoint.clone(),
-                    build_fetch_config(concurrency),
-                )?,
-            };
-            let endpoint = client.endpoint_identity();
-            match source {
-                Source::S3(source) => validate_index_namespace(
-                    &source.endpoint,
-                    &source.bucket,
-                    &source.prefix,
-                    &endpoint,
-                    &bucket,
-                    &root,
-                )?,
-                Source::Local(_) => {
-                    anyhow::ensure!(!root.is_empty(), "s3:// index location needs a prefix");
-                }
-            }
-            let cache = build_cache_dir(Some(&endpoint), &bucket, &root)?;
-            Ok(IndexStorage::S3 {
-                client,
-                endpoint,
-                bucket,
-                root,
-                cache,
-            })
-        }
-    }
+    let root = target.prefix.trim_matches('/').to_owned();
+    let client = if index.index_region.is_none() && index.index_endpoint.is_none() {
+        source.client.clone()
+    } else {
+        S3Client::connect(
+            index.index_region.clone(),
+            index.index_endpoint.clone(),
+            build_fetch_config(concurrency),
+        )?
+    };
+    let endpoint = client.endpoint_identity();
+    validate_index_namespace(
+        &source.endpoint,
+        &source.bucket,
+        &source.prefix,
+        &endpoint,
+        &target.bucket,
+        &root,
+    )?;
+    let cache = build_cache_dir(Some(&endpoint), &target.bucket, &root)?;
+    Ok(IndexStorage {
+        client,
+        endpoint,
+        bucket: target.bucket,
+        root,
+        cache,
+    })
 }
 
 /// rg's rule: once any -e is given, every positional is a TARGET.
@@ -492,78 +410,12 @@ fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
     Ok(value)
 }
 
-fn build_local_key_prefix(dir: &Path) -> Result<String> {
-    let canonical = std::fs::canonicalize(dir)?;
-    let mut prefix = canonical
-        .to_str()
-        .with_context(|| format!("local target is not valid UTF-8: {}", canonical.display()))?
-        .to_owned();
-    #[cfg(windows)]
-    {
-        prefix = prefix.replace('\\', "/");
+fn build_source_identity(source: &S3Source) -> SourceIdentity {
+    SourceIdentity::S3 {
+        endpoint: source.endpoint.clone(),
+        bucket: source.bucket.clone(),
+        prefix: list_prefix(&source.prefix),
     }
-    if !prefix.ends_with('/') {
-        prefix.push('/');
-    }
-    Ok(prefix)
-}
-
-fn build_source_identity(source: &Source) -> Result<SourceIdentity> {
-    match source {
-        Source::Local(dir) => Ok(SourceIdentity::Local {
-            prefix: build_local_key_prefix(dir)?,
-        }),
-        Source::S3(source) => Ok(SourceIdentity::S3 {
-            endpoint: source.endpoint.clone(),
-            bucket: source.bucket.clone(),
-            prefix: list_prefix(&source.prefix),
-        }),
-    }
-}
-
-fn build_local(
-    dir: &Path,
-    index: &IndexStorage,
-    strategy: Strategy,
-    rebuild: bool,
-    purge_deleted: bool,
-) -> Result<index::IndexResult> {
-    // Canonical target root: `./logs` and `logs` must produce identical
-    // index keys, or invocation spelling would churn the incremental diff.
-    let dir = std::fs::canonicalize(dir)?;
-    let excluded = match index {
-        IndexStorage::Local { root, .. } => {
-            let root = std::fs::canonicalize(root)?;
-            anyhow::ensure!(
-                !dir.starts_with(&root),
-                "local index directory must not contain the target directory"
-            );
-            Some(root)
-        }
-        IndexStorage::S3 { .. } => None,
-    };
-    let corpus = LocalCorpus::new_excluding(&dir, excluded.as_deref())?;
-    let listing = corpus.listing()?;
-    let store = index.store();
-    let source = SourceIdentity::Local {
-        prefix: build_local_key_prefix(&dir)?,
-    };
-    let report = update_index(
-        store.as_ref(),
-        index.cache(),
-        &source,
-        strategy,
-        &listing,
-        UpdateOptions {
-            rebuild,
-            purge_deleted,
-        },
-        &|shard| Ok(Box::new(LocalCorpus::from_listing(shard))),
-    )?;
-    Ok(index::IndexResult {
-        report,
-        location: index.location(),
-    })
 }
 
 fn list_user_objects(src: &S3Source, index: &IndexStorage) -> Result<Vec<ObjectMeta>> {
@@ -633,12 +485,12 @@ struct SearchExecution<'a> {
 }
 
 fn execute_search(
-    source: Source,
+    source: &S3Source,
     index: &IndexStorage,
     execution: SearchExecution<'_>,
     sink: &dyn MatchSink,
 ) -> Result<SearchStats> {
-    let source_identity = build_source_identity(&source)?;
+    let source_identity = build_source_identity(source);
     let key_filter = execution.scope.map(|scope| {
         move |key: &str| {
             scope
@@ -650,39 +502,22 @@ fn execute_search(
     let key_matches = key_filter
         .as_ref()
         .map(|filter| filter as &(dyn Fn(&str) -> bool + Sync));
-    let search_stats = match source {
-        Source::Local(dir) => {
-            let target_prefix = build_local_key_prefix(&dir)?;
-            search_with_reopen(
-                || SegmentedReader::open(index.store(), index.cache(), &source_identity),
-                execution.pattern,
-                KeyScope {
-                    prefix: Some(&target_prefix),
-                    matches: key_matches,
-                },
-                execution.options,
-                sink,
-            )?
-        }
-        Source::S3(src) => {
-            let target_prefix = list_prefix(&src.prefix);
-            let candidate_prefix = if target_prefix.is_empty() {
-                execution.scope.and_then(Scope::key_prefix)
-            } else {
-                Some(target_prefix.as_str())
-            };
-            search_with_reopen(
-                || SegmentedReader::open(index.store(), index.cache(), &source_identity),
-                execution.pattern,
-                KeyScope {
-                    prefix: candidate_prefix,
-                    matches: key_matches,
-                },
-                execution.options,
-                sink,
-            )?
-        }
+    let target_prefix = list_prefix(&source.prefix);
+    let candidate_prefix = if target_prefix.is_empty() {
+        execution.scope.and_then(Scope::key_prefix)
+    } else {
+        Some(target_prefix.as_str())
     };
+    let search_stats = search_with_reopen(
+        || SegmentedReader::open(index.store(), index.cache(), &source_identity),
+        execution.pattern,
+        KeyScope {
+            prefix: candidate_prefix,
+            matches: key_matches,
+        },
+        execution.options,
+        sink,
+    )?;
     if let Some(scope) = execution.scope {
         scope.report();
     }
@@ -763,8 +598,8 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     };
     let color = printer::resolve_color(args.color, is_tty);
 
-    let source = open_source(parse_target(&target_raw)?, &args.connect)?;
-    let index = open_index_storage(&source, &args.index, None, args.connect.concurrency, false)?;
+    let source = open_source(parse_s3_target(&target_raw)?, &args.connect)?;
+    let index = open_index_storage(&source, &args.index, args.connect.concurrency)?;
     let stats_line = args.stats && !args.json;
     let execution = SearchExecution {
         pattern: &pattern,
@@ -775,7 +610,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
 
     if args.quiet {
         let sink = printer::QuietSink::new(!args.stats);
-        let result = execute_search(source, &index, execution, &sink);
+        let result = execute_search(&source, &index, execution, &sink);
         return match result {
             Ok(_) => Ok(sink.matched()),
             // rg's quiet error-mask: a found match wins over later errors
@@ -786,7 +621,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     if args.json {
         let started = std::time::Instant::now();
         let sink = json::JsonSink::new();
-        let stats = execute_search(source, &index, execution, &sink)?;
+        let stats = execute_search(&source, &index, execution, &sink)?;
         sink.write_summary(&stats, started.elapsed())?;
         return Ok(!stats.hits.is_empty());
     }
@@ -805,7 +640,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
             color,
         ))
     };
-    let stats = execute_search(source, &index, execution, sink.as_ref())?;
+    let stats = execute_search(&source, &index, execution, sink.as_ref())?;
     Ok(!stats.hits.is_empty())
 }
 
@@ -815,7 +650,6 @@ fn run() -> Result<bool> {
         Some(Cmd::Index {
             target,
             index,
-            out,
             strategy,
             rebuild,
             purge_deleted,
@@ -833,15 +667,9 @@ fn run() -> Result<bool> {
                 json,
             };
             let started = std::time::Instant::now();
-            let (source, storage) = match (|| -> Result<(Source, IndexStorage)> {
-                let parsed = parse_target(&target)?;
-                anyhow::ensure!(
-                    out.is_none() || matches!(&parsed, Target::Local(_)),
-                    "--out only applies to local targets; use --index for S3"
-                );
-                let source = open_source(parsed, &connect)?;
-                let storage =
-                    open_index_storage(&source, &index, out.as_deref(), connect.concurrency, true)?;
+            let (source, storage) = match (|| -> Result<(S3Source, IndexStorage)> {
+                let source = open_source(parse_s3_target(&target)?, &connect)?;
+                let storage = open_index_storage(&source, &index, connect.concurrency)?;
                 Ok((source, storage))
             })() {
                 Ok(opened) => opened,
@@ -850,24 +678,9 @@ fn run() -> Result<bool> {
                     return Err(error);
                 }
             };
-            match source {
-                Source::Local(dir) => index::run_index(config, |cycle_rebuild| {
-                    build_local(&dir, &storage, strategy, cycle_rebuild, purge_deleted)
-                })?,
-                Source::S3(src) => {
-                    index::run_index(config, |cycle_rebuild| {
-                        build_s3(&src, &storage, strategy, cycle_rebuild, purge_deleted)
-                    })?;
-                }
-            }
-            Ok(true)
-        }
-        Some(Cmd::Stats { index }) => {
-            let reader = open_local_reader(&index)?;
-            let s = reader.stats();
-            println!("distinct_grams={}", s.distinct_grams);
-            println!("terms_fst_bytes={}", s.terms_fst_bytes);
-            println!("postings_bytes={}", s.postings_bytes);
+            index::run_index(config, |cycle_rebuild| {
+                build_s3(&source, &storage, strategy, cycle_rebuild, purge_deleted)
+            })?;
             Ok(true)
         }
         None => run_search(cli.search),
@@ -897,31 +710,6 @@ fn build_cache_dir(endpoint: Option<&str>, bucket: &str, prefix: &str) -> Result
         holys3_core::hash_ngram(scope.as_bytes())
     ));
     Ok(path)
-}
-
-/// Cache dir for a local index, keyed on its canonicalized path. A REAL
-/// cache directory, never `<out>/segments` itself: `SegmentedReader`'s
-/// self-heal and stale-segment eviction delete cache entries, which must
-/// never be the store's own blobs.
-fn local_cache_dir(index_dir: &Path) -> Result<PathBuf> {
-    let canonical = std::fs::canonicalize(index_dir).with_context(|| {
-        format!(
-            "no index at {} (run `holys3 index <TARGET> --index {0}`)",
-            index_dir.display()
-        )
-    })?;
-    let mut path = cache_home()?;
-    path.push("holys3");
-    path.push(format!(
-        "local-{:016x}",
-        holys3_core::hash_ngram(canonical.to_string_lossy().as_bytes())
-    ));
-    Ok(path)
-}
-
-fn open_local_reader(index_dir: &Path) -> Result<SegmentedReader> {
-    let cache_dir = local_cache_dir(index_dir)?;
-    SegmentedReader::inspect(Box::new(LocalBlobStore::new(index_dir)), &cache_dir)
 }
 
 fn cache_home() -> Result<PathBuf> {
@@ -967,24 +755,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_target_forms() {
+    fn parse_s3_target_forms() {
         assert!(matches!(
-            parse_target("s3://bkt").unwrap(),
-            Target::S3 { bucket, prefix } if bucket == "bkt" && prefix.is_empty()
+            parse_s3_target("s3://bkt").unwrap(),
+            S3Target { bucket, prefix } if bucket == "bkt" && prefix.is_empty()
         ));
         assert!(matches!(
-            parse_target("s3://bkt/a/b").unwrap(),
-            Target::S3 { bucket, prefix } if bucket == "bkt" && prefix == "a/b"
+            parse_s3_target("s3://bkt/a/b").unwrap(),
+            S3Target { bucket, prefix } if bucket == "bkt" && prefix == "a/b"
         ));
         assert!(matches!(
-            parse_target("s3://bkt/a//b/").unwrap(),
-            Target::S3 { bucket, prefix } if bucket == "bkt" && prefix == "a//b/"
+            parse_s3_target("s3://bkt/a//b/").unwrap(),
+            S3Target { bucket, prefix } if bucket == "bkt" && prefix == "a//b/"
         ));
-        assert!(parse_target("s3://").is_err());
-        assert!(matches!(
-            parse_target("./logs").unwrap(),
-            Target::Local(p) if p == Path::new("./logs")
-        ));
+        assert!(parse_s3_target("s3://").is_err());
     }
 
     #[test]
@@ -1048,19 +832,6 @@ mod tests {
         assert_eq!(
             index.index_endpoint.as_deref(),
             Some("http://127.0.0.1:9000")
-        );
-
-        let cli = Cli::try_parse_from([
-            "holys3",
-            "needle",
-            "s3://source/logs",
-            "--index",
-            "/tmp/holys3-index",
-        ])
-        .unwrap();
-        assert_eq!(
-            cli.search.index.location.as_deref(),
-            Some("/tmp/holys3-index")
         );
         assert!(Cli::try_parse_from([
             "holys3",

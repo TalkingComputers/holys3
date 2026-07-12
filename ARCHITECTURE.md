@@ -2,7 +2,7 @@
 
 ## Bird's Eye View
 
-holys3 is a grep-style CLI for local files and private S3 buckets. It builds a compact gram index and immutable compressed content snapshot, uses the grams only to reduce the candidate set, and runs the final regex over snapshot bytes. The correctness model is deliberately simple: indexed search must return the same document set as scanning the canonical bytes captured by that index generation.
+holys3 is a grep-style CLI for private S3 buckets. It builds a compact gram index and immutable compressed content snapshot, uses the grams only to reduce the candidate set, and runs the final regex over snapshot bytes. The correctness model is deliberately simple: indexed search must return the same document set as scanning the canonical bytes captured by that index generation.
 
 The main boundary is IO. `holys3-core`, `holys3-query`, and `holys3-index` are mostly pure format and planning code. `holys3-s3` owns AWS network calls. `holys3` wires those pieces into a user-facing CLI.
 
@@ -12,13 +12,11 @@ The main boundary is IO. `holys3-core`, `holys3-query`, and `holys3-index` are m
 
 `holys3 index s3://bucket[/prefix]` lists the prefix, filters out any co-located index namespace, diffs (key, etag) pairs against the union of existing segment doc tables, writes immutable tombstones and bounded content-addressed segments over the changes, optionally repacks or merges segments, and atomically swaps the index root pointer. The index defaults to `<prefix>/.holys3/`; `--index s3://other-bucket/path` selects an independent bucket and namespace. Large blobs upload as concurrent multipart parts.
 
-`holys3 index <DIR>` is the same pipeline over the selected local or S3 index blob store: it walks the canonicalized directory, computes BLAKE3 content tokens, and runs the identical incremental diff — there is exactly one index format.
-
 `--watch --interval SECONDS` opens the target once, retains one refreshing S3 client when applicable, and serializes fresh listing/diff/CAS cycles through the same pipeline. The interval begins after an attempt completes. Continuous mode adds no daemon database, event-consumer path, or second index transaction.
 
 ### Search pipeline
 
-Local and S3 searches use the same path. The CLI opens the selected segmented index, verifies its source binding, plans a gram query from the regex, reads candidate IDs from posting ranges, fetches only the required compressed pack ranges, verifies each block hash, decompresses canonical bytes, and renders rg-style verified results. Search does not read mutable source objects.
+The CLI opens the selected segmented index, verifies its S3 source binding, plans a gram query from the regex, reads candidate IDs from posting ranges, fetches only the required compressed pack ranges, verifies each block hash, decompresses canonical bytes, and renders rg-style verified results. Search does not read mutable source objects.
 
 ## Code Map
 
@@ -26,7 +24,7 @@ Local and S3 searches use the same path. The CLI opens the selected segmented in
 
 `crates/query` turns a regex pattern into a gram query using regex-syntax literal extraction. It chooses candidate constraints, not matches. Architectural Invariant: query must not read corpus bytes, fetch indexes, or decide final answers.
 
-`crates/index` builds and reads the FST term dictionary, postings blocks, format-11 source/document/block tables, source-bound segment lists, content packs, local corpus, and the store-backed segmented index reader. One physical archive may emit many logical posting IDs. The reader joins candidates to snapshot coordinates and supplies canonical decoded bytes for final verification. Architectural Invariant: index must not treat candidates as answers.
+`crates/index` builds and reads the FST term dictionary, postings blocks, format-11 source/document/block tables, source-bound segment lists, content packs, and the store-backed segmented index reader. Its local corpus adapter is restricted to tests and the unpublished benchmark harness. One physical archive may emit many logical posting IDs. The reader joins candidates to snapshot coordinates and supplies canonical decoded bytes for final verification. Architectural Invariant: index must not treat candidates as answers.
 
 Index construction emits bounded sorted posting runs to temporary files and k-way merges them into the final FST/postings pair while computing each blob's SHA-256 digest in the same write. The same canonical decoder output streams into 128 KiB independently checksummed zstd frames grouped into content-addressed packs capped near 256 MiB. Document tables store the first block, intra-block offset, and decoded length; block tables bind pack ID, compressed range, decoded length, and SHA-256. Trigram dictionaries above one million temporary posting records use 256 independently streamed first-byte FST shards in one immutable term blob, bounding builder state for dense three-byte keyspaces; smaller trigram dictionaries and sparse dictionaries remain one FST. Completed runs and packs retain closed temporary paths; merge fan-in opens at most 64 runs. Corpus cardinality does not require one global in-memory postings map. Oversized local and S3 source bodies and decoded output above 8 MiB remain file-backed. File-backed TAR and ZIP inputs decode from streaming or seekable handles. Trigram and sparse extraction read files in bounded 1 MiB chunks; high-cardinality trigram inputs retain a fixed 2 MiB bitmap and stream it directly to a posting run, while sparse grams use exact short-gram bitmaps and bounded external-sort runs. Raw sources extract grams in parallel. Formats that can expand are decoded one source at a time: canonical member bytes go to one content spool, documents retain only spool coordinates, and posting runs materialize grams under a fixed memory budget after member-key sorting. The segment cap applies to logical documents: an oversized multi-source shard is bisected at source boundaries and rebuilt, while one physical source that alone exceeds the cap fails explicitly.
 
@@ -36,7 +34,7 @@ Immutable term dictionaries download into the content-addressed cache through bo
 
 `crates/s3` is the AWS S3 boundary: official SDK configuration and credential providers, list, conditional/full/ranged GET, PUT and multipart upload, S3 blob storage, index key layout, build-side source fetching, adaptive request limits, and retry scheduling. Large source responses use sealed file-backed bodies. Architectural Invariant: s3 must be the only crate that performs S3 network IO.
 
-`crates/cli` owns argument parsing, env reads, rg-style output rendering (stdout sinks, JSON wire format), and composition of local or S3 pipelines (the async runtime lives inside `S3Client`). Architectural Invariant: cli must not contain index format or AWS transport logic.
+`crates/cli` owns argument parsing, env reads, rg-style output rendering (stdout sinks, JSON wire format), and composition of S3 source and index storage pipelines (the async runtime lives inside `S3Client`). Architectural Invariant: cli must not contain index format or AWS transport logic.
 
 ## Cross-Cutting Concerns
 
@@ -56,7 +54,7 @@ Continuous indexing fails its first cycle so invalid targets, credentials, and i
 
 ### Index storage
 
-S3 sources default to index data under `.holys3/` or `<prefix>/.holys3/` in the source bucket. `--index` may instead name any local path or prefixed S3 location; `--index-region` and `--index-endpoint` independently configure that S3 client. The search path reads the selected root pointer, verifies its source identity, opens each live segment, then uses coalesced ranged GETs against postings and content packs. Searches may narrow the recorded source prefix but cannot broaden it or change its endpoint or bucket. Co-located explicit namespaces are excluded from source listings only when endpoint and bucket both match, and namespaces that contain the source prefix are rejected. Because packs contain canonical decoded content, the index storage boundary has the same confidentiality requirements as the source.
+S3 sources default to index data under `.holys3/` or `<prefix>/.holys3/` in the source bucket. `--index` may instead name any prefixed S3 location; `--index-region` and `--index-endpoint` independently configure that S3 client. The search path reads the selected root pointer, verifies its source identity, opens each live segment, then uses coalesced ranged GETs against postings and content packs. Searches may narrow the recorded source prefix but cannot broaden it or change its endpoint or bucket. Co-located explicit namespaces are excluded from source listings only when endpoint and bucket both match, and namespaces that contain the source prefix are rejected. Because packs contain canonical decoded content, the index storage boundary has the same confidentiality requirements as the source.
 
 ### Reader consistency
 
