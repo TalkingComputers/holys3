@@ -1,21 +1,25 @@
-# release-plz configuration. https://release-plz.dev/docs/config
 [workspace]
-# All crates share one version and are bumped together. The protected
-# crates-io environment gates every registry-missing workspace version.
 release_always = true
-# Keep the changelog in Keep a Changelog style, grouped by Conventional Commit type.
-changelog_update = true
-# crates.io trusted publishing handles auth; no token needed in the manifest.
+changelog_update = false
 publish = true
-git_release_enable = true
-git_tag_enable = true
+git_release_enable = false
+git_tag_enable = false
 
-# One v{version} tag for the whole workspace (single shared version): this is
-# the tag shape both the release workflow trigger and cargo-binstall's
-# default pkg-url templates expect.
-git_tag_name = "v{{ version }}"
+[[package]]
+name = "holys3"
+changelog_include = [
+  "holys3-core",
+  "holys3-index",
+  "holys3-query",
+  "holys3-s3",
+  "holys3-sigv4",
+]
+changelog_path = "./CHANGELOG.md"
+changelog_update = true
+git_release_enable = true
 git_release_name = "v{{ version }}"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
 
 [changelog]
-# git-cliff-compatible commit parsers. Conventional Commits -> grouped sections.
 protect_breaking_commits = true
