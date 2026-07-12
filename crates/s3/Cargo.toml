@@ -13,8 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-holys3-core = { path = "../core", version = "0.4.0" }
-holys3-sigv4 = { path = "../sigv4", version = "0.4.0" }
+holys3-core = { path = "../core", version = "0.5.0" }
+holys3-sigv4 = { path = "../sigv4", version = "0.5.0" }
 anyhow.workspace = true
 futures = "0.3.32"
 rand = "0.10.1"
@@ -30,7 +30,7 @@ fs4.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
-holys3-core = { path = "../core", version = "0.4.0", features = ["testutil"] }
+holys3-core = { path = "../core", version = "0.5.0", features = ["testutil"] }
 
 [lints]
 workspace = true

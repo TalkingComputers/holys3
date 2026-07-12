@@ -18,9 +18,9 @@ name = "holys3"
 path = "src/main.rs"
 
 [dependencies]
-holys3-core = { path = "../core", version = "0.4.0" }
-holys3-index = { path = "../index", version = "0.4.0" }
-holys3-s3 = { path = "../s3", version = "0.4.0" }
+holys3-core = { path = "../core", version = "0.5.0" }
+holys3-index = { path = "../index", version = "0.5.0" }
+holys3-s3 = { path = "../s3", version = "0.5.0" }
 anyhow.workspace = true
 base64 = "0.22.1"
 globset = "0.4.18"
@@ -36,7 +36,7 @@ time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
-holys3-core = { path = "../core", version = "0.4.0", features = ["testutil"] }
+holys3-core = { path = "../core", version = "0.5.0", features = ["testutil"] }
 predicates = "3.1.4"
 tempfile = "3.27.0"
 

@@ -4,7 +4,7 @@ members = ["crates/core", "crates/query", "crates/index", "crates/sigv4", "crate
 
 [workspace.package]
 edition = "2021"
-version = "0.4.0"
+version = "0.5.0"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Indexed regex search for local files and private S3 buckets"

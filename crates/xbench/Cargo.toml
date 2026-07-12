@@ -18,9 +18,9 @@ name = "holys3-bench"
 path = "src/main.rs"
 
 [dependencies]
-holys3-core = { path = "../core", version = "0.4.0" }
-holys3-index = { path = "../index", version = "0.4.0" }
-holys3-s3 = { path = "../s3", version = "0.4.0" }
+holys3-core = { path = "../core", version = "0.5.0" }
+holys3-index = { path = "../index", version = "0.5.0" }
+holys3-s3 = { path = "../s3", version = "0.5.0" }
 anyhow.workspace = true
 mimalloc = "0.1.52"
 clap.workspace = true

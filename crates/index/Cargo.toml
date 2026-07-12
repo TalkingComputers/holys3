@@ -13,8 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-holys3-core = { path = "../core", version = "0.4.0" }
-holys3-query = { path = "../query", version = "0.4.0" }
+holys3-core = { path = "../core", version = "0.5.0" }
+holys3-query = { path = "../query", version = "0.5.0" }
 anyhow.workspace = true
 serde.workspace = true
 postcard.workspace = true
@@ -30,7 +30,7 @@ bytes.workspace = true
 memmap2.workspace = true
 
 [dev-dependencies]
-holys3-core = { path = "../core", version = "0.4.0", features = ["testutil"] }
+holys3-core = { path = "../core", version = "0.5.0", features = ["testutil"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 

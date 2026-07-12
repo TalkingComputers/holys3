@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-12
+
 ### Added
 
 - Continuous local and S3 indexing with paired `--watch --interval SECONDS` controls, graceful signal shutdown, and fail-fast startup followed by retry after a successful cycle.
