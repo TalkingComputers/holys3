@@ -11,7 +11,7 @@ use holys3_core::{
 };
 use holys3_index::{
     search_collect, search_streaming, update_index, IndexChanged, IndexReader, KeyScope, NullSink,
-    SegmentedReader,
+    SegmentedReader, SourceIdentity,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -101,12 +101,84 @@ impl DocFetcher for CountingBucketFetcher<'_> {
     }
 }
 
+fn test_source() -> SourceIdentity {
+    SourceIdentity::Local {
+        prefix: "/test/".into(),
+    }
+}
+
 fn reindex(bucket: &Bucket, store_dir: &Path, cache_dir: &Path, strategy: Strategy) -> Result<()> {
     let store = LocalBlobStore::new(store_dir);
     let listing = bucket.listing();
-    update_index(&store, cache_dir, strategy, &listing, false, &|shard| {
-        Ok(Box::new(bucket.corpus_over(shard)))
-    })?;
+    update_index(
+        &store,
+        cache_dir,
+        &test_source(),
+        strategy,
+        &listing,
+        false,
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn index_source_binding_allows_only_same_backend_subtrees() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("logs/app/a.log", b"needle");
+    let listing = bucket.listing();
+    let indexed = SourceIdentity::S3 {
+        endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+        bucket: "source".into(),
+        prefix: "logs/".into(),
+    };
+    update_index(
+        &LocalBlobStore::new(store_dir.path()),
+        cache_dir.path(),
+        &indexed,
+        Strategy::Trigram,
+        &listing,
+        false,
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+
+    let narrower = SourceIdentity::S3 {
+        endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+        bucket: "source".into(),
+        prefix: "logs/app/".into(),
+    };
+    SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &narrower,
+    )?;
+
+    for rejected in [
+        SourceIdentity::S3 {
+            endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+            bucket: "source".into(),
+            prefix: String::new(),
+        },
+        SourceIdentity::S3 {
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "source".into(),
+            prefix: "logs/".into(),
+        },
+        SourceIdentity::S3 {
+            endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+            bucket: "other".into(),
+            prefix: "logs/".into(),
+        },
+    ] {
+        assert!(SegmentedReader::open(
+            Box::new(LocalBlobStore::new(store_dir.path())),
+            cache_dir.path(),
+            &rejected,
+        )
+        .is_err());
+    }
     Ok(())
 }
 
@@ -119,7 +191,11 @@ fn assert_matches_oracle(
     patterns: &[&str],
     label: &str,
 ) -> Result<()> {
-    let reader = SegmentedReader::open(Box::new(LocalBlobStore::new(store_dir)), cache_dir)?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir)),
+        cache_dir,
+        &test_source(),
+    )?;
     let full = bucket.full_corpus();
     let keys: Vec<String> = full
         .sources()
@@ -170,6 +246,7 @@ fn archive_members_follow_source_lifecycle() -> Result<()> {
     let reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache_dir.path(),
+        &test_source(),
     )?;
     let query = holys3_query::plan("needle", Strategy::Trigram)?;
     let candidates = reader.candidate_docs(&query, Some("logs/bundle.zip!/"))?;
@@ -226,6 +303,7 @@ fn archive_members_follow_source_lifecycle() -> Result<()> {
     let reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache_dir.path(),
+        &test_source(),
     )?;
     assert_eq!(
         search_collect(&reader, &BucketFetcher(&bucket), "needle")?
@@ -244,6 +322,7 @@ fn archive_members_follow_source_lifecycle() -> Result<()> {
     let reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache_dir.path(),
+        &test_source(),
     )?;
     assert_eq!(reader.total_docs(), 0);
     Ok(())
@@ -282,6 +361,7 @@ fn indexes_large_archive_without_decoding_it_twice_per_search() -> Result<()> {
     let reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache_dir.path(),
+        &test_source(),
     )?;
     assert_eq!(reader.total_docs(), 17_000);
     let stats = search_collect(&reader, &BucketFetcher(&bucket), "scale-needle")?.1;
@@ -324,6 +404,7 @@ fn reports_changed_root_when_garbage_collection_invalidates_reader() -> Result<(
     let reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache_dir.path(),
+        &test_source(),
     )?;
 
     bucket.put("logs/a", b"needle new");
@@ -438,6 +519,7 @@ fn lifecycle_add_modify_delete_readd() -> Result<()> {
     let report = update_index(
         &store,
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &listing,
         false,
@@ -476,6 +558,7 @@ fn compaction_bounds_segment_count_and_preserves_results() -> Result<()> {
     let reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache_dir.path(),
+        &test_source(),
     )?;
     assert!(
         reader.total_docs() == 20,
@@ -536,6 +619,7 @@ fn gzipped_objects_and_prefix_pruning() -> Result<()> {
     let reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache_dir.path(),
+        &test_source(),
     )?;
     let fetcher = BucketFetcher(&bucket);
     let scope = KeyScope {
@@ -564,6 +648,7 @@ fn corrupt_cache_self_heals_and_stale_segments_evict() -> Result<()> {
     drop(SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache.path(),
+        &test_source(),
     )?);
 
     // Same-length corruption of a cached terms.fst self-heals on open.
@@ -594,6 +679,7 @@ fn corrupt_cache_self_heals_and_stale_segments_evict() -> Result<()> {
     drop(SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache.path(),
+        &test_source(),
     )?);
     assert!(
         !seg_dir.exists(),
@@ -624,6 +710,7 @@ fn undecodable_objects_marked_failed_and_converge() -> Result<()> {
     let report = update_index(
         &store,
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &listing,
         false,
@@ -697,6 +784,7 @@ fn object_missing_during_fetch_retries_with_same_etag() -> Result<()> {
     let first = update_index(
         &store,
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &listing,
         false,
@@ -706,6 +794,7 @@ fn object_missing_during_fetch_retries_with_same_etag() -> Result<()> {
     let second = update_index(
         &store,
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &listing,
         false,
@@ -735,6 +824,7 @@ fn rebuild_flag_reingests_from_scratch() -> Result<()> {
     let report = update_index(
         &store,
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &listing,
         true,
@@ -806,6 +896,7 @@ fn unreferenced_segment_blobs_are_garbage_collected() -> Result<()> {
     update_index(
         &store,
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &listing,
         true,
@@ -919,6 +1010,7 @@ fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
     let err = update_index(
         &store,
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &listing,
         false,
@@ -1011,6 +1103,7 @@ fn interrupted_root_swap_preserves_old_index_and_restart_converges() -> Result<(
     let error = update_index(
         &store,
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &listing,
         false,
@@ -1070,6 +1163,7 @@ fn same_run_compacted_newborns_are_garbage_collected() -> Result<()> {
     let report = update_index(
         &store,
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &bucket.listing(),
         false,
@@ -1162,6 +1256,7 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
     let result = update_index(
         &flaky,
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &listing,
         false,
@@ -1186,6 +1281,7 @@ fn duplicate_listing_fails_before_fetching() -> Result<()> {
     let error = update_index(
         &LocalBlobStore::new(store_dir.path()),
         cache_dir.path(),
+        &test_source(),
         Strategy::Trigram,
         &listing,
         false,

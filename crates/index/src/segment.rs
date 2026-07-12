@@ -64,8 +64,83 @@ pub(crate) struct SegmentMeta {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct SegmentList {
     pub format: u32,
+    pub source: SourceIdentity,
     pub strategy: Strategy,
     pub segments: Vec<SegmentMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceIdentity {
+    Local {
+        prefix: String,
+    },
+    S3 {
+        endpoint: String,
+        bucket: String,
+        prefix: String,
+    },
+}
+
+impl SourceIdentity {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Local { prefix } => anyhow::ensure!(
+                !prefix.is_empty() && prefix.ends_with('/'),
+                "local source identity must be a non-empty directory prefix"
+            ),
+            Self::S3 {
+                endpoint,
+                bucket,
+                prefix,
+            } => {
+                anyhow::ensure!(!endpoint.is_empty(), "S3 source endpoint is empty");
+                anyhow::ensure!(!bucket.is_empty(), "S3 source bucket is empty");
+                anyhow::ensure!(
+                    prefix.is_empty() || prefix.ends_with('/'),
+                    "S3 source prefix must be empty or end with /"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn can_search(&self, requested: &Self) -> bool {
+        match (self, requested) {
+            (Self::Local { prefix }, Self::Local { prefix: requested }) => {
+                requested.starts_with(prefix)
+            }
+            (
+                Self::S3 {
+                    endpoint,
+                    bucket,
+                    prefix,
+                },
+                Self::S3 {
+                    endpoint: requested_endpoint,
+                    bucket: requested_bucket,
+                    prefix: requested_prefix,
+                },
+            ) => {
+                endpoint == requested_endpoint
+                    && bucket == requested_bucket
+                    && requested_prefix.starts_with(prefix)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for SourceIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local { prefix } => write!(formatter, "local directory {prefix}"),
+            Self::S3 {
+                endpoint,
+                bucket,
+                prefix,
+            } => write!(formatter, "s3://{bucket}/{prefix} at {endpoint}"),
+        }
+    }
 }
 
 fn sha256_hex(parts: &[&[u8]]) -> String {
@@ -92,6 +167,7 @@ fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
         "index format {} is not the current {INDEX_FORMAT}; run `holys3 index` to rebuild",
         list.format
     );
+    list.source.validate()?;
     let mut segment_ids = std::collections::HashSet::with_capacity(list.segments.len());
     for segment in &list.segments {
         anyhow::ensure!(
@@ -199,11 +275,13 @@ pub type CorpusFactory<'a> = dyn Fn(&[(String, String, u64)]) -> Result<Box<dyn 
 pub fn update_index(
     store: &dyn BlobStore,
     cache_dir: &Path,
+    source: &SourceIdentity,
     strategy: Strategy,
     listing: &[(String, String, u64)],
     rebuild: bool,
     make_corpus: &CorpusFactory<'_>,
 ) -> Result<UpdateReport> {
+    source.validate()?;
     let mut listing_keys = std::collections::HashSet::with_capacity(listing.len());
     for (key, _, _) in listing {
         anyhow::ensure!(
@@ -224,12 +302,20 @@ pub fn update_index(
         Vec::new()
     } else {
         match root {
-            RootState::Loaded(list) if list.strategy == strategy => list.segments,
             RootState::Loaded(list) => {
-                eprintln!("note: index strategy changed; rebuilding from scratch");
-                forced = true;
-                replaced = list.segments;
-                Vec::new()
+                anyhow::ensure!(
+                    list.source == *source,
+                    "index was built for {}, not {source}; use --rebuild to replace it",
+                    list.source
+                );
+                if list.strategy == strategy {
+                    list.segments
+                } else {
+                    eprintln!("note: index strategy changed; rebuilding from scratch");
+                    forced = true;
+                    replaced = list.segments;
+                    Vec::new()
+                }
             }
             RootState::Absent => {
                 eprintln!("note: no existing index; building from scratch");
@@ -373,6 +459,7 @@ pub fn update_index(
     let count = segments.len();
     let list = SegmentList {
         format: INDEX_FORMAT,
+        source: source.clone(),
         strategy,
         segments,
     };
@@ -617,12 +704,36 @@ pub struct SegmentedReader {
 }
 
 impl SegmentedReader {
-    pub fn open(store: Box<dyn BlobStore>, cache_dir: &Path) -> Result<SegmentedReader> {
+    pub fn open(
+        store: Box<dyn BlobStore>,
+        cache_dir: &Path,
+        source: &SourceIdentity,
+    ) -> Result<SegmentedReader> {
+        source.validate()?;
+        Self::load(store, cache_dir, Some(source))
+    }
+
+    pub fn inspect(store: Box<dyn BlobStore>, cache_dir: &Path) -> Result<SegmentedReader> {
+        Self::load(store, cache_dir, None)
+    }
+
+    fn load(
+        store: Box<dyn BlobStore>,
+        cache_dir: &Path,
+        source: Option<&SourceIdentity>,
+    ) -> Result<SegmentedReader> {
         let (bytes, root_version) = store
             .get_versioned("segments.bin")
             .context("reading segments.bin")?
             .context("no index found — run `holys3 index` first")?;
         let list = parse_segment_list(&bytes)?;
+        if let Some(source) = source {
+            anyhow::ensure!(
+                list.source.can_search(source),
+                "index was built for {}, which does not contain requested source {source}",
+                list.source
+            );
+        }
         let strategy = list.strategy;
         let mut segments = Vec::with_capacity(list.segments.len());
         for meta in list.segments {
@@ -916,6 +1027,12 @@ impl crate::IndexReader for SegmentedReader {
 mod tests {
     use super::*;
 
+    fn test_source() -> SourceIdentity {
+        SourceIdentity::Local {
+            prefix: "/test/".into(),
+        }
+    }
+
     fn segment() -> SegmentMeta {
         SegmentMeta {
             seg_id: "a".repeat(64),
@@ -936,6 +1053,7 @@ mod tests {
     fn encoded(segments: Vec<SegmentMeta>) -> Vec<u8> {
         postcard::to_allocvec(&SegmentList {
             format: INDEX_FORMAT,
+            source: test_source(),
             strategy: Strategy::Trigram,
             segments,
         })
@@ -961,6 +1079,55 @@ mod tests {
         let mut invalid_dead = segment();
         invalid_dead.dead_hash = "b".repeat(64);
         assert!(parse_segment_list(&encoded(vec![invalid_dead])).is_err());
+    }
+
+    #[test]
+    fn source_identity_allows_only_same_backend_subtrees() {
+        let local = test_source();
+        assert!(local.can_search(&SourceIdentity::Local {
+            prefix: "/test/child/".into()
+        }));
+        assert!(!local.can_search(&SourceIdentity::Local {
+            prefix: "/other/".into()
+        }));
+
+        let s3 = SourceIdentity::S3 {
+            endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+            bucket: "source".into(),
+            prefix: "logs/".into(),
+        };
+        assert!(s3.can_search(&SourceIdentity::S3 {
+            endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+            bucket: "source".into(),
+            prefix: "logs/app/".into(),
+        }));
+        assert!(!s3.can_search(&SourceIdentity::S3 {
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "source".into(),
+            prefix: "logs/".into(),
+        }));
+    }
+
+    #[test]
+    fn index_update_rejects_source_change_without_rebuild() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let store = holys3_core::LocalBlobStore::new(store_dir.path());
+        store.put("segments.bin", &encoded(Vec::new())).unwrap();
+        let other = SourceIdentity::Local {
+            prefix: "/other/".into(),
+        };
+        let error = update_index(
+            &store,
+            cache_dir.path(),
+            &other,
+            Strategy::Trigram,
+            &[],
+            false,
+            &|_| anyhow::bail!("source mismatch must fail before fetching"),
+        )
+        .expect_err("source mismatch must fail");
+        assert!(error.to_string().contains("use --rebuild to replace it"));
     }
 
     #[test]
@@ -1065,6 +1232,7 @@ mod tests {
         }
         let root = postcard::to_allocvec(&SegmentList {
             format: INDEX_FORMAT,
+            source: test_source(),
             strategy: Strategy::Trigram,
             segments,
         })
@@ -1074,6 +1242,7 @@ mod tests {
         let report = update_index(
             &store,
             cache_dir.path(),
+            &test_source(),
             Strategy::Trigram,
             &listing,
             false,

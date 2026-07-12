@@ -20,9 +20,9 @@ holys3 -i 'timeout' s3://my-logs -g '*.gz' -C2 --since 6h
 
 S3 has no native grep. The alternatives scan: download-everything-and-rg pays for
 every object on every query, and Athena bills per byte scanned. holys3 builds a
-compact trigram index _next to the data_ (under `.holys3/` in the same bucket),
-uses it to narrow each query to candidate objects, then fetches only those and
-verifies with real Rust regexes against the original bytes. **The index narrows
+compact trigram index in S3 (next to the data by default, or in a dedicated
+bucket), uses it to narrow each query to candidate objects, then fetches only
+those and verifies with real Rust regexes against the original bytes. **The index narrows
 candidates; the verifier decides matches** — results are always exact, never
 index-approximated.
 
@@ -53,14 +53,18 @@ AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2
 AWS_PROFILE=my-sso holys3 'level":"ERROR' s3://my-log-bucket/prod --region us-east-2
 AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2 --watch --interval 30
 
+# Keep the index in a separate bucket (required when the source is read-only)
+AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2 --index s3://my-search-index/holys3/my-log-bucket/prod --index-region us-east-2
+AWS_PROFILE=my-sso holys3 'level":"ERROR' s3://my-log-bucket/prod --region us-east-2 --index s3://my-search-index/holys3/my-log-bucket/prod --index-region us-east-2
+
 # rg-style flags work
 holys3 'req-[0-9a-f]+' s3://my-log-bucket --json | jq .
 holys3 -w -F 'foo(' s3://my-code-bucket -l
 
 # local directories work too
-holys3 index ./logs --out holys3.idxdir
+holys3 index ./logs --index holys3.idxdir
 holys3 'TODO|FIXME' ./logs --index holys3.idxdir
-holys3 index ./logs --out holys3.idxdir --watch --interval 30
+holys3 index ./logs --index holys3.idxdir --watch --interval 30
 ```
 
 The CLI follows ripgrep: `holys3 PATTERN TARGET`, where TARGET is
@@ -134,7 +138,12 @@ match the line terminator, and a literal `\n` in a pattern is an error.
   without a recognizable timestamp are searched anyway, with a note on stderr —
   time scoping never silently hides data.
 - `--region`, `--endpoint` (MinIO, R2, any S3-compatible store),
-  `--concurrency` (default 750), `--index` (local index dir)
+  `--concurrency` (default 750)
+- `--index LOCATION` — local path or `s3://bucket/prefix`; S3 defaults to
+  `<source-prefix>/.holys3` in the source bucket and local defaults to
+  `holys3.idxdir`
+- `--index-region`, `--index-endpoint` — connection overrides for an S3 index
+  in a different region or service
 - `--object-cache DIR --object-cache-cap BYTES` — explicit private cache for
   immutable S3 source bodies. Both flags are required; files are checksummed,
   content-addressed by endpoint/bucket/key/ETag, owner-only, atomically
@@ -171,7 +180,9 @@ The SDK signs requests and refreshes temporary credentials automatically.
 ### The index
 
 `holys3 index s3://bucket/prefix` maintains content-addressed segments under
-`.holys3/`. Runs are **incremental diffs**: only new or changed objects are
+`<prefix>/.holys3/` by default. `--index s3://other-bucket/path` moves the
+complete index to that exact namespace, so the source bucket may be read-only.
+Runs are **incremental diffs**: only new or changed objects are
 fetched and indexed, deletions take effect immediately, an unchanged bucket
 costs one listing (~seconds), and small segments merge automatically. Posting
 lists are density-classed and bit-packed, and grams shared by every document
@@ -183,6 +194,11 @@ blobs upload as concurrent multipart parts. Every immutable segment blob has
 its own SHA-256 length/hash contract; readers reject truncation, corruption,
 duplicate segment IDs, and malformed metadata before using it.
 
+The root records the indexed local directory or S3 endpoint, bucket, and
+prefix. Searches may select a narrower subtree of that source, but a broader
+or different source fails instead of returning an incomplete or out-of-scope
+result. `--rebuild` is required to repurpose an index location.
+
 `--watch --interval SECONDS` repeats the same listing, diff, and atomic root
 swap without overlapping cycles; the interval starts after each attempt. A
 startup failure exits, while failures after the first successful cycle are
@@ -191,8 +207,8 @@ SIGHUP, Ctrl-C, and Ctrl-Break finish any active cycle and stop cleanly.
 `--json` emits tagged `indexed`, `error`, and `stopped` JSON Lines on stdout;
 lower-layer notes and warnings remain on stderr.
 
-Local directories use the same format-9 physical-source/logical-document
-tables, written to `--out` (default `holys3.idxdir`) with BLAKE3 content
+Local directories use the same format-10 physical-source/logical-document
+tables, written to `--index` (default `holys3.idxdir`) with BLAKE3 content
 freshness tokens. Local verification rechecks the token, local runs are
 incremental, and `--rebuild` re-ingests everything. Raw candidate files are
 read concurrently under the same 512 MiB byte budget; expanding formats stay
@@ -287,9 +303,10 @@ reference. Refresh it only from CI's `bench-micro` artifact.
 
 ## Security
 
-Use private buckets. The index lives in the same account and bucket namespace
-as the data, under `.holys3/`. holys3 contacts the configured S3 endpoint and
-the AWS credential endpoints required by the active SDK provider chain.
+Use private buckets. The default index lives under `<source-prefix>/.holys3/`;
+`--index s3://bucket/prefix` may place it in a separately permissioned bucket.
+holys3 contacts the configured source and index S3 endpoints plus the AWS
+credential endpoints required by the active SDK provider chains.
 
 ## Contributing
 

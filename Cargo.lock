@@ -2096,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "holys3"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "holys3-bench"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "holys3-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "holys3-index"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "holys3-query"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "holys3-core",
@@ -2207,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "holys3-s3"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aws-config",

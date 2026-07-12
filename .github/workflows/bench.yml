@@ -164,7 +164,7 @@ jobs:
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
             "$MINIO_IMAGE" server /data --address :9000
-      - name: Create bucket
+      - name: Create buckets
         env:
           MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
@@ -175,6 +175,7 @@ jobs:
             sleep 1
           done
           docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-bench
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-index
       - name: Build benchmark binaries
         run: cargo build --locked --release -p holys3 -p holys3-bench
       - name: Run xbench
@@ -189,6 +190,19 @@ jobs:
           target/release/holys3-bench upload --target s3
           target/release/holys3-bench run --scenarios crates/xbench/scenarios/queries.toml --iterations 3 --warmup 1 --concurrency 64
           target/release/holys3-bench render --input crates/xbench/runs/latest.json > bench-e2e.md
+      - name: Test independent index bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
+        run: |
+          source_index_keys=$(docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ls --recursive --json local/holys3-bench/xbench/.holys3 | wc -l)
+          target/release/holys3 index s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild
+          target/release/holys3 -l longliteralbenchmarktoken s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-independent-index-hits.txt
+          test "$(wc -l < bench-independent-index-hits.txt)" -eq 334
+          if target/release/holys3 -q longliteralbenchmarktoken s3://holys3-bench/xbench/missing --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64; then exit 1; else test "$?" -eq 1; fi
+          if target/release/holys3 -q longliteralbenchmarktoken s3://holys3-bench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64; then exit 1; else test "$?" -eq 2; fi
+          test "$(docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ls --recursive --json local/holys3-bench/xbench/.holys3 | wc -l)" -eq "$source_index_keys"
       - name: Test large-object ranged fetch
         env:
           AWS_ACCESS_KEY_ID: minioadmin
@@ -251,6 +265,7 @@ jobs:
           path: |
             bench-e2e.md
             bench-entropy-*.txt
+            bench-independent-index-hits.txt
             bench-s3-*.txt
             crates/xbench/runs/latest.json
           if-no-files-found: ignore

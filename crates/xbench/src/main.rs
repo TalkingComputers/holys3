@@ -14,7 +14,7 @@ use gen::{
 use holys3_core::{DocFetcher, LocalBlobStore, Strategy};
 use holys3_index::{
     search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, LocalFetcher, NullSink,
-    SegmentedReader,
+    SegmentedReader, SourceIdentity,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
@@ -27,6 +27,22 @@ use std::time::{Duration, Instant};
 
 const S3_PREFIX: &str = "xbench";
 const DEFAULT_CONCURRENCY: usize = 64;
+
+fn dir_source_identity() -> Result<SourceIdentity> {
+    let root = std::fs::canonicalize(objects_dir())?;
+    let mut prefix = root
+        .to_str()
+        .with_context(|| format!("benchmark source is not UTF-8: {}", root.display()))?
+        .to_owned();
+    #[cfg(windows)]
+    {
+        prefix = prefix.replace('\\', "/");
+    }
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    Ok(SourceIdentity::Local { prefix })
+}
 
 #[derive(Parser)]
 #[command(name = "holys3-bench")]
@@ -191,6 +207,7 @@ fn upload_dir() -> Result<()> {
     update_index(
         &store,
         &dir_cache_dir(),
+        &dir_source_identity()?,
         Strategy::Trigram,
         &listing,
         false,
@@ -248,9 +265,15 @@ fn upload_s3(manifest: &SeedManifest) -> Result<()> {
     );
     let client = backend.client;
     let bucket = backend.bucket.clone();
+    let source = SourceIdentity::S3 {
+        endpoint: client.endpoint_identity(),
+        bucket: bucket.clone(),
+        prefix: format!("{S3_PREFIX}/"),
+    };
     let report = update_index(
         &store,
         &cache_dir,
+        &source,
         Strategy::Trigram,
         &listing,
         false,
@@ -301,6 +324,7 @@ fn run_dir(
     let reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(local_index_dir())),
         &dir_cache_dir(),
+        &dir_source_identity()?,
     )?;
     let fetcher = LocalFetcher::new(concurrency)?;
     let single_fetcher = LocalFetcher::new(1)?;
@@ -346,7 +370,12 @@ fn run_s3(
         S3_PREFIX.to_owned(),
     );
     let cache_dir = reports_dir().join("s3-cache");
-    let reader = SegmentedReader::open(Box::new(store), &cache_dir)?;
+    let source = SourceIdentity::S3 {
+        endpoint: backend.client.endpoint_identity(),
+        bucket: backend.bucket.clone(),
+        prefix: format!("{S3_PREFIX}/"),
+    };
+    let reader = SegmentedReader::open(Box::new(store), &cache_dir, &source)?;
     let fetcher = S3Fetcher::new(backend.client.clone(), backend.bucket.clone());
     let single_fetcher = S3Fetcher::new(single_backend.client, backend.bucket.clone());
     let results = run_all(

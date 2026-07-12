@@ -3,13 +3,19 @@ use holys3_core::{
     grams_index, grams_query, pack_trigram_grams, testutil::MemCorpus, Corpus, LocalBlobStore,
     Strategy,
 };
-use holys3_index::{update_index, IndexReader, SegmentedReader};
+use holys3_index::{update_index, IndexReader, SegmentedReader, SourceIdentity};
 use holys3_query::plan;
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Duration;
 
 const SAMPLE: &[u8] = include_bytes!("fixtures/sample.txt");
+
+fn source_identity() -> SourceIdentity {
+    SourceIdentity::Local {
+        prefix: "/benchmark/".into(),
+    }
+}
 
 fn mem_corpus() -> MemCorpus {
     let mut keys = Vec::new();
@@ -140,6 +146,7 @@ fn bench_index_reader(c: &mut Criterion) {
     update_index(
         &store,
         cache_dir.path(),
+        &source_identity(),
         Strategy::Sparse,
         &listing,
         false,
@@ -159,6 +166,7 @@ fn bench_index_reader(c: &mut Criterion) {
     let store_reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache_dir.path(),
+        &source_identity(),
     )
     .expect("benchmark setup failed");
     let q = plan("ERROR42", store_reader.strategy()).expect("benchmark setup failed");
@@ -204,6 +212,7 @@ fn bench_index_build(c: &mut Criterion) {
                     update_index(
                         &LocalBlobStore::new(store_dir.path()),
                         cache_dir.path(),
+                        &source_identity(),
                         strategy,
                         &listing,
                         false,

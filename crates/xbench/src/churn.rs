@@ -1,7 +1,7 @@
 use crate::gen::{
     churn_run_path, doc_path, local_index_dir, objects_dir, read_manifest, reports_dir,
 };
-use crate::{dir_cache_dir, percentile_ms, DEFAULT_CONCURRENCY};
+use crate::{dir_cache_dir, dir_source_identity, percentile_ms, DEFAULT_CONCURRENCY};
 use anyhow::{Context, Result};
 use holys3_core::{LocalBlobStore, MatchOptions, Strategy};
 use holys3_index::{
@@ -76,6 +76,7 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
     let initial_reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(local_index_dir())),
         &dir_cache_dir(),
+        &dir_source_identity()?,
     )
     .context("opening local benchmark index")?;
     anyhow::ensure!(
@@ -122,6 +123,7 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
         let report = update_index(
             &LocalBlobStore::new(local_index_dir()),
             &dir_cache_dir(),
+            &dir_source_identity()?,
             Strategy::Trigram,
             &listing,
             false,
@@ -151,6 +153,7 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
     let reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(local_index_dir())),
         &dir_cache_dir(),
+        &dir_source_identity()?,
     )?;
     let fetcher = LocalFetcher::new(DEFAULT_CONCURRENCY)?;
     let stats = search_streaming(

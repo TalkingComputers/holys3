@@ -10,17 +10,17 @@ The main boundary is IO. `holys3-core`, `holys3-query`, and `holys3-index` are m
 
 ### Index pipeline
 
-`holys3 index s3://bucket[/prefix]` lists the prefix, filters out the exact index namespace, diffs (key, etag) pairs against the union of existing segment doc tables, builds one or more bounded content-addressed segments over the changes (tombstoning superseded docs), optionally merges small adjacent segments, and atomically swaps `.holys3/segments.bin`. Large segment blobs upload as concurrent multipart parts.
+`holys3 index s3://bucket[/prefix]` lists the prefix, filters out any co-located index namespace, diffs (key, etag) pairs against the union of existing segment doc tables, builds one or more bounded content-addressed segments over the changes (tombstoning superseded docs), optionally merges small adjacent segments, and atomically swaps the index root pointer. The index defaults to `<prefix>/.holys3/`; `--index s3://other-bucket/path` selects an independent bucket and namespace. Large segment blobs upload as concurrent multipart parts.
 
-`holys3 index <DIR>` is the same pipeline over a local blob store rooted at `--out`: it walks the canonicalized directory, computes BLAKE3 content tokens, and runs the identical incremental diff — there is exactly one index format.
+`holys3 index <DIR>` is the same pipeline over the selected local or S3 index blob store: it walks the canonicalized directory, computes BLAKE3 content tokens, and runs the identical incremental diff — there is exactly one index format.
 
 `--watch --interval SECONDS` opens the target once, retains one refreshing S3 client when applicable, and serializes fresh listing/diff/CAS cycles through the same pipeline. The interval begins after an attempt completes. Continuous mode adds no daemon database, event-consumer path, or second index transaction.
 
 ### Search pipeline
 
-`holys3 <PATTERN> <DIR> --index ...` opens the segmented index in the local index directory, plans a gram query from the regex (prefix, suffix, AND inner literals), reads candidate ids, fetches local files, and renders rg-style verified results.
+`holys3 <PATTERN> <DIR> --index ...` opens the segmented index from its local or S3 location, plans a gram query from the regex (prefix, suffix, AND inner literals), reads candidate ids, fetches local files, and renders rg-style verified results.
 
-`holys3 <PATTERN> s3://bucket[/prefix]` opens the in-bucket segmented index through the S3 blob store, caches immutable segment blobs locally, reads posting blocks with coalesced ranged GETs, groups logical candidates by physical source, and fetches each source with an ETag-bound conditional GET. Sources of at least 64 MiB are reconstructed from four concurrent 8 MiB conditional ranges whose response chunks spool directly to private temporary files. An optional explicit source-object cache sits before decoding.
+`holys3 <PATTERN> s3://bucket[/prefix]` opens the default in-bucket or explicit independent segmented index through its blob store, caches immutable segment blobs locally, reads posting blocks with coalesced ranged GETs, groups logical candidates by physical source, and fetches each source with an ETag-bound conditional GET. Sources of at least 64 MiB are reconstructed from four concurrent 8 MiB conditional ranges whose response chunks spool directly to private temporary files. An optional explicit source-object cache sits before decoding.
 
 ## Code Map
 
@@ -28,7 +28,7 @@ The main boundary is IO. `holys3-core`, `holys3-query`, and `holys3-index` are m
 
 `crates/query` turns a regex pattern into a gram query using regex-syntax literal extraction. It chooses candidate constraints, not matches. Architectural Invariant: query must not read corpus bytes, fetch indexes, or decide final answers.
 
-`crates/index` builds and reads the FST term dictionary, postings blocks, format-9 source/document tables, segment lists, local corpus, and the store-backed segmented index reader. One physical archive may emit many logical posting IDs. The reader joins candidates back to typed source/member addresses and delegates final verification to canonical decoded bytes. Architectural Invariant: index must not treat candidates as answers.
+`crates/index` builds and reads the FST term dictionary, postings blocks, format-10 source/document tables, source-bound segment lists, local corpus, and the store-backed segmented index reader. One physical archive may emit many logical posting IDs. The reader joins candidates back to typed source/member addresses and delegates final verification to canonical decoded bytes. Architectural Invariant: index must not treat candidates as answers.
 
 Index construction emits bounded sorted posting runs to temporary files and k-way merges them into the final FST/postings pair while computing each blob's SHA-256 digest in the same write. Trigram dictionaries above one million temporary posting records use 256 independently streamed first-byte FST shards in one immutable term blob, bounding builder state for dense three-byte keyspaces; smaller trigram dictionaries and sparse dictionaries remain one FST. Completed runs retain closed temporary paths; merge fan-in opens at most 64 runs. Corpus cardinality does not require one global in-memory postings map. Oversized local and S3 source bodies and decoded output above 8 MiB remain file-backed. Trigram and sparse extraction read those files in bounded 1 MiB chunks; high-cardinality trigram inputs retain a fixed 2 MiB bitmap and stream it directly to a posting run, while sparse grams use exact short-gram bitmaps and bounded external-sort runs. Raw sources extract grams in parallel, while formats that can expand are decoded and flushed one source at a time. The segment cap applies to logical documents: an oversized multi-source shard is bisected at source boundaries and rebuilt, while one physical source that alone exceeds the cap fails explicitly.
 
@@ -54,10 +54,10 @@ Fallible boundaries return `anyhow::Result`. Format checks use explicit validati
 
 Continuous indexing fails its first cycle so invalid targets, credentials, and index state cannot become a silently unhealthy process. After one successful cycle, later errors are emitted and retried after the configured interval. `--rebuild` is passed only to cycle 1. A stop signal interrupts the wait or lets an active cycle reach the atomic root-swap boundary before clean exit.
 
-### The index lives in the bucket
+### Index storage
 
-For S3, index data is written under `.holys3/` or `<prefix>/.holys3/` in the same bucket namespace as the searched objects. The search path reads `.holys3/segments.bin` (the root pointer), opens each live segment, then uses coalesced ranged GETs against postings data to find candidates.
+S3 sources default to index data under `.holys3/` or `<prefix>/.holys3/` in the source bucket. `--index` may instead name any local path or prefixed S3 location; `--index-region` and `--index-endpoint` independently configure that S3 client. The search path reads the selected root pointer, verifies its source identity, opens each live segment, then uses coalesced ranged GETs against postings data to find candidates. Searches may narrow the recorded source prefix but cannot broaden it or change its endpoint or bucket. Co-located explicit namespaces are excluded from source listings only when endpoint and bucket both match, and namespaces that contain the source prefix are rejected.
 
 ### Reader consistency
 
-The root swap is atomic and concurrent writers use compare-and-swap. Segment blobs are immutable and format 9 records the length and SHA-256 digest of each FST, postings, and document-table blob. Garbage collection runs after the root swap; readers detect a missing old segment as an `IndexChanged` error, and the CLI reopens the new root once before emitting any result.
+The root swap is atomic and concurrent writers use compare-and-swap. Format 10 binds the root to its source identity and records the length and SHA-256 digest of each immutable FST, postings, and document-table blob. Garbage collection runs after the root swap; readers detect a missing old segment as an `IndexChanged` error, and the CLI reopens the new root once before emitting any result.

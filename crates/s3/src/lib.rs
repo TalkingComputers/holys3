@@ -66,24 +66,33 @@ pub fn is_index_key(prefix: &str, key: &str) -> bool {
             .is_some_and(|relative| relative.starts_with('/'))
 }
 
-/// Index blob storage under `<prefix>/.holys3/` in the bucket.
+/// Index blob storage under an S3 key prefix.
 pub struct S3BlobStore {
     client: S3Client,
     bucket: String,
-    prefix: String,
+    root: String,
 }
 
 impl S3BlobStore {
     pub fn new(client: S3Client, bucket: String, prefix: String) -> S3BlobStore {
+        Self::at(client, bucket, build_index_namespace(&prefix))
+    }
+
+    pub fn at(client: S3Client, bucket: String, root: String) -> S3BlobStore {
         S3BlobStore {
             client,
             bucket,
-            prefix,
+            root: root.trim_matches('/').to_owned(),
         }
     }
 
     fn build_key(&self, name: &str) -> String {
-        build_index_key(&self.prefix, name)
+        let name = name.trim_start_matches('/');
+        if self.root.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{}/{name}", self.root)
+        }
     }
 
     fn blob_context(&self, name: &str) -> String {
@@ -481,5 +490,20 @@ mod tests {
         assert_eq!(list_prefix("foo"), "foo/");
         assert_eq!(list_prefix("foo/"), "foo/");
         assert_eq!(list_prefix("/a//b/"), "/a//b/");
+    }
+
+    #[test]
+    fn explicit_index_root_preserves_blob_name_semantics() {
+        let client = S3Client::connect_static(
+            "us-east-1".into(),
+            "test".into(),
+            "test".into(),
+            None,
+            Some("http://127.0.0.1:9000".into()),
+            FetchConfig::default(),
+        )
+        .unwrap();
+        let store = S3BlobStore::at(client, "bucket".into(), "/index/".into());
+        assert_eq!(store.build_key("/segments.bin"), "index/segments.bin");
     }
 }

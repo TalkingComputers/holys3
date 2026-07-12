@@ -6,8 +6,15 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Added
+
+- `--index` accepts a local path or an independent prefixed S3 location, with separate `--index-region` and `--index-endpoint` controls for read-only source buckets and cross-region or S3-compatible index storage.
+
 ### Changed
 
+- Index format 10 binds every root to its canonical local source or S3 endpoint, bucket, and prefix; searches may narrow that scope but reject broader or different sources.
+- The legacy `--out` flag remains accepted for local index builds and is rejected for S3 targets; `--index` is the unambiguous storage-location flag.
+- The workspace version is now 0.6.0 for the index-format and public library API break.
 - S3 now uses the official AWS SDK credential, endpoint, signing, and operation implementations while retaining holys3's adaptive concurrency, retries, hedging, range coalescing, and bounded body storage.
 - The minimum supported Rust version is now 1.94.1, required by the current AWS SDK.
 

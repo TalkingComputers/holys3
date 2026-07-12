@@ -387,7 +387,7 @@ impl S3Client {
         })))
     }
 
-    pub(crate) fn endpoint_identity(&self) -> String {
+    pub fn endpoint_identity(&self) -> String {
         self.0
             .endpoint_base
             .clone()
@@ -690,6 +690,10 @@ mod tests {
             while requests < 2 && std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
                         let mut request = [0u8; 8192];
                         let _ = stream.read(&mut request).unwrap();
                         requests += 1;

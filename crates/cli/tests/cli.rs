@@ -529,7 +529,21 @@ fn local_index_cannot_contain_target() {
 }
 
 #[test]
-fn local_target_does_not_escape_directory() {
+fn s3_target_rejects_legacy_out() {
+    holys3()
+        .args(["index", "s3://bucket", "--out", "holys3.idxdir"])
+        .env("AWS_ACCESS_KEY_ID", "test")
+        .env("AWS_SECRET_ACCESS_KEY", "test")
+        .env("AWS_REGION", "us-east-1")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--out only applies to local targets; use --index for S3",
+        ));
+}
+
+#[test]
+fn local_index_rejects_a_different_target() {
     let indexed = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
     let index = tempfile::tempdir().unwrap();
@@ -549,8 +563,11 @@ fn local_target_does_not_escape_directory() {
         .arg(index.path())
         .arg("-l")
         .assert()
-        .code(1)
-        .stdout(predicate::str::is_empty());
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "does not contain requested source",
+        ));
 }
 
 #[test]

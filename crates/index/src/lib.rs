@@ -11,7 +11,9 @@ mod terms;
 pub use search::{
     search_collect, search_streaming, DocResult, KeyScope, MatchSink, NullSink, SinkFlow,
 };
-pub use segment::{update_index, CorpusFactory, IndexChanged, SegmentedReader, UpdateReport};
+pub use segment::{
+    update_index, CorpusFactory, IndexChanged, SegmentedReader, SourceIdentity, UpdateReport,
+};
 
 #[cfg(test)]
 use build::{
@@ -49,7 +51,7 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 9;
+const INDEX_FORMAT: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -609,6 +611,12 @@ mod tests {
     use holys3_core::testutil::MemCorpus;
     use holys3_core::{LineEvent, LineKind, LocalBlobStore, MatchOptions, SubMatch};
 
+    fn test_source() -> SourceIdentity {
+        SourceIdentity::Local {
+            prefix: "/test/".into(),
+        }
+    }
+
     struct OutOfRangeCorpus {
         sources: Vec<SourceObject>,
     }
@@ -650,6 +658,7 @@ mod tests {
         update_index(
             &LocalBlobStore::new(store_dir.path()),
             cache_dir.path(),
+            &test_source(),
             strategy,
             &listing,
             false,
@@ -673,6 +682,7 @@ mod tests {
         let r = SegmentedReader::open(
             Box::new(LocalBlobStore::new(store_dir.path())),
             cache_dir.path(),
+            &test_source(),
         )
         .unwrap();
         (store_dir, cache_dir, r)

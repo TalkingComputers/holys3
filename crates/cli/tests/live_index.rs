@@ -1,5 +1,5 @@
 use holys3_core::{DocFetcher, Strategy};
-use holys3_index::{search_collect, update_index, SegmentedReader};
+use holys3_index::{search_collect, update_index, SegmentedReader, SourceIdentity};
 use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus, S3Fetcher};
 
 #[test]
@@ -13,6 +13,11 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
     };
     let region = std::env::var("AWS_REGION")?;
     let client = S3Client::connect(Some(region), None, FetchConfig::default())?;
+    let source = SourceIdentity::S3 {
+        endpoint: client.endpoint_identity(),
+        bucket: bucket.clone(),
+        prefix: String::new(),
+    };
     let listing = client
         .list(&bucket, "")?
         .into_iter()
@@ -26,6 +31,7 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
     update_index(
         &store,
         cache_dir.path(),
+        &source,
         Strategy::Trigram,
         &listing,
         false,
@@ -44,6 +50,7 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
             String::new(),
         )),
         cache_dir.path(),
+        &source,
     )?;
     let fetcher = S3Fetcher::new(client, bucket);
     assert_hit(&reader, &fetcher, "world", "b.txt")?;
