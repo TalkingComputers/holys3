@@ -26,6 +26,7 @@ base64 = "0.22.1"
 globset = "0.4.18"
 mimalloc = { version = "0.1.52", features = ["no_thp"] }
 clap.workspace = true
+ctrlc = { version = "3.5.2", features = ["termination"] }
 regex.workspace = true
 regex-syntax.workspace = true
 serde.workspace = true

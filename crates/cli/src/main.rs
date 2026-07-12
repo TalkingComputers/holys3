@@ -1,4 +1,5 @@
 mod globs;
+mod index;
 mod json;
 mod patterns;
 mod printer;
