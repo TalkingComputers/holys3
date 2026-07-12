@@ -21,7 +21,12 @@ check:
 	typos
 
 package:
-	cargo package --locked --workspace
+	cargo package --locked -p holys3-core
+	cargo package --locked -p holys3-query --config 'patch.crates-io.holys3-core.path="crates/core"'
+	cargo package --locked -p holys3-index --config 'patch.crates-io.holys3-core.path="crates/core"' --config 'patch.crates-io.holys3-query.path="crates/query"'
+	cargo package --locked -p holys3-s3 --config 'patch.crates-io.holys3-core.path="crates/core"'
+	cargo package --locked -p holys3 --config 'patch.crates-io.holys3-core.path="crates/core"' --config 'patch.crates-io.holys3-index.path="crates/index"' --config 'patch.crates-io.holys3-s3.path="crates/s3"'
+	cargo package --locked -p holys3-bench --config 'patch.crates-io.holys3-core.path="crates/core"' --config 'patch.crates-io.holys3-index.path="crates/index"' --config 'patch.crates-io.holys3-s3.path="crates/s3"'
 
 bench: bench-micro
 
