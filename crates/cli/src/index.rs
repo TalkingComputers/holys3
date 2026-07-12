@@ -151,7 +151,11 @@ fn run_cycles(
             if let Some(error) = fail_fast_error.as_ref().filter(|_| !config.json) {
                 eprintln!("cycle {cycle}: index failed: {error:#}");
             }
-            return write_stopped(config, cycle, output);
+            write_stopped(config, cycle, output)?;
+            return match fail_fast_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
         }
         if let Some(error) = fail_fast_error {
             return Err(error);
@@ -355,7 +359,7 @@ mod tests {
             sender.try_send(()).unwrap();
             anyhow::bail!("offline")
         };
-        run_cycles(
+        let error = run_cycles(
             IndexConfig {
                 target: "./logs",
                 interval: Some(Duration::from_secs(60)),
@@ -366,7 +370,8 @@ mod tests {
             &mut output,
             &mut build,
         )
-        .unwrap();
+        .unwrap_err();
+        assert_eq!(error.to_string(), "offline");
         assert_eq!(
             parse_events(&output)
                 .iter()
