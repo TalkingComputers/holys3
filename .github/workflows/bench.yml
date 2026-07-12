@@ -276,6 +276,10 @@ jobs:
           target/release/holys3-bench run --scenarios crates/xbench/scenarios/queries.toml --iterations 1 --warmup 0 --concurrency 64
           target/release/holys3-bench render --input crates/xbench/runs/latest.json > bench-scale.md
           cp crates/xbench/runs/latest.json bench-scale.json
+      - name: Profile incremental churn
+        run: |
+          /usr/bin/time -v -o bench-churn-rss.txt target/release/holys3-bench churn --cycles 10 --changes 250 | tee bench-churn.txt
+          cp crates/xbench/runs/churn.json bench-churn.json
       - name: Profile 256 MiB decoded workload
         run: |
           mkdir -p /tmp/holys3-large-data
@@ -303,11 +307,18 @@ jobs:
       - name: Enforce peak memory ceilings
         run: |
           python3 <<'PY'
+          import json
+          import math
           import re
           from pathlib import Path
 
           limit_kib = 300 * 1024
-          for name in ("bench-scale-index.txt", "bench-scale-large.txt", "bench-scale-sparse.txt"):
+          for name in (
+              "bench-scale-index.txt",
+              "bench-scale-large.txt",
+              "bench-scale-sparse.txt",
+              "bench-churn-rss.txt",
+          ):
               lines = Path(name).read_text().splitlines()
               field = next(line for line in lines if "Maximum resident set size" in line)
               peak_kib = int(field.rsplit(":", 1)[1])
@@ -335,6 +346,44 @@ jobs:
           build_limit_ms = 14_000
           if build_ms > build_limit_ms:
               raise SystemExit(f"25,000-object build took {build_ms:.3f} ms, exceeds {build_limit_ms} ms")
+
+          churn = json.loads(Path("bench-churn.json").read_text())
+          expected_fields = {
+              "cycles",
+              "changes_per_cycle",
+              "total_docs",
+              "listing_p50_ms",
+              "listing_p95_ms",
+              "update_p50_ms",
+              "update_p95_ms",
+              "final_segments",
+          }
+          if set(churn) != expected_fields:
+              raise SystemExit(f"churn summary fields are {sorted(churn)}, expected {sorted(expected_fields)}")
+          for name, expected in (
+              ("cycles", 10),
+              ("changes_per_cycle", 250),
+              ("total_docs", 25_000),
+          ):
+              value = churn[name]
+              if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+                  raise SystemExit(f"churn {name} is {value!r}, expected {expected}")
+          for name in (
+              "listing_p50_ms",
+              "listing_p95_ms",
+              "update_p50_ms",
+              "update_p95_ms",
+          ):
+              value = churn[name]
+              if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                  raise SystemExit(f"churn {name} must be a positive finite number, got {value!r}")
+          if churn["listing_p95_ms"] > 2_000:
+              raise SystemExit(f"churn listing p95 {churn['listing_p95_ms']:.3f} ms exceeds 2000 ms")
+          if churn["update_p95_ms"] > 5_000:
+              raise SystemExit(f"churn update p95 {churn['update_p95_ms']:.3f} ms exceeds 5000 ms")
+          final_segments = churn["final_segments"]
+          if isinstance(final_segments, bool) or not isinstance(final_segments, int) or final_segments <= 0:
+              raise SystemExit(f"churn final_segments must be a positive integer, got {final_segments!r}")
           PY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
@@ -347,6 +396,9 @@ jobs:
             bench-scale-large.txt
             bench-scale-sparse.txt
             bench-scale.json
+            bench-churn.txt
+            bench-churn-rss.txt
+            bench-churn.json
             bench-expansion-index.txt
             bench-expansion-search.txt
             bench-expansion-hits.txt
