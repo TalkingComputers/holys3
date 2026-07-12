@@ -1,8 +1,6 @@
 //! Segmented incremental index over a `BlobStore`.
 //!
-//! Layout under the store root (`<id>` = sha256 of the three blobs' bytes,
-//! so identical ids imply identical bytes — blobs are write-once and
-//! cache-forever):
+//! Layout under the store root:
 //!
 //! ```text
 //! segments.bin                  root pointer (SegmentList), rewritten per index run
@@ -10,21 +8,24 @@
 //! segments/<id>/postings.bin
 //! segments/<id>/docs.bin
 //! segments/<id>/dead-<hash>.bin immutable dead-id sets, referenced by hash
+//! packs/<hash>.pack             immutable canonical decoded content frames
 //! ```
 //!
 //! `holys3 index` becomes a diff: list the bucket, compare (key, etag)
 //! against the union of segment doc tables, build bounded segments over the
-//! changes, mark superseded entries dead, and atomically swap segments.bin.
+//! changes, tombstone superseded documents, periodically repack, and atomically
+//! swap segments.bin.
 
 #[cfg(test)]
 use crate::format::DocEntry;
 use crate::format::{parse_dead, parse_tables, DeadSet, SegmentTables, SourceEntry};
+use crate::pack::{PackFile, PackMeta};
 use crate::terms::TermMap;
 use crate::{candidates_with, INDEX_FORMAT};
 use anyhow::{Context, Result};
 use cache::{cached_blob, cached_file, map_file};
-use compact::maybe_compact;
-use holys3_core::{BlobStore, Corpus, DocAddress, Strategy};
+use compact::{maybe_compact, merge_segments};
+use holys3_core::{BlobStore, Corpus, DocAddress, IndexAddress, Strategy};
 use holys3_query::Query;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -44,6 +45,7 @@ const SEGMENT_COUNT_TARGET: usize = 8;
 const MERGE_POSTINGS_CAP: u64 = 256 * 1024 * 1024;
 const MERGE_TERMS_CAP: u64 = 64 * 1024 * 1024;
 const MERGE_DOCS_CAP: u64 = 64 * 1024 * 1024;
+const REPACK_DEAD_FRACTION: usize = 4;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SegmentMeta {
@@ -59,6 +61,7 @@ pub(crate) struct SegmentMeta {
     pub max_key: String,
     pub dead_hash: String,
     pub dead_len: u64,
+    pub packs: Vec<PackMeta>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -159,6 +162,10 @@ fn segment_blob(seg_id: &str, name: &str) -> String {
     format!("segments/{seg_id}/{name}")
 }
 
+fn pack_blob(hash: &str) -> String {
+    format!("packs/{hash}.pack")
+}
+
 fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
     let list: SegmentList = postcard::from_bytes(bytes)
         .context("segments.bin unreadable; run `holys3 index` to rebuild")?;
@@ -193,6 +200,13 @@ fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
                 || (is_sha256(&segment.dead_hash) && segment.dead_len > 0),
             "segment dead-set metadata is invalid"
         );
+        anyhow::ensure!(
+            segment
+                .packs
+                .iter()
+                .all(|pack| is_sha256(&pack.hash) && pack.len > 0),
+            "segment pack metadata is invalid"
+        );
     }
     Ok(list)
 }
@@ -215,6 +229,27 @@ fn validate_segment_tables(meta: &SegmentMeta, tables: &SegmentTables) -> Result
         first.key == meta.min_key && last.key == meta.max_key,
         "segment key bounds do not match its source table"
     );
+    let pack_count = tables
+        .blocks
+        .last()
+        .map_or(0usize, |block| block.pack as usize + 1);
+    anyhow::ensure!(
+        pack_count == meta.packs.len(),
+        "segment pack count does not match its metadata"
+    );
+    for (pack_id, pack) in meta.packs.iter().enumerate() {
+        let end = tables
+            .blocks
+            .iter()
+            .rev()
+            .find(|block| block.pack as usize == pack_id)
+            .map(|block| block.offset + u64::from(block.compressed_len))
+            .context("segment pack has no blocks")?;
+        anyhow::ensure!(
+            end == pack.len,
+            "segment pack length does not match its blocks"
+        );
+    }
     Ok(())
 }
 
@@ -254,6 +289,12 @@ pub struct UpdateReport {
     pub up_to_date: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpdateOptions {
+    pub rebuild: bool,
+    pub purge_deleted: bool,
+}
+
 #[derive(Debug)]
 pub struct IndexChanged;
 
@@ -278,9 +319,13 @@ pub fn update_index(
     source: &SourceIdentity,
     strategy: Strategy,
     listing: &[(String, String, u64)],
-    rebuild: bool,
+    options: UpdateOptions,
     make_corpus: &CorpusFactory<'_>,
 ) -> Result<UpdateReport> {
+    let UpdateOptions {
+        rebuild,
+        purge_deleted,
+    } = options;
     source.validate()?;
     let mut listing_keys = std::collections::HashSet::with_capacity(listing.len());
     for (key, _, _) in listing {
@@ -387,7 +432,21 @@ pub fn update_index(
 
     let root_missing = root_version.is_none();
     let needs_compaction = existing.len() > SEGMENT_COUNT_TARGET;
-    if to_add.is_empty() && newly_dead.is_empty() && !forced && !needs_compaction && !root_missing {
+    let needs_repack =
+        dead_sets
+            .iter()
+            .zip(&tables)
+            .zip(&existing)
+            .any(|((dead, tables), meta)| {
+                !dead.sources.is_empty() && (purge_deleted || should_repack(meta, tables, dead))
+            });
+    if to_add.is_empty()
+        && newly_dead.is_empty()
+        && !forced
+        && !needs_compaction
+        && !needs_repack
+        && !root_missing
+    {
         return Ok(UpdateReport {
             added: 0,
             removed: 0,
@@ -400,9 +459,8 @@ pub fn update_index(
     let added = to_add.len();
     let removed = newly_dead.len();
 
-    // Fold the new deaths into per-segment dead sets, then drop fully-dead
-    // segments (collect_garbage deletes their blobs after the root swap).
     let mut metas = existing;
+    let mut changed_dead = vec![false; metas.len()];
     for group in newly_dead.chunk_by(|a, b| a.0 == b.0) {
         let seg_idx = group[0].0;
         let mut dead = dead_sets[seg_idx].clone();
@@ -416,20 +474,33 @@ pub fn update_index(
         dead.sources.dedup();
         dead.documents.sort_unstable();
         dead.documents.dedup();
-        write_dead(store, &mut metas[seg_idx], &dead)?;
         dead_sets[seg_idx] = dead;
+        changed_dead[seg_idx] = true;
     }
-    // Snapshot AFTER the dead-set rewrites: a segment that just got a fresh
-    // dead blob and then drops out (fully dead, or merged away) must have
-    // that fresh blob GC'd too, not only its pre-run one.
-    replaced.extend(metas.iter().cloned());
-    let mut keep: Vec<(SegmentMeta, DeadSet)> = metas
-        .into_iter()
-        .zip(dead_sets)
-        .enumerate()
-        .filter(|(seg_idx, (_, dead))| dead.sources.len() < tables[*seg_idx].sources.len())
-        .map(|(_, item)| item)
-        .collect();
+    let mut keep = Vec::with_capacity(metas.len());
+    let mut repacked = false;
+    for (seg_idx, (mut meta, dead)) in metas.drain(..).zip(dead_sets).enumerate() {
+        if dead.sources.len() == tables[seg_idx].sources.len() {
+            continue;
+        }
+        if dead.sources.is_empty() {
+            keep.push((meta, dead));
+        } else if purge_deleted || should_repack(&meta, &tables[seg_idx], &dead) {
+            let rewritten = merge_segments(store, cache_dir, strategy, &[(meta, dead)])?;
+            replaced.push(rewritten.clone());
+            keep.push((rewritten, DeadSet::default()));
+            repacked = true;
+        } else {
+            dead.validate(&tables[seg_idx])?;
+            if changed_dead[seg_idx] {
+                let (hash, len) = write_dead(store, &meta.seg_id, &dead)?;
+                meta.dead_hash = hash;
+                meta.dead_len = len;
+                replaced.push(meta.clone());
+            }
+            keep.push((meta, dead));
+        }
+    }
 
     // Build the new segment(s) over the changes, capped.
     for shard in to_add.chunks(SEGMENT_DOC_CAP) {
@@ -441,7 +512,7 @@ pub fn update_index(
         }
     }
 
-    let compacted = maybe_compact(store, cache_dir, strategy, &mut keep)?;
+    let compacted = maybe_compact(store, cache_dir, strategy, &mut keep)? || repacked;
 
     if added == 0 && removed == 0 && !forced && !root_missing && !compacted {
         return Ok(UpdateReport {
@@ -497,6 +568,7 @@ fn meta_blobs(meta: &SegmentMeta) -> Vec<String> {
             &format!("dead-{}.bin", meta.dead_hash),
         ));
     }
+    blobs.extend(meta.packs.iter().map(|pack| pack_blob(&pack.hash)));
     blobs
 }
 
@@ -506,9 +578,11 @@ fn meta_blobs(meta: &SegmentMeta) -> Vec<String> {
 /// racing the swap errors loudly on the missing blob and just reruns.
 fn collect_garbage(store: &dyn BlobStore, before: &[SegmentMeta], after: &[SegmentMeta]) {
     let kept: std::collections::HashSet<String> = after.iter().flat_map(meta_blobs).collect();
+    let mut deleted = std::collections::HashSet::new();
     for meta in before {
         for blob in meta_blobs(meta) {
-            if !kept.contains(&blob) && store.delete(&blob).is_err() {
+            if !kept.contains(&blob) && deleted.insert(blob.clone()) && store.delete(&blob).is_err()
+            {
                 eprintln!("warning: failed to delete unreferenced index blob {blob}");
             }
         }
@@ -572,16 +646,33 @@ fn load_dead(store: &dyn BlobStore, cache_dir: &Path, meta: &SegmentMeta) -> Res
     Ok(dead)
 }
 
-fn write_dead(store: &dyn BlobStore, meta: &mut SegmentMeta, dead: &DeadSet) -> Result<()> {
+fn write_dead(store: &dyn BlobStore, seg_id: &str, dead: &DeadSet) -> Result<(String, u64)> {
     let bytes = postcard::to_allocvec(dead)?;
     let hash = sha256_hex(&[&bytes]);
-    store.put(
-        &segment_blob(&meta.seg_id, &format!("dead-{hash}.bin")),
-        &bytes,
-    )?;
-    meta.dead_hash = hash;
-    meta.dead_len = bytes.len() as u64;
-    Ok(())
+    store
+        .put(&segment_blob(seg_id, &format!("dead-{hash}.bin")), &bytes)
+        .context("failed to write segment dead set")?;
+    Ok((hash, u64::try_from(bytes.len())?))
+}
+
+fn should_repack(meta: &SegmentMeta, tables: &SegmentTables, dead: &DeadSet) -> bool {
+    if dead.documents.is_empty() {
+        return false;
+    }
+    let dead_documents = dead.documents.len();
+    let documents = usize::try_from(meta.doc_count).expect("document count fits usize");
+    if dead_documents.saturating_mul(REPACK_DEAD_FRACTION) >= documents {
+        return true;
+    }
+    let total_bytes = tables.documents.iter().fold(0u64, |total, document| {
+        total.saturating_add(document.decoded_size)
+    });
+    let dead_bytes = dead.documents.iter().fold(0u64, |total, document| {
+        let index = usize::try_from(*document).expect("document ID fits usize");
+        total.saturating_add(tables.documents[index].decoded_size)
+    });
+    let fraction = u64::try_from(REPACK_DEAD_FRACTION).expect("repack fraction fits u64");
+    total_bytes > 0 && dead_bytes.saturating_mul(fraction) >= total_bytes
 }
 
 /// Build and PUT one segment over `docs` ((key, listing-etag, size) triples,
@@ -621,7 +712,13 @@ fn write_bounded_segments(
     let corpus = make_corpus(docs)?;
     match build_segment_files(corpus.as_ref(), strategy, docs, doc_cap) {
         Ok(built) => {
-            let meta = put_segment_files(store, &built.fst, &built.postings, &built.tables)?;
+            let meta = put_segment_files(
+                store,
+                &built.fst,
+                &built.postings,
+                &built.tables,
+                &built.packs,
+            )?;
             return Ok(vec![meta]);
         }
         Err(error) if error.is::<crate::DocumentCapExceeded>() => {}
@@ -650,13 +747,37 @@ fn put_segment_files(
     fst: &crate::TempBlob,
     postings: &crate::TempBlob,
     tables: &SegmentTables,
+    packs: &[PackFile],
 ) -> Result<SegmentMeta> {
     anyhow::ensure!(
         !tables.sources.is_empty(),
         "refusing to write a segment without sources"
     );
     tables.validate()?;
+    let pack_metas = packs.iter().map(PackFile::meta).collect::<Vec<_>>();
+    let pack_count = tables
+        .blocks
+        .last()
+        .map_or(0usize, |block| block.pack as usize + 1);
+    anyhow::ensure!(
+        pack_count == packs.len(),
+        "pack file count differs from block table"
+    );
+    for (pack_id, pack) in packs.iter().enumerate() {
+        let end = tables
+            .blocks
+            .iter()
+            .rev()
+            .find(|block| block.pack as usize == pack_id)
+            .map(|block| block.offset + u64::from(block.compressed_len))
+            .context("pack file has no blocks")?;
+        anyhow::ensure!(
+            end == pack.len(),
+            "pack file length differs from block table"
+        );
+    }
     let docs_bytes = postcard::to_allocvec(tables)?;
+    let pack_bytes = postcard::to_allocvec(&pack_metas)?;
     let terms_fst_hash = fst.hash().to_owned();
     let postings_hash = postings.hash().to_owned();
     let docs_hash = sha256_hex(&[&docs_bytes]);
@@ -664,7 +785,11 @@ fn put_segment_files(
         terms_fst_hash.as_bytes(),
         postings_hash.as_bytes(),
         docs_hash.as_bytes(),
+        &pack_bytes,
     ]);
+    for pack in packs {
+        store.put_file(&pack_blob(pack.hash()), pack.path())?;
+    }
     store.put_file(&segment_blob(&seg_id, "terms.fst"), fst.path())?;
     store.put_file(&segment_blob(&seg_id, "postings.bin"), postings.path())?;
     store.put(&segment_blob(&seg_id, "docs.bin"), &docs_bytes)?;
@@ -681,6 +806,7 @@ fn put_segment_files(
         max_key: tables.sources[tables.sources.len() - 1].key.clone(),
         dead_hash: String::new(),
         dead_len: 0,
+        packs: pack_metas,
     };
     Ok(meta)
 }
@@ -838,7 +964,7 @@ impl SegmentedReader {
         anyhow::ensure!(batch_size > 0, "candidate batch size must be positive");
         let source_prefix =
             key_prefix.map(|prefix| prefix.split_once("!/").map_or(prefix, |(source, _)| source));
-        for segment in &self.segments {
+        for (segment_id, segment) in self.segments.iter().enumerate() {
             if let Some(prefix) = source_prefix {
                 self.classify_index_result(self.segment_tables(segment))?;
                 if !Self::prefix_overlaps(&segment.meta, prefix) {
@@ -882,16 +1008,14 @@ impl SegmentedReader {
             let tables = self.classify_index_result(self.segment_tables(segment))?;
             let capacity = batch_size.min(usize::try_from(segment.meta.doc_count)?);
             let mut batch = Vec::with_capacity(capacity);
-            let mut batch_source = None;
             for id in live {
                 let document = &tables.documents[id as usize];
-                if batch.len() >= batch_size && batch_source != Some(document.source_id) {
+                if batch.len() >= batch_size {
                     if !visit(std::mem::take(&mut batch))? {
                         return Ok(());
                     }
                     batch.reserve(capacity);
                 }
-                batch_source = Some(document.source_id);
                 let source = &tables.sources[document.source_id as usize];
                 batch.push(DocAddress {
                     display_key: document.display_key.clone(),
@@ -900,6 +1024,10 @@ impl SegmentedReader {
                     encoded_size: source.encoded_size,
                     encoding: source.encoding,
                     member_path: document.member_path.clone(),
+                    index: Some(IndexAddress {
+                        segment: u32::try_from(segment_id)?,
+                        document: id,
+                    }),
                 });
             }
             if !batch.is_empty() && !visit(batch)? {
@@ -1023,6 +1151,63 @@ impl crate::IndexReader for SegmentedReader {
     }
 }
 
+impl holys3_core::DocFetcher for SegmentedReader {
+    fn fetch_each(
+        &self,
+        documents: &[DocAddress],
+        consume: &mut dyn FnMut(usize, holys3_core::DocumentBody) -> Result<()>,
+    ) -> Result<()> {
+        let mut grouped = std::collections::BTreeMap::<u32, Vec<(usize, u32)>>::new();
+        for (index, document) in documents.iter().enumerate() {
+            let address = document
+                .index
+                .as_ref()
+                .context("candidate has no index snapshot address")?;
+            grouped
+                .entry(address.segment)
+                .or_default()
+                .push((index, address.document));
+        }
+        for (segment_id, addresses) in grouped {
+            let segment = self
+                .segments
+                .get(usize::try_from(segment_id)?)
+                .context("candidate segment is out of bounds")?;
+            let tables = self.classify_index_result(self.segment_tables(segment))?;
+            let requests = addresses
+                .iter()
+                .map(|(index, document_id)| {
+                    let document = tables
+                        .documents
+                        .get(usize::try_from(*document_id)?)
+                        .context("candidate document is out of bounds")?;
+                    anyhow::ensure!(
+                        document.display_key == documents[*index].display_key,
+                        "candidate display key differs from its index entry"
+                    );
+                    Ok(crate::pack::PackRequest {
+                        index: *index,
+                        slice: crate::pack::PackSlice {
+                            first_block: document.first_block,
+                            block_offset: document.block_offset,
+                        },
+                        decoded_size: document.decoded_size,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let fetched = crate::pack::fetch_documents(
+                self.store.as_ref(),
+                &segment.meta.packs,
+                &tables.blocks,
+                &requests,
+                consume,
+            );
+            self.classify_index_result(fetched)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,6 +1232,10 @@ mod tests {
             max_key: "z".into(),
             dead_hash: String::new(),
             dead_len: 0,
+            packs: vec![PackMeta {
+                hash: "e".repeat(64),
+                len: 1,
+            }],
         }
     }
 
@@ -1123,11 +1312,44 @@ mod tests {
             &other,
             Strategy::Trigram,
             &[],
-            false,
+            UpdateOptions::default(),
             &|_| anyhow::bail!("source mismatch must fail before fetching"),
         )
         .expect_err("source mismatch must fail");
         assert!(error.to_string().contains("use --rebuild to replace it"));
+    }
+
+    #[test]
+    fn segment_root_references_uploaded_content_packs() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let store = holys3_core::LocalBlobStore::new(store_dir.path());
+        let listing = vec![("a.txt".to_owned(), "v1".to_owned(), 5)];
+        update_index(
+            &store,
+            cache_dir.path(),
+            &test_source(),
+            Strategy::Trigram,
+            &listing,
+            UpdateOptions::default(),
+            &|_| {
+                Ok(Box::new(holys3_core::testutil::MemCorpus::new(
+                    vec!["a.txt".to_owned()],
+                    vec![b"alpha".to_vec()],
+                )))
+            },
+        )
+        .unwrap();
+
+        let root = store.get("segments.bin").unwrap().unwrap();
+        let list = parse_segment_list(&root).unwrap();
+        let pack = &list.segments[0].packs[0];
+        let bytes = store
+            .get(&format!("packs/{}.pack", pack.hash))
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes.len() as u64, pack.len);
+        assert_eq!(sha256_hex(&[&bytes]), pack.hash);
     }
 
     #[test]
@@ -1148,6 +1370,15 @@ mod tests {
                 source_id: 0,
                 member_path: None,
                 decoded_size: 1,
+                first_block: 0,
+                block_offset: 0,
+            }],
+            blocks: vec![crate::pack::PackBlock {
+                pack: 0,
+                offset: 0,
+                compressed_len: 1,
+                decoded_len: 1,
+                hash: [0; 32],
             }],
         };
         let mut meta = segment();
@@ -1223,9 +1454,24 @@ mod tests {
                     source_id: 0,
                     member_path: None,
                     decoded_size: 1,
+                    first_block: 0,
+                    block_offset: 0,
+                }],
+                blocks: vec![crate::pack::PackBlock {
+                    pack: 0,
+                    offset: 0,
+                    compressed_len: 1,
+                    decoded_len: 1,
+                    hash: [0; 32],
                 }],
             };
-            let mut meta = put_segment_files(&store, &fst, &postings, &tables).unwrap();
+            let mut builder = crate::pack::PackBuilder::production().unwrap();
+            builder.append(std::io::Cursor::new([0]), 1).unwrap();
+            let packed = builder.finish().unwrap();
+            let mut tables = tables;
+            tables.blocks = packed.blocks;
+            let mut meta =
+                put_segment_files(&store, &fst, &postings, &tables, &packed.packs).unwrap();
             meta.postings_len = MERGE_POSTINGS_CAP + 1;
             segments.push(meta);
             listing.push((key, "v1".to_owned(), 1));
@@ -1245,7 +1491,7 @@ mod tests {
             &test_source(),
             Strategy::Trigram,
             &listing,
-            false,
+            UpdateOptions::default(),
             &|_| anyhow::bail!("unchanged index should not fetch"),
         )
         .unwrap();

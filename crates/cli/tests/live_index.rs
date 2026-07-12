@@ -1,6 +1,6 @@
-use holys3_core::{DocFetcher, Strategy};
-use holys3_index::{search_collect, update_index, SegmentedReader, SourceIdentity};
-use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus, S3Fetcher};
+use holys3_core::Strategy;
+use holys3_index::{search_collect, update_index, SegmentedReader, SourceIdentity, UpdateOptions};
+use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus};
 
 #[test]
 fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
@@ -34,7 +34,7 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
         &source,
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| {
             Ok(Box::new(S3Corpus::new(
                 factory_client.clone(),
@@ -52,20 +52,14 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
         cache_dir.path(),
         &source,
     )?;
-    let fetcher = S3Fetcher::new(client, bucket);
-    assert_hit(&reader, &fetcher, "world", "b.txt")?;
-    assert_hit(&reader, &fetcher, "handleClick", "a.rs")?;
-    assert_hit(&reader, &fetcher, "EMAIL", "c/d.log")?;
+    assert_hit(&reader, "world", "b.txt")?;
+    assert_hit(&reader, "handleClick", "a.rs")?;
+    assert_hit(&reader, "EMAIL", "c/d.log")?;
     Ok(())
 }
 
-fn assert_hit(
-    reader: &SegmentedReader,
-    fetcher: &dyn DocFetcher,
-    pattern: &str,
-    expected_key: &str,
-) -> anyhow::Result<()> {
-    let hits = search_collect(reader, fetcher, pattern)?.1.hits;
+fn assert_hit(reader: &SegmentedReader, pattern: &str, expected_key: &str) -> anyhow::Result<()> {
+    let hits = search_collect(reader, pattern)?.1.hits;
     assert!(
         hits.iter().any(|key| key == expected_key),
         "pattern {pattern} expected {expected_key}, got {hits:?}"

@@ -1,4 +1,4 @@
-//! Streaming search engine: concurrent fetch, parallel decompress+verify,
+//! Streaming search engine: packed snapshot fetch, parallel decompress+verify,
 //! per-doc result sinks. Documents are addressed by key throughout.
 
 use crate::{IndexReader, SearchStats};
@@ -273,7 +273,6 @@ fn search_batch(
 /// match per doc.
 pub fn search_streaming(
     reader: &dyn IndexReader,
-    fetcher: &dyn DocFetcher,
     pattern: &str,
     scope: KeyScope<'_>,
     options: MatchOptions,
@@ -309,7 +308,7 @@ pub fn search_streaming(
             }
             let (batch_hits, batch_bytes, stopped) = search_batch(
                 &documents,
-                fetcher,
+                reader,
                 &re,
                 whole_document,
                 bounded_len,
@@ -375,13 +374,11 @@ impl MatchSink for CollectSink {
 /// sorted by (key, line, col, text).
 pub fn search_collect(
     reader: &dyn IndexReader,
-    fetcher: &dyn DocFetcher,
     pattern: &str,
 ) -> Result<(Vec<(String, LineEvent)>, SearchStats)> {
     let sink = CollectSink::default();
     let stats = search_streaming(
         reader,
-        fetcher,
         pattern,
         KeyScope::default(),
         MatchOptions::default(),
@@ -436,6 +433,24 @@ mod tests {
 
     struct BatchReader {
         documents: Vec<DocAddress>,
+        largest: AtomicUsize,
+    }
+
+    impl DocFetcher for BatchReader {
+        fn fetch_each(
+            &self,
+            documents: &[DocAddress],
+            consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
+        ) -> Result<()> {
+            self.largest.fetch_max(documents.len(), Ordering::Relaxed);
+            for index in 0..documents.len() {
+                consume(
+                    index,
+                    DocumentBody::from_bytes(bytes::Bytes::from_static(b"needle\n")),
+                )?;
+            }
+            Ok(())
+        }
     }
 
     impl IndexReader for BatchReader {
@@ -523,6 +538,7 @@ mod tests {
             encoded_size: 7,
             encoding: SourceEncoding::Raw,
             member_path: None,
+            index: None,
         }];
         let fetcher = RecordingFetcher {
             largest: AtomicUsize::new(0),
@@ -558,15 +574,13 @@ mod tests {
                     encoded_size: 7,
                     encoding: SourceEncoding::Raw,
                     member_path: None,
+                    index: None,
                 })
                 .collect(),
-        };
-        let fetcher = RecordingFetcher {
             largest: AtomicUsize::new(0),
         };
         let stats = search_streaming(
             &reader,
-            &fetcher,
             "needle",
             KeyScope::default(),
             MatchOptions::default(),
@@ -574,11 +588,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats.hits.len(), 5);
-        assert_eq!(fetcher.largest.load(Ordering::Relaxed), 2);
+        assert_eq!(reader.largest.load(Ordering::Relaxed), 2);
     }
 
     struct ChangingReader {
         document: DocAddress,
+    }
+
+    impl DocFetcher for ChangingReader {
+        fn fetch_each(
+            &self,
+            documents: &[DocAddress],
+            consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
+        ) -> Result<()> {
+            anyhow::ensure!(
+                documents.len() == 1,
+                "expected one changing-reader document"
+            );
+            consume(
+                0,
+                DocumentBody::from_bytes(bytes::Bytes::from_static(b"needle\n")),
+            )
+        }
     }
 
     impl IndexReader for ChangingReader {
@@ -628,14 +659,11 @@ mod tests {
                 encoded_size: 7,
                 encoding: SourceEncoding::Raw,
                 member_path: None,
+                index: None,
             },
-        };
-        let fetcher = RecordingFetcher {
-            largest: AtomicUsize::new(0),
         };
         let error = search_streaming(
             &reader,
-            &fetcher,
             "needle",
             KeyScope::default(),
             MatchOptions::default(),

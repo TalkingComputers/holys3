@@ -5,7 +5,7 @@ BENCH_SIZE=4096
 BENCH_ITERATIONS=5
 BENCH_WARMUP=1
 BENCH_CONCURRENCY=64
-MINIO_ENV=AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin HOLYS3_BENCH_BUCKET=holys3-bench HOLYS3_BENCH_REGION=us-east-1 HOLYS3_BENCH_ENDPOINT=http://localhost:9000
+MINIO_ENV=env -u AWS_PROFILE AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin HOLYS3_BENCH_BUCKET=holys3-bench HOLYS3_BENCH_REGION=us-east-1 HOLYS3_BENCH_ENDPOINT=http://127.0.0.1:9000
 XBENCH=cargo run --locked --release -p holys3-bench --
 
 .PHONY: check package bench bench-micro bench-s3 bench-minio

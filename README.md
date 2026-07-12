@@ -2,7 +2,7 @@
 
 # holys3
 
-**grep for S3.** Indexed regex search over buckets — fetches matches, not corpora.
+**grep for S3.** Snapshot-indexed regex search over buckets.
 
 [![CI](https://github.com/TalkingComputers/holys3/actions/workflows/ci.yml/badge.svg)](https://github.com/TalkingComputers/holys3/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/holys3.svg)](https://crates.io/crates/holys3)
@@ -20,16 +20,17 @@ holys3 -i 'timeout' s3://my-logs -g '*.gz' -C2 --since 6h
 
 S3 has no native grep. The alternatives scan: download-everything-and-rg pays for
 every object on every query, and Athena bills per byte scanned. holys3 builds a
-compact trigram index in S3 (next to the data by default, or in a dedicated
-bucket), uses it to narrow each query to candidate objects, then fetches only
-those and verifies with real Rust regexes against the original bytes. **The index narrows
-candidates; the verifier decides matches** — results are always exact, never
-index-approximated.
+compact trigram index plus compressed canonical content snapshot in S3, next to
+the data by default or in a dedicated bucket. Queries read only selective index
+ranges, then verify candidates with real Rust regexes. **The gram index narrows
+candidates; the immutable content snapshot decides matches** — results are exact
+for the indexed generation, never index-approximated. Source objects are read
+only by `holys3 index`; search still works when the source is unavailable.
 
-In the tracked real-S3 benchmark below, a literal query over 1,000 objects
-finished in **1.5 s** at concurrency 64 versus **54.7 s** sequentially. A
-no-match query fetched zero objects. Every benchmark corpus, planted hit count,
-candidate count, and byte count is deterministic and checked before timing.
+The tracked 25,000-object MinIO benchmark completes matching queries in
+**90-140 ms** p50 and a fully pruned no-match query in **0.005 ms**. Every
+benchmark corpus, planted hit count, candidate count, and byte count is
+deterministic and checked before timing.
 
 ## Install
 
@@ -52,6 +53,9 @@ attestations. Verify an archive with
 AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2
 AWS_PROFILE=my-sso holys3 'level":"ERROR' s3://my-log-bucket/prod --region us-east-2
 AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2 --watch --interval 30
+
+# force physical removal of all tombstoned snapshot bytes
+AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2 --purge-deleted
 
 # Keep the index in a separate bucket (required when the source is read-only)
 AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2 --index s3://my-search-index/holys3/my-log-bucket/prod --index-region us-east-2
@@ -144,10 +148,6 @@ match the line terminator, and a literal `\n` in a pattern is an error.
   `holys3.idxdir`
 - `--index-region`, `--index-endpoint` — connection overrides for an S3 index
   in a different region or service
-- `--object-cache DIR --object-cache-cap BYTES` — explicit private cache for
-  immutable S3 source bodies. Both flags are required; files are checksummed,
-  content-addressed by endpoint/bucket/key/ETag, owner-only, atomically
-  replaced, and size-bounded with FIFO eviction.
 
 ### Credentials
 
@@ -167,15 +167,13 @@ The SDK signs requests and refreshes temporary credentials automatically.
    the rarest grams per AND-group are fetched, and grams present in every doc
    cost zero bytes on disk and zero fetches.
 3. Posting blocks are read with coalesced ranged GETs; candidates are pruned
-   by key scope before a single object is fetched.
-4. Candidate physical sources stream through concurrent conditional GETs
-   (`If-Match` against the indexed ETag), with adaptive AIMD concurrency,
-   retries, request hedging, and a 512 MiB in-flight byte budget. Sources of
-   at least 64 MiB use four concurrent streamed 8 MiB conditional ranges. One archive
-   is fetched and decoded once even when many members are candidates. Sources
-   are then regex-verified on a worker pool — results print as they complete,
-   unordered across objects like rg's parallel mode, pipe-friendly
-   (`holys3 ... | head` terminates cleanly).
+   by key scope before content is fetched.
+4. Candidate bytes come from immutable content-addressed packs. Canonical
+   decoded documents share independent 128 KiB zstd frames inside bounded
+   packs; adjacent frames merge into bounded range GETs, each frame is
+   SHA-256 verified before decompression, and oversized documents spool to
+   private temporary files. Regex verification runs on a worker pool and
+   prints unordered across objects like rg's parallel mode.
 
 ### The index
 
@@ -183,8 +181,8 @@ The SDK signs requests and refreshes temporary credentials automatically.
 `<prefix>/.holys3/` by default. `--index s3://other-bucket/path` moves the
 complete index to that exact namespace, so the source bucket may be read-only.
 Runs are **incremental diffs**: only new or changed objects are
-fetched and indexed, deletions take effect immediately, an unchanged bucket
-costs one listing (~seconds), and small segments merge automatically. Posting
+fetched and indexed, deletions disappear from search immediately, an unchanged
+bucket costs one listing (~seconds), and small segments merge automatically. Posting
 lists are density-classed and bit-packed, and grams shared by every document
 cost nothing. Index construction uses bounded sorted runs instead of a global
 in-memory postings map. Replaced segments are garbage-collected; the root
@@ -193,6 +191,13 @@ concurrent index run fails loudly instead of corrupting anything. Large index
 blobs upload as concurrent multipart parts. Every immutable segment blob has
 its own SHA-256 length/hash contract; readers reject truncation, corruption,
 duplicate segment IDs, and malformed metadata before using it.
+
+Each root is a complete snapshot. Segment metadata binds content-pack hashes,
+lengths, block coordinates, per-block hashes, and immutable tombstones. A
+segment is physically repacked when dead documents or decoded bytes reach 25%,
+during compaction, or when `--purge-deleted` is supplied. Fully dead segments
+are removed without rereading their packs. `--rebuild` also removes all stale
+snapshot bytes. Searches never fall back to mutable source objects.
 
 The root records the indexed local directory or S3 endpoint, bucket, and
 prefix. Searches may select a narrower subtree of that source, but a broader
@@ -206,34 +211,19 @@ reported and retried. `--rebuild` applies only to cycle 1. SIGINT, SIGTERM,
 SIGHUP, Ctrl-C, and Ctrl-Break finish any active cycle and stop cleanly.
 `--json` emits tagged `indexed`, `error`, and `stopped` JSON Lines on stdout;
 lower-layer notes and warnings remain on stderr.
+With `--purge-deleted`, every watch cycle physically repacks touched segments;
+this explicit retention guarantee approaches eager-update cost under churn.
 
-Local directories use the same format-10 physical-source/logical-document
+Local directories use the same format-11 physical-source/logical-document
 tables, written to `--index` (default `holys3.idxdir`) with BLAKE3 content
-freshness tokens. Local verification rechecks the token, local runs are
-incremental, and `--rebuild` re-ingests everything. Raw candidate files are
-read concurrently under the same 512 MiB byte budget; expanding formats stay
-serial so decompression cannot multiply peak memory.
+freshness tokens. Local runs are incremental, and `--rebuild` re-ingests
+everything. Searches verify the same packed snapshot as S3 searches.
 
 ## Performance
 
-**Real-world S3** — 1,000 synthetic 4 KiB objects, indexed search
-(concurrency 64) vs a sequential (`--concurrency 1`) baseline, laptop →
-us-east-2 over the public internet (per-object RTT dominates; in-region is
-far lower). Reproduce with `make bench-s3`.
-
-| scenario | pattern | hits | candidates/total | p50 ms | seq p50 ms | speedup |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| no_match | `UNMATCHABLE_TOKEN` | 0 | 0/1000 | 0 | 0 | index fetches nothing |
-| QAll | `.*` | 1000 | 1000/1000 | 2566 | 110239 | 43.0x |
-| short_literal | `needle` | 500 | 500/1000 | 1501 | 54688 | 36.4x |
-| alternation | `alpha\|beta` | 314 | 314/1000 | 1088 | 35729 | 32.8x |
-| anchored | `^ANCHOR_START` | 91 | 91/1000 | 390 | 10204 | 26.1x |
-| long_literal | `longliteralbenchmarktoken` | 334 | 334/1000 | 1810 | 37891 | 20.9x |
-| dot_star_gap | `needle.*alpha` | 100 | 100/1000 | 1135 | 10984 | 9.7x |
-
-Absolute latencies vary with the network (per-object RTT dominates from a
-laptop; in-region EC2 is far lower) — the prune ratios and hits are the
-stable part.
+**MinIO snapshot path** — 25,000 synthetic 4 KiB objects, release build, three
+measured iterations after one warmup. Reproduce with
+`make bench-minio BENCH_OBJECTS=25000 BENCH_ITERATIONS=3`.
 
 **Continuous (CI)** — measured on every push against a pinned local MinIO
 image (`make bench-minio`). CI runs release binaries, rejects missing or
@@ -241,9 +231,10 @@ unbaselined microbenchmarks and hybrid sort paths more than 15% slower than
 their same-run controls, validates exact end-to-end hit counts, indexes 25,000
 objects, and enforces hosted-run time plus a 300 MiB peak-RSS ceiling for
 high-cardinality and 256 MiB decoded workloads under both index strategies.
-The scale job also replaces 250 of 25,000 objects per cycle for ten cycles and
-requires listing p95 at or below 2 seconds, update p95 at or below 5 seconds,
-exact additions/deletions, and churn peak RSS at or below 300 MiB.
+The scale job also replaces 250 of 25,000 objects per cycle for 30 cycles,
+crosses the physical-repack threshold, caps update p50/p95/max at
+0.5/1.5/5 seconds, limits cumulative pack writes to 300 MiB, verifies exact
+additions/deletions, and caps churn peak RSS at 300 MiB.
 Segment construction also enforces its cap on logical documents, including
 archive members, rather than only on physical source objects. A separate 512
 MiB compressed-expansion gate caps trigram/sparse index and files-only search
@@ -251,18 +242,20 @@ RSS at 96 MiB. A 512 MiB raw-object MinIO gate applies the same ceiling to S3
 indexing and files-only search with both strategies. A separate 64 MiB
 high-entropy gzip gate exercises ranged source download, streaming decode,
 bitmap-backed trigram construction, cold term-cache population, and mmap lookup
-under the same 96 MiB ceiling. Workspace line coverage is gated at 80%.
+under the same 96 MiB ceiling. A 20,000-member, 640 MiB TAR gate applies the
+96 MiB ceiling to sparse indexing, removes the source archive, and requires
+exact snapshot search results. Workspace line coverage is gated at 80%.
 
 <!-- BENCH:START -->
 | scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| short_literal | 500 | 500/1000 | 0.500 | 2048000 | 20.887 | 210.947 | 210.947 | 102.454 |
-| long_literal | 334 | 334/1000 | 0.334 | 1368064 | 12.522 | 23.286 | 23.286 | 64.968 |
-| alternation | 314 | 314/1000 | 0.314 | 1286144 | 14.916 | 207.664 | 207.664 | 62.277 |
-| anchored | 91 | 91/1000 | 0.091 | 372736 | 3.303 | 3.585 | 3.585 | 19.080 |
-| no_match | 0 | 0/1000 | 0.000 | 0 | 0.004 | 0.004 | 0.004 | 0.003 |
-| QAll | 1000 | 1000/1000 | 1.000 | 4096000 | 231.110 | 245.671 | 245.671 | 206.964 |
-| dot_star_gap | 100 | 100/1000 | 0.100 | 409600 | 5.413 | 12.604 | 12.604 | 22.036 |
+| short_literal | 12500 | 12500/25000 | 0.500 | 51200000 | 126.481 | 135.274 | 135.274 | 144.098 |
+| long_literal | 8334 | 8334/25000 | 0.333 | 34136064 | 130.168 | 133.678 | 133.678 | 139.821 |
+| alternation | 7857 | 7857/25000 | 0.314 | 32182272 | 121.114 | 133.386 | 133.386 | 127.223 |
+| anchored | 2273 | 2273/25000 | 0.091 | 9310208 | 92.022 | 100.881 | 100.881 | 88.671 |
+| no_match | 0 | 0/25000 | 0.000 | 0 | 0.006 | 0.006 | 0.006 | 0.005 |
+| QAll | 25000 | 25000/25000 | 1.000 | 102400000 | 161.019 | 163.742 | 163.742 | 168.181 |
+| dot_star_gap | 2500 | 2500/25000 | 0.100 | 10240000 | 122.263 | 124.068 | 124.068 | 105.753 |
 <!-- BENCH:END -->
 
 Microbenchmarks: `make bench-micro`. PR CI compares the base and head revisions
@@ -283,14 +276,13 @@ reference. Refresh it only from CI's `bench-micro` artifact.
   reads them through a bounded 1 MiB window. Expansion is capped at 64 GiB per
   physical source, 100,000 regular archive members, and four nested format
   layers.
-- Oversized local sources, S3 sources of at least 64 MiB, and large optional
-  object-cache entries remain file-backed through indexing and verification
-  instead of materializing the full body in memory. File-backed gzip, zstd,
-  bzip2, Snappy, Brotli, and zlib sources decode through bounded readers rather
-  than whole-source mappings.
-- A search that races segment garbage collection reopens the new index root
-  once before emitting results. Continuous write churn can still require a
-  manual rerun; no incorrect matches are returned.
+- Oversized local sources and S3 sources of at least 64 MiB remain file-backed
+  during indexing instead of materializing the full body in memory. File-backed
+  gzip, zstd, bzip2, Snappy, Brotli, zlib, TAR, and ZIP sources decode through
+  bounded readers or seekable file handles rather than whole-source mappings.
+- A root race before candidate processing reopens once. If garbage collection
+  invalidates a reader after result batches begin, the command errors and must
+  be rerun; emitted matches remain valid, but output may be partial.
 - Continuous indexing polls after each completed cycle; it does not consume
   bucket notifications, daemonize itself, or install a system service.
 - Concurrent `holys3 index` runs over one prefix are safe. A losing one-shot
@@ -305,6 +297,9 @@ reference. Refresh it only from CI's `bench-micro` artifact.
 
 Use private buckets. The default index lives under `<source-prefix>/.holys3/`;
 `--index s3://bucket/prefix` may place it in a separately permissioned bucket.
+The index contains compressed canonical decoded content, not only grams, so
+protect it with the same access controls, retention policy, and encryption
+requirements as the source data.
 holys3 contacts the configured source and index S3 endpoints plus the AWS
 credential endpoints required by the active SDK provider chains.
 

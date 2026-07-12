@@ -3,7 +3,7 @@ use holys3_core::{
     grams_index, grams_query, pack_trigram_grams, testutil::MemCorpus, Corpus, LocalBlobStore,
     Strategy,
 };
-use holys3_index::{update_index, IndexReader, SegmentedReader, SourceIdentity};
+use holys3_index::{update_index, IndexReader, SegmentedReader, SourceIdentity, UpdateOptions};
 use holys3_query::plan;
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -149,7 +149,7 @@ fn bench_index_reader(c: &mut Criterion) {
         &source_identity(),
         Strategy::Sparse,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| {
             let keys: Vec<String> = shard.iter().map(|(key, _, _)| key.clone()).collect();
             let bodies = keys
@@ -215,7 +215,7 @@ fn bench_index_build(c: &mut Criterion) {
                         &source_identity(),
                         strategy,
                         &listing,
-                        false,
+                        UpdateOptions::default(),
                         &|shard| {
                             let keys = shard
                                 .iter()

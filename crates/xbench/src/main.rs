@@ -11,14 +11,12 @@ use gen::{
     doc_path, latest_run_path, local_index_dir, objects_dir, read_manifest, remove_dir,
     reports_dir, write_seed, SeedManifest,
 };
-use holys3_core::{DocFetcher, LocalBlobStore, Strategy};
+use holys3_core::{LocalBlobStore, Strategy};
 use holys3_index::{
-    search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, LocalFetcher, NullSink,
-    SegmentedReader, SourceIdentity,
+    search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, NullSink, SegmentedReader,
+    SourceIdentity, UpdateOptions,
 };
-use holys3_s3::{
-    build_fetch_config, build_index_namespace, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
-};
+use holys3_s3::{build_fetch_config, build_index_namespace, S3BlobStore, S3Client, S3Corpus};
 use scenarios::{read_scenarios, Scenario};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -210,7 +208,7 @@ fn upload_dir() -> Result<()> {
         &dir_source_identity()?,
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| Ok(Box::new(LocalCorpus::from_listing(shard))),
     )?;
     let build_ms = build_started.elapsed().as_secs_f64() * 1000.0;
@@ -276,7 +274,7 @@ fn upload_s3(manifest: &SeedManifest) -> Result<()> {
         &source,
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| {
             Ok(Box::new(S3Corpus::new(
                 client.clone(),
@@ -326,12 +324,14 @@ fn run_dir(
         &dir_cache_dir(),
         &dir_source_identity()?,
     )?;
-    let fetcher = LocalFetcher::new(concurrency)?;
-    let single_fetcher = LocalFetcher::new(1)?;
+    let single_reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(local_index_dir())),
+        &dir_cache_dir(),
+        &dir_source_identity()?,
+    )?;
     let results = run_all(
         &reader,
-        &fetcher,
-        &single_fetcher,
+        &single_reader,
         &scenarios,
         manifest,
         iterations,
@@ -376,12 +376,19 @@ fn run_s3(
         prefix: format!("{S3_PREFIX}/"),
     };
     let reader = SegmentedReader::open(Box::new(store), &cache_dir, &source)?;
-    let fetcher = S3Fetcher::new(backend.client.clone(), backend.bucket.clone());
-    let single_fetcher = S3Fetcher::new(single_backend.client, backend.bucket.clone());
+    let single_store = S3BlobStore::new(
+        single_backend.client,
+        backend.bucket.clone(),
+        S3_PREFIX.to_owned(),
+    );
+    let single_reader = SegmentedReader::open(
+        Box::new(single_store),
+        &reports_dir().join("s3-cache-single"),
+        &source,
+    )?;
     let results = run_all(
         &reader,
-        &fetcher,
-        &single_fetcher,
+        &single_reader,
         &scenarios,
         manifest,
         iterations,
@@ -408,8 +415,7 @@ fn run_s3(
 #[allow(clippy::too_many_arguments)]
 fn run_all(
     reader: &dyn IndexReader,
-    fetcher: &dyn DocFetcher,
-    single_fetcher: &dyn DocFetcher,
+    single_reader: &dyn IndexReader,
     scenarios: &[Scenario],
     manifest: &SeedManifest,
     iterations: usize,
@@ -422,15 +428,8 @@ fn run_all(
                 .expected_hits
                 .get(&scenario.name)
                 .with_context(|| format!("missing expected hit count for {}", scenario.name))?;
-            let timed = time_scenario(reader, fetcher, scenario, expected, iterations, warmup)?;
-            let single = time_scenario(
-                reader,
-                single_fetcher,
-                scenario,
-                expected,
-                iterations,
-                warmup,
-            )?;
+            let timed = time_scenario(reader, scenario, expected, iterations, warmup)?;
+            let single = time_scenario(single_reader, scenario, expected, iterations, warmup)?;
             anyhow::ensure!(
                 timed.hits == single.hits,
                 "{} indexed hits {} != concurrency=1 hits {}",
@@ -458,14 +457,13 @@ fn run_all(
 
 fn time_scenario(
     reader: &dyn IndexReader,
-    fetcher: &dyn DocFetcher,
     scenario: &Scenario,
     expected: usize,
     iterations: usize,
     warmup: usize,
 ) -> Result<TimedScenario> {
     for _ in 0..warmup {
-        let measurement = measure_search(reader, fetcher, &scenario.pattern)?;
+        let measurement = measure_search(reader, &scenario.pattern)?;
         anyhow::ensure!(
             measurement.hits.len() == expected,
             "{} expected {} hits, got {}",
@@ -477,7 +475,7 @@ fn time_scenario(
     let mut elapsed = Vec::with_capacity(iterations);
     let mut last = None;
     for _ in 0..iterations {
-        let measurement = measure_search(reader, fetcher, &scenario.pattern)?;
+        let measurement = measure_search(reader, &scenario.pattern)?;
         anyhow::ensure!(
             measurement.hits.len() == expected,
             "{} expected {} hits, got {}",
@@ -501,15 +499,10 @@ fn time_scenario(
     })
 }
 
-fn measure_search(
-    reader: &dyn IndexReader,
-    fetcher: &dyn DocFetcher,
-    pattern: &str,
-) -> Result<SearchMeasurement> {
+fn measure_search(reader: &dyn IndexReader, pattern: &str) -> Result<SearchMeasurement> {
     let start = Instant::now();
     let stats = search_streaming(
         reader,
-        fetcher,
         pattern,
         KeyScope::default(),
         holys3_core::MatchOptions::default(),

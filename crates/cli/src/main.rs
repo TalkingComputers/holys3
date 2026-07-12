@@ -12,12 +12,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use holys3_core::{BlobStore, LocalBlobStore, MatchOptions, Strategy};
 use holys3_index::{
-    search_streaming, update_index, IndexChanged, IndexReader, KeyScope, LocalCorpus, LocalFetcher,
-    MatchSink, SearchStats, SegmentedReader, SourceIdentity,
+    search_streaming, update_index, IndexChanged, IndexReader, KeyScope, LocalCorpus, MatchSink,
+    SearchStats, SegmentedReader, SourceIdentity, UpdateOptions,
 };
 use holys3_s3::{
-    build_fetch_config, build_index_namespace, is_index_key, list_prefix, ObjectCacheConfig,
-    ObjectMeta, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
+    build_fetch_config, build_index_namespace, is_index_key, list_prefix, ObjectMeta, S3BlobStore,
+    S3Client, S3Corpus,
 };
 use scope::Scope;
 use std::io::IsTerminal;
@@ -60,6 +60,9 @@ enum Cmd {
         /// Ignore any existing index and re-ingest everything.
         #[arg(long)]
         rebuild: bool,
+        /// Physically remove tombstoned snapshot bytes during this update.
+        #[arg(long)]
+        purge_deleted: bool,
         #[arg(long, requires = "interval", help = "Continuously update the index")]
         watch: bool,
         #[arg(
@@ -214,21 +217,6 @@ struct SearchArgs {
     /// Only search objects covering times at or before this instant (same formats).
     #[arg(long)]
     until: Option<String>,
-    #[arg(
-        long,
-        requires = "object_cache_cap",
-        value_name = "DIR",
-        help = "Cache immutable S3 source bodies under DIR"
-    )]
-    object_cache: Option<PathBuf>,
-    #[arg(
-        long,
-        requires = "object_cache",
-        value_name = "BYTES",
-        value_parser = parse_positive_u64,
-        help = "Limit the source-object cache to BYTES"
-    )]
-    object_cache_cap: Option<u64>,
     #[command(flatten)]
     connect: ConnectArgs,
 }
@@ -538,6 +526,7 @@ fn build_local(
     index: &IndexStorage,
     strategy: Strategy,
     rebuild: bool,
+    purge_deleted: bool,
 ) -> Result<index::IndexResult> {
     // Canonical target root: `./logs` and `logs` must produce identical
     // index keys, or invocation spelling would churn the incremental diff.
@@ -565,7 +554,10 @@ fn build_local(
         &source,
         strategy,
         &listing,
-        rebuild,
+        UpdateOptions {
+            rebuild,
+            purge_deleted,
+        },
         &|shard| Ok(Box::new(LocalCorpus::from_listing(shard))),
     )?;
     Ok(index::IndexResult {
@@ -590,6 +582,7 @@ fn build_s3(
     index: &IndexStorage,
     strategy: Strategy,
     rebuild: bool,
+    purge_deleted: bool,
 ) -> Result<index::IndexResult> {
     // Real sizes ride the listing so the build bounds its fetch chunks by
     // bytes, not just doc count — a bucket of huge objects must not OOM.
@@ -611,7 +604,10 @@ fn build_s3(
         &source,
         strategy,
         &listing,
-        rebuild,
+        UpdateOptions {
+            rebuild,
+            purge_deleted,
+        },
         &|shard| {
             Ok(Box::new(S3Corpus::new(
                 client.clone(),
@@ -634,7 +630,6 @@ struct SearchExecution<'a> {
     scope: Option<&'a Scope>,
     options: MatchOptions,
     stats_line: bool,
-    object_cache: Option<&'a ObjectCacheConfig>,
 }
 
 fn execute_search(
@@ -657,15 +652,9 @@ fn execute_search(
         .map(|filter| filter as &(dyn Fn(&str) -> bool + Sync));
     let search_stats = match source {
         Source::Local(dir) => {
-            anyhow::ensure!(
-                execution.object_cache.is_none(),
-                "--object-cache only applies to s3:// targets"
-            );
             let target_prefix = build_local_key_prefix(&dir)?;
-            let fetcher = LocalFetcher::new(std::thread::available_parallelism()?.get())?;
             search_with_reopen(
                 || SegmentedReader::open(index.store(), index.cache(), &source_identity),
-                &fetcher,
                 execution.pattern,
                 KeyScope {
                     prefix: Some(&target_prefix),
@@ -682,13 +671,8 @@ fn execute_search(
             } else {
                 Some(target_prefix.as_str())
             };
-            let fetcher = match execution.object_cache {
-                Some(config) => S3Fetcher::with_cache(src.client, src.bucket, config.clone())?,
-                None => S3Fetcher::new(src.client, src.bucket),
-            };
             search_with_reopen(
                 || SegmentedReader::open(index.store(), index.cache(), &source_identity),
-                &fetcher,
                 execution.pattern,
                 KeyScope {
                     prefix: candidate_prefix,
@@ -715,17 +699,16 @@ fn execute_search(
 
 fn search_with_reopen(
     mut open: impl FnMut() -> Result<SegmentedReader>,
-    fetcher: &dyn holys3_core::DocFetcher,
     pattern: &str,
     scope: KeyScope<'_>,
     options: MatchOptions,
     sink: &dyn MatchSink,
 ) -> Result<SearchStats> {
     let reader = open()?;
-    match search_streaming(&reader, fetcher, pattern, scope, options, sink) {
+    match search_streaming(&reader, pattern, scope, options, sink) {
         Err(error) if error.is::<IndexChanged>() => {
             let reader = open()?;
-            search_streaming(&reader, fetcher, pattern, scope, options, sink)
+            search_streaming(&reader, pattern, scope, options, sink)
         }
         result => result,
     }
@@ -750,12 +733,6 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         args.until,
         globs,
     )?;
-    let object_cache = match (args.object_cache, args.object_cache_cap) {
-        (Some(root), Some(cap_bytes)) => Some(ObjectCacheConfig { root, cap_bytes }),
-        (None, None) => None,
-        _ => anyhow::bail!("--object-cache and --object-cache-cap must be supplied together"),
-    };
-
     let standard_mode =
         !args.quiet && !args.json && !args.files_with_matches && !args.count && !args.count_matches;
     // standard output AND --json render context (rg emits context messages
@@ -794,7 +771,6 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         scope: scope.as_ref(),
         options,
         stats_line,
-        object_cache: object_cache.as_ref(),
     };
 
     if args.quiet {
@@ -842,6 +818,7 @@ fn run() -> Result<bool> {
             out,
             strategy,
             rebuild,
+            purge_deleted,
             watch: _,
             interval,
             json,
@@ -875,11 +852,11 @@ fn run() -> Result<bool> {
             };
             match source {
                 Source::Local(dir) => index::run_index(config, |cycle_rebuild| {
-                    build_local(&dir, &storage, strategy, cycle_rebuild)
+                    build_local(&dir, &storage, strategy, cycle_rebuild, purge_deleted)
                 })?,
                 Source::S3(src) => {
                     index::run_index(config, |cycle_rebuild| {
-                        build_s3(&src, &storage, strategy, cycle_rebuild)
+                        build_s3(&src, &storage, strategy, cycle_rebuild, purge_deleted)
                     })?;
                 }
             }
@@ -1027,8 +1004,14 @@ mod tests {
     #[test]
     fn clap_parses_rg_style_invocations() {
         // subcommand wins the first positional
-        let cli = Cli::try_parse_from(["holys3", "index", "s3://b"]).unwrap();
-        assert!(matches!(cli.cmd, Some(Cmd::Index { .. })));
+        let cli = Cli::try_parse_from(["holys3", "index", "s3://b", "--purge-deleted"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Index {
+                purge_deleted: true,
+                ..
+            })
+        ));
         // -e escape hatch searches for the literal word "index"
         let cli = Cli::try_parse_from(["holys3", "-e", "index", "s3://b"]).unwrap();
         assert!(cli.cmd.is_none());

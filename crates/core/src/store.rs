@@ -15,6 +15,12 @@ pub struct SourceObject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexAddress {
+    pub segment: u32,
+    pub document: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocAddress {
     pub display_key: String,
     pub source_key: String,
@@ -22,6 +28,7 @@ pub struct DocAddress {
     pub encoded_size: u64,
     pub encoding: crate::SourceEncoding,
     pub member_path: Option<String>,
+    pub index: Option<IndexAddress>,
 }
 
 #[derive(Debug)]
@@ -322,6 +329,7 @@ mod tests {
             encoded_size: source.encoded_size,
             encoding: crate::SourceEncoding::Zip,
             member_path: Some("app.log".to_owned()),
+            index: None,
         };
         assert_eq!(document.source_key, source.key);
         assert_eq!(document.source_version, source.version);
@@ -416,6 +424,7 @@ mod tests {
                 encoded_size: 3,
                 encoding: crate::SourceEncoding::Raw,
                 member_path: None,
+                index: None,
             },
             DocAddress {
                 display_key: "a".into(),
@@ -424,6 +433,7 @@ mod tests {
                 encoded_size: 3,
                 encoding: crate::SourceEncoding::Raw,
                 member_path: None,
+                index: None,
             },
         ];
         let mut seen = Vec::new();
@@ -452,6 +462,7 @@ mod tests {
             encoded_size: 7,
             encoding: crate::SourceEncoding::Raw,
             member_path: None,
+            index: None,
         }];
         let error = corpus
             .fetch_each(&documents, &mut |_, _| Ok(()))

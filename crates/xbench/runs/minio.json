@@ -3,14 +3,14 @@
   "objects": 25000,
   "object_size": 4096,
   "total_bytes": 102400000,
-  "iterations": 5,
+  "iterations": 3,
   "warmup": 1,
   "concurrency": 64,
   "backend": {
     "kind": "s3",
     "bucket": "holys3-bench",
     "region": "us-east-1",
-    "endpoint": "http://localhost:9000"
+    "endpoint": "http://127.0.0.1:9000"
   },
   "scenarios": [
     {
@@ -22,10 +22,10 @@
       "total_docs": 25000,
       "prune_ratio": 0.5,
       "bytes_fetched": 51200000,
-      "p50_ms": 619.29225,
-      "p95_ms": 675.066083,
-      "p99_ms": 675.066083,
-      "sequential_p50_ms": 3139.426583
+      "p50_ms": 126.48124999999999,
+      "p95_ms": 135.2745,
+      "p99_ms": 135.2745,
+      "sequential_p50_ms": 144.097833
     },
     {
       "name": "long_literal",
@@ -36,10 +36,10 @@
       "total_docs": 25000,
       "prune_ratio": 0.33336,
       "bytes_fetched": 34136064,
-      "p50_ms": 386.87037499999997,
-      "p95_ms": 392.05487500000004,
-      "p99_ms": 392.05487500000004,
-      "sequential_p50_ms": 2004.459791
+      "p50_ms": 130.168042,
+      "p95_ms": 133.67775,
+      "p99_ms": 133.67775,
+      "sequential_p50_ms": 139.821208
     },
     {
       "name": "alternation",
@@ -50,10 +50,10 @@
       "total_docs": 25000,
       "prune_ratio": 0.31428,
       "bytes_fetched": 32182272,
-      "p50_ms": 363.736583,
-      "p95_ms": 558.881041,
-      "p99_ms": 558.881041,
-      "sequential_p50_ms": 1918.911
+      "p50_ms": 121.113666,
+      "p95_ms": 133.386167,
+      "p99_ms": 133.386167,
+      "sequential_p50_ms": 127.22325000000001
     },
     {
       "name": "anchored",
@@ -64,10 +64,10 @@
       "total_docs": 25000,
       "prune_ratio": 0.09092,
       "bytes_fetched": 9310208,
-      "p50_ms": 105.717667,
-      "p95_ms": 112.83270900000001,
-      "p99_ms": 112.83270900000001,
-      "sequential_p50_ms": 538.814542
+      "p50_ms": 92.022,
+      "p95_ms": 100.881458,
+      "p99_ms": 100.881458,
+      "sequential_p50_ms": 88.671459
     },
     {
       "name": "no_match",
@@ -78,10 +78,10 @@
       "total_docs": 25000,
       "prune_ratio": 0.0,
       "bytes_fetched": 0,
-      "p50_ms": 0.004791,
-      "p95_ms": 0.006167000000000001,
-      "p99_ms": 0.006167000000000001,
-      "sequential_p50_ms": 0.004167
+      "p50_ms": 0.005834000000000001,
+      "p95_ms": 0.006125,
+      "p99_ms": 0.006125,
+      "sequential_p50_ms": 0.0047090000000000005
     },
     {
       "name": "QAll",
@@ -92,10 +92,10 @@
       "total_docs": 25000,
       "prune_ratio": 1.0,
       "bytes_fetched": 102400000,
-      "p50_ms": 1153.3482079999999,
-      "p95_ms": 1183.446209,
-      "p99_ms": 1183.446209,
-      "sequential_p50_ms": 5917.83875
+      "p50_ms": 161.018542,
+      "p95_ms": 163.741792,
+      "p99_ms": 163.741792,
+      "sequential_p50_ms": 168.18050000000002
     },
     {
       "name": "dot_star_gap",
@@ -106,10 +106,10 @@
       "total_docs": 25000,
       "prune_ratio": 0.1,
       "bytes_fetched": 10240000,
-      "p50_ms": 113.803833,
-      "p95_ms": 116.427667,
-      "p99_ms": 116.427667,
-      "sequential_p50_ms": 615.7247500000001
+      "p50_ms": 122.262708,
+      "p95_ms": 124.067583,
+      "p99_ms": 124.067583,
+      "sequential_p50_ms": 105.752542
     }
   ]
 }

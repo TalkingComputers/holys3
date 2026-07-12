@@ -4,6 +4,7 @@
 mod build;
 mod eval;
 mod format;
+mod pack;
 mod search;
 mod segment;
 mod terms;
@@ -12,7 +13,8 @@ pub use search::{
     search_collect, search_streaming, DocResult, KeyScope, MatchSink, NullSink, SinkFlow,
 };
 pub use segment::{
-    update_index, CorpusFactory, IndexChanged, SegmentedReader, SourceIdentity, UpdateReport,
+    update_index, CorpusFactory, IndexChanged, SegmentedReader, SourceIdentity, UpdateOptions,
+    UpdateReport,
 };
 
 #[cfg(test)]
@@ -51,7 +53,7 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 10;
+const INDEX_FORMAT: u32 = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -69,7 +71,7 @@ pub struct SearchStats {
     pub bytes_fetched: usize,
 }
 
-pub trait IndexReader {
+pub trait IndexReader: DocFetcher {
     fn strategy(&self) -> Strategy;
     fn total_docs(&self) -> usize;
     fn candidate_docs(
@@ -617,6 +619,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn index_build_writes_decoded_documents_to_content_packs() {
+        let corpus = MemCorpus::new(
+            vec!["a.txt".into(), "b.txt".into()],
+            vec![b"alpha".to_vec(), b"beta".to_vec()],
+        );
+        let built = build_index_files(&corpus, Strategy::Trigram, None).unwrap();
+
+        assert_eq!(built.packs.len(), 1);
+        assert_eq!(built.tables.blocks.len(), 1);
+        assert_eq!(built.tables.documents[0].first_block, 0);
+        assert_eq!(built.tables.documents[0].block_offset, 0);
+        assert_eq!(built.tables.documents[1].first_block, 0);
+        assert_eq!(built.tables.documents[1].block_offset, 5);
+    }
+
     struct OutOfRangeCorpus {
         sources: Vec<SourceObject>,
     }
@@ -661,7 +679,7 @@ mod tests {
             &test_source(),
             strategy,
             &listing,
-            false,
+            UpdateOptions::default(),
             &|shard| {
                 let keys: Vec<String> = shard.iter().map(|(key, _, _)| key.clone()).collect();
                 let bodies = keys
@@ -773,9 +791,10 @@ mod tests {
                 .map(|index| u8::try_from((index * 31 + index / 7) % 251).unwrap())
                 .collect::<Vec<_>>();
             let mut file = tempfile::tempfile().unwrap();
+            file.write_all(b"prefix").unwrap();
             file.write_all(&bytes).unwrap();
             assert_eq!(
-                pack_file_trigrams(&mut file, u64::try_from(len).unwrap()).unwrap(),
+                pack_file_trigrams(&mut file, 6, u64::try_from(len).unwrap()).unwrap(),
                 pack_trigram_grams(&bytes),
                 "length {len}"
             );
@@ -790,9 +809,21 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&bytes).unwrap();
         let indexed =
-            collect_file_trigrams(&mut file, u64::try_from(bytes.len()).unwrap()).unwrap();
+            collect_file_trigrams(&mut file, 0, u64::try_from(bytes.len()).unwrap()).unwrap();
         assert!(matches!(indexed, IndexedGrams::TrigramBitmap(_)));
-        let actual = write_posting_runs(vec![(0, indexed)], Strategy::Trigram, 1024).unwrap();
+        let actual = write_posting_runs(
+            vec![(
+                0,
+                IndexedGrams::TrigramSpool {
+                    offset: 0,
+                    len: u64::try_from(bytes.len()).unwrap(),
+                },
+            )],
+            Strategy::Trigram,
+            1024,
+            Some(&file),
+        )
+        .unwrap();
         let expected = write_trigram_run_radix(vec![(0, pack_trigram_grams(&bytes))]).unwrap();
         assert_eq!(
             std::fs::read(&actual[0]).unwrap(),
@@ -816,6 +847,7 @@ mod tests {
             vec![(0, IndexedGrams::Trigram(vec![0x000102, 0x7f0304, 0xff0506]))],
             Strategy::Trigram,
             1024,
+            None,
         )
         .unwrap();
         let (terms, _) = merge_posting_runs(runs, Strategy::Trigram, 1).unwrap();
@@ -833,6 +865,7 @@ mod tests {
             vec![(0, IndexedGrams::Sparse(text.into()))],
             Strategy::Sparse,
             1024,
+            None,
         )
         .unwrap();
         assert!(runs.len() > 1);
@@ -861,6 +894,7 @@ mod tests {
             vec![(0, IndexedGrams::Sparse(text.clone().into()))],
             Strategy::Sparse,
             1024,
+            None,
         )
         .unwrap();
         let mut file = tempfile::tempfile().unwrap();
@@ -869,12 +903,32 @@ mod tests {
             vec![(0, IndexedGrams::SparseFile(file))],
             Strategy::Sparse,
             1024,
+            None,
+        )
+        .unwrap();
+        let mut spool = tempfile::tempfile().unwrap();
+        spool.write_all(b"prefix").unwrap();
+        spool.write_all(&text).unwrap();
+        spool.write_all(b"suffix").unwrap();
+        let spooled = write_posting_runs(
+            vec![(
+                0,
+                IndexedGrams::SparseSpool {
+                    offset: 6,
+                    len: u64::try_from(text.len()).unwrap(),
+                },
+            )],
+            Strategy::Sparse,
+            1024,
+            Some(&spool),
         )
         .unwrap();
         let (memory_fst, memory_postings) =
             merge_posting_runs(memory, Strategy::Sparse, 1).unwrap();
         let (streamed_fst, streamed_postings) =
             merge_posting_runs(streamed, Strategy::Sparse, 1).unwrap();
+        let (spooled_fst, spooled_postings) =
+            merge_posting_runs(spooled, Strategy::Sparse, 1).unwrap();
         assert_eq!(
             std::fs::read(memory_fst.path()).unwrap(),
             std::fs::read(streamed_fst.path()).unwrap()
@@ -882,6 +936,14 @@ mod tests {
         assert_eq!(
             std::fs::read(memory_postings.path()).unwrap(),
             std::fs::read(streamed_postings.path()).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(memory_fst.path()).unwrap(),
+            std::fs::read(spooled_fst.path()).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(memory_postings.path()).unwrap(),
+            std::fs::read(spooled_postings.path()).unwrap()
         );
     }
 
@@ -1021,7 +1083,7 @@ mod tests {
             vec![b"abc world".to_vec(), b"nomatch".to_vec()],
         );
         let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
-        let (matches, stats) = search_collect(&r, &c, "world").unwrap();
+        let (matches, stats) = search_collect(&r, "world").unwrap();
         assert_eq!(
             matches,
             vec![(
@@ -1054,14 +1116,13 @@ mod tests {
         let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
         let stats = search_streaming(
             &r,
-            &c,
             "world",
             KeyScope::default(),
             MatchOptions::default(),
             &NullSink,
         )
         .unwrap();
-        let (_, full_stats) = search_collect(&r, &c, "world").unwrap();
+        let (_, full_stats) = search_collect(&r, "world").unwrap();
         assert_eq!(stats.hits, full_stats.hits);
         assert_eq!(stats.hits, vec!["x", "z"]);
     }
@@ -1078,7 +1139,7 @@ mod tests {
             matches: None,
         };
         let stats =
-            search_streaming(&r, &c, "world", scope, MatchOptions::default(), &NullSink).unwrap();
+            search_streaming(&r, "world", scope, MatchOptions::default(), &NullSink).unwrap();
         assert_eq!(stats.hits, vec!["logs/a"]);
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.bytes_fetched, b"abc world".len());
@@ -1100,7 +1161,7 @@ mod tests {
         );
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
             let (_s, _c, r) = build_tmp(&c, strategy);
-            let (matches, stats) = search_collect(&r, &c, "needle").unwrap();
+            let (matches, stats) = search_collect(&r, "needle").unwrap();
             assert_eq!(
                 stats.hits,
                 vec!["a.log.gz", "b.log"],
@@ -1129,7 +1190,6 @@ mod tests {
         let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
         let stats = search_streaming(
             &r,
-            &c,
             "needle",
             KeyScope::default(),
             MatchOptions::default(),
@@ -1182,6 +1242,7 @@ mod tests {
             encoded_size: source.encoded_size,
             encoding: SourceEncoding::Raw,
             member_path: None,
+            index: None,
         };
         LocalFetcher::new(1)
             .unwrap()
@@ -1218,6 +1279,7 @@ mod tests {
             encoded_size: 5,
             encoding: SourceEncoding::Raw,
             member_path: None,
+            index: None,
         };
         std::fs::write(&path, b"bravo").unwrap();
         let error = LocalFetcher::new(1)
@@ -1243,6 +1305,7 @@ mod tests {
                     encoded_size: u64::try_from(body.len()).unwrap(),
                     encoding: SourceEncoding::Raw,
                     member_path: None,
+                    index: None,
                 }
             })
             .collect::<Vec<_>>();

@@ -183,63 +183,6 @@ fn exit_codes() {
 }
 
 #[test]
-fn object_cache_flags_are_paired_and_s3_only() {
-    holys3()
-        .args([
-            "needle",
-            "s3://bucket",
-            "--object-cache",
-            "/tmp/holys3-cache",
-        ])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("--object-cache-cap"));
-    holys3()
-        .args(["needle", "s3://bucket", "--object-cache-cap", "1024"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("--object-cache"));
-    holys3()
-        .args([
-            "needle",
-            "s3://bucket",
-            "--object-cache",
-            "/tmp/holys3-cache",
-            "--object-cache-cap",
-            "0",
-        ])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("greater than 0"));
-
-    let c = corpus();
-    search_pattern(&c, "ERROR")
-        .args([
-            "--object-cache",
-            "/tmp/holys3-cache",
-            "--object-cache-cap",
-            "1024",
-        ])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("only applies to s3://"));
-}
-
-#[test]
-fn prints_object_cache_help() {
-    holys3()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "Cache immutable S3 source bodies under DIR",
-        ))
-        .stdout(predicate::str::contains(
-            "Limit the source-object cache to BYTES",
-        ));
-}
-
-#[test]
 fn piped_default_format_and_flags() {
     let c = corpus();
     let out = search(&c).output().unwrap();

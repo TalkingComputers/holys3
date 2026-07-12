@@ -1,0 +1,12 @@
+{
+  "cycles": 30,
+  "changes_per_cycle": 250,
+  "total_docs": 25000,
+  "listing_p50_ms": 234.944708,
+  "listing_p95_ms": 249.111083,
+  "update_p50_ms": 111.675125,
+  "update_p95_ms": 127.60612499999999,
+  "update_max_ms": 2000.153833,
+  "pack_bytes_written": 41694648,
+  "final_segments": 8
+}

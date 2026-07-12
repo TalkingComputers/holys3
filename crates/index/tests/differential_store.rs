@@ -6,7 +6,7 @@ use holys3_core::{
 };
 use holys3_index::{
     search_collect, search_streaming, update_index, KeyScope, NullSink, SegmentedReader,
-    SourceIdentity,
+    SourceIdentity, UpdateOptions,
 };
 
 /// The store-backed (segmented) index must agree with a full scan of
@@ -43,7 +43,7 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
                 &source,
                 strategy,
                 &listing,
-                false,
+                UpdateOptions::default(),
                 &|shard| {
                     let keys: Vec<String> = shard.iter().map(|(key, _, _)| key.clone()).collect();
                     let bodies = keys
@@ -66,7 +66,7 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
                 &source,
             )?;
             for p in PATTERNS {
-                let indexed: Vec<String> = search_collect(&reader, &c, p)?.1.hits;
+                let indexed: Vec<String> = search_collect(&reader, p)?.1.hits;
                 let re = regex::bytes::Regex::new(p)?;
                 let oracle = scan_matching_docs(&c, &re)?;
                 assert_eq!(
@@ -75,7 +75,6 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
                 );
                 let fast = search_streaming(
                     &reader,
-                    &c,
                     p,
                     KeyScope::default(),
                     MatchOptions::default(),

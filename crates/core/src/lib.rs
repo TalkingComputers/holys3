@@ -25,6 +25,6 @@ pub use grep::{
     has_line_match, has_line_match_fast, LineEvent, LineKind, MatchOptions, SubMatch,
 };
 pub use store::{
-    content_version, scan_matching_docs, BlobStore, Corpus, DocAddress, DocFetcher, LocalBlobStore,
-    SourceObject, StaleSource,
+    content_version, scan_matching_docs, BlobStore, Corpus, DocAddress, DocFetcher, IndexAddress,
+    LocalBlobStore, SourceObject, StaleSource,
 };

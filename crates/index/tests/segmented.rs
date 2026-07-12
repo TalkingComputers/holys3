@@ -4,14 +4,13 @@
 
 use anyhow::Result;
 use holys3_core::{
-    decode_body, decode_requested, scan_matching_docs,
+    decode_body, scan_matching_docs,
     testutil::{encode, MemCorpus},
-    BlobStore, Corpus, DocAddress, DocFetcher, DocumentBody, LocalBlobStore, MatchOptions,
-    SourceEncoding, SourceObject, Strategy,
+    BlobStore, Corpus, LocalBlobStore, MatchOptions, SourceEncoding, SourceObject, Strategy,
 };
 use holys3_index::{
     search_collect, search_streaming, update_index, IndexChanged, IndexReader, KeyScope, NullSink,
-    SegmentedReader, SourceIdentity,
+    SegmentedReader, SourceIdentity, UpdateOptions,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -58,49 +57,6 @@ impl Bucket {
     }
 }
 
-struct BucketFetcher<'a>(&'a Bucket);
-
-impl DocFetcher for BucketFetcher<'_> {
-    fn fetch_each(
-        &self,
-        documents: &[DocAddress],
-        consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
-    ) -> Result<()> {
-        let mut groups = BTreeMap::new();
-        for (idx, document) in documents.iter().enumerate() {
-            groups
-                .entry((document.source_key.clone(), document.source_version.clone()))
-                .or_insert_with(Vec::new)
-                .push((idx, document.member_path.clone()));
-        }
-        for ((key, _), requests) in groups {
-            match self.0.objects.get(&key) {
-                Some(body) => {
-                    decode_requested(&key, &requests, bytes::Bytes::from(body.clone()), consume)?;
-                }
-                None => eprintln!("warning: {key} vanished; skipping"),
-            }
-        }
-        Ok(())
-    }
-}
-
-struct CountingBucketFetcher<'a> {
-    bucket: &'a Bucket,
-    calls: AtomicUsize,
-}
-
-impl DocFetcher for CountingBucketFetcher<'_> {
-    fn fetch_each(
-        &self,
-        documents: &[DocAddress],
-        consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
-    ) -> Result<()> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        BucketFetcher(self.bucket).fetch_each(documents, consume)
-    }
-}
-
 fn test_source() -> SourceIdentity {
     SourceIdentity::Local {
         prefix: "/test/".into(),
@@ -116,10 +72,54 @@ fn reindex(bucket: &Bucket, store_dir: &Path, cache_dir: &Path, strategy: Strate
         &test_source(),
         strategy,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     Ok(())
+}
+
+struct RangeCountingStore {
+    inner: LocalBlobStore,
+    pack_reads: std::cell::Cell<usize>,
+    deleted: std::cell::RefCell<Vec<String>>,
+}
+
+impl BlobStore for RangeCountingStore {
+    fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put(name, bytes)
+    }
+
+    fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.put_file(name, path)
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name)
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(name, start, len)
+    }
+
+    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> Result<Vec<Vec<u8>>> {
+        if name.starts_with("packs/") {
+            self.pack_reads.set(self.pack_reads.get() + 1);
+        }
+        self.inner.get_ranges(name, ranges)
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        self.deleted.borrow_mut().push(name.to_owned());
+        self.inner.delete(name)
+    }
+
+    fn get_versioned(&self, name: &str) -> Result<Option<(Vec<u8>, String)>> {
+        self.inner.get_versioned(name)
+    }
+
+    fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
+        self.inner.put_if(name, bytes, expected)
+    }
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn index_source_binding_allows_only_same_backend_subtrees() -> Result<()> {
         &indexed,
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
 
@@ -182,6 +182,71 @@ fn index_source_binding_allows_only_same_backend_subtrees() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn indexed_snapshot_searches_after_source_removal() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("logs/a.log", b"before needle after");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    bucket.delete("logs/a.log");
+
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    let stats = search_collect(&reader, "needle")?.1;
+    assert_eq!(stats.hits, ["logs/a.log"]);
+    Ok(())
+}
+
+#[test]
+fn deleting_one_source_rewrites_and_removes_its_old_pack() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("a.log", b"deleted secret needle");
+    bucket.put("b.log", b"retained public needle");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    let packs_dir = store_dir.path().join("packs");
+    let before = std::fs::read_dir(&packs_dir)?
+        .map(|entry| Ok(entry?.file_name()))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(before.len(), 1);
+
+    bucket.delete("a.log");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    let after = std::fs::read_dir(&packs_dir)?
+        .map(|entry| Ok(entry?.file_name()))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(after.len(), 1);
+    assert_ne!(before, after);
+
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    assert_eq!(search_collect(&reader, "needle")?.1.hits, ["b.log"]);
+    Ok(())
+}
+
 /// Search the segmented index and compare with a scan oracle over the live
 /// bucket contents (decompressed).
 fn assert_matches_oracle(
@@ -212,8 +277,7 @@ fn assert_matches_oracle(
         .collect();
     let decoded = MemCorpus::new(keys, decoded_bodies);
     for pattern in patterns {
-        let fetcher = BucketFetcher(bucket);
-        let hits = search_collect(&reader, &fetcher, pattern)?.1.hits;
+        let hits = search_collect(&reader, pattern)?.1.hits;
         let re = regex::bytes::Regex::new(pattern)?;
         let oracle = scan_matching_docs(&decoded, &re)?;
         assert_eq!(hits, oracle, "{label}: pattern `{pattern}`");
@@ -266,9 +330,7 @@ fn archive_members_follow_source_lifecycle() -> Result<()> {
             && document.member_path.is_some()
     }));
     assert_eq!(
-        search_collect(&reader, &BucketFetcher(&bucket), "needle")?
-            .1
-            .hits,
+        search_collect(&reader, "needle")?.1.hits,
         [
             "logs/bundle.zip!/app.log".to_owned(),
             "logs/bundle.zip!/nested/worker.log".to_owned()
@@ -277,7 +339,6 @@ fn archive_members_follow_source_lifecycle() -> Result<()> {
     assert_eq!(
         search_streaming(
             &reader,
-            &BucketFetcher(&bucket),
             "needle",
             KeyScope {
                 prefix: Some("logs/bundle.zip!/nested/"),
@@ -306,9 +367,7 @@ fn archive_members_follow_source_lifecycle() -> Result<()> {
         &test_source(),
     )?;
     assert_eq!(
-        search_collect(&reader, &BucketFetcher(&bucket), "needle")?
-            .1
-            .hits,
+        search_collect(&reader, "needle")?.1.hits,
         ["logs/bundle.zip!/renamed.log".to_owned()]
     );
 
@@ -364,27 +423,21 @@ fn indexes_large_archive_without_decoding_it_twice_per_search() -> Result<()> {
         &test_source(),
     )?;
     assert_eq!(reader.total_docs(), 17_000);
-    let stats = search_collect(&reader, &BucketFetcher(&bucket), "scale-needle")?.1;
+    let stats = search_collect(&reader, "scale-needle")?.1;
     assert_eq!(stats.candidates, 17);
     assert_eq!(stats.hits.len(), 17);
     assert!(stats
         .hits
         .iter()
         .all(|key| key.starts_with("scale.zip!/logs/member-")));
-    let fetcher = CountingBucketFetcher {
-        bucket: &bucket,
-        calls: AtomicUsize::new(0),
-    };
     let stats = search_streaming(
         &reader,
-        &fetcher,
         ".+",
         KeyScope::default(),
         MatchOptions::default(),
         &NullSink,
     )?;
     assert_eq!(stats.hits.len(), 17_000);
-    assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
     Ok(())
 }
 
@@ -522,7 +575,7 @@ fn lifecycle_add_modify_delete_readd() -> Result<()> {
         &test_source(),
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     assert!(report.up_to_date, "run6 should be a no-op");
@@ -575,10 +628,8 @@ fn compaction_bounds_segment_count_and_preserves_results() -> Result<()> {
 
     // Segment count must stay bounded: target 8 plus at most the one new
     // segment a run can add beyond a single merge.
-    let fetcher = BucketFetcher(&bucket);
     let stats = search_streaming(
         &reader,
-        &fetcher,
         "needle",
         KeyScope::default(),
         MatchOptions::default(),
@@ -621,19 +672,11 @@ fn gzipped_objects_and_prefix_pruning() -> Result<()> {
         cache_dir.path(),
         &test_source(),
     )?;
-    let fetcher = BucketFetcher(&bucket);
     let scope = KeyScope {
         prefix: Some("logs/"),
         matches: None,
     };
-    let stats = search_streaming(
-        &reader,
-        &fetcher,
-        "needle",
-        scope,
-        MatchOptions::default(),
-        &NullSink,
-    )?;
+    let stats = search_streaming(&reader, "needle", scope, MatchOptions::default(), &NullSink)?;
     assert_eq!(stats.hits, vec!["logs/2026/06/08/x.gz"]);
     Ok(())
 }
@@ -713,7 +756,7 @@ fn undecodable_objects_marked_failed_and_converge() -> Result<()> {
         &test_source(),
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     assert!(report.up_to_date, "failed-marked object must not loop");
@@ -787,7 +830,7 @@ fn object_missing_during_fetch_retries_with_same_etag() -> Result<()> {
         &test_source(),
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &build,
     )?;
     assert_eq!(first.total_docs, 0);
@@ -797,7 +840,7 @@ fn object_missing_during_fetch_retries_with_same_etag() -> Result<()> {
         &test_source(),
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &build,
     )?;
     assert_eq!(second.added, 1);
@@ -827,7 +870,10 @@ fn rebuild_flag_reingests_from_scratch() -> Result<()> {
         &test_source(),
         Strategy::Trigram,
         &listing,
-        true,
+        UpdateOptions {
+            rebuild: true,
+            purge_deleted: false,
+        },
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     assert!(!report.up_to_date);
@@ -899,7 +945,10 @@ fn unreferenced_segment_blobs_are_garbage_collected() -> Result<()> {
         &test_source(),
         Strategy::Trigram,
         &listing,
-        true,
+        UpdateOptions {
+            rebuild: true,
+            purge_deleted: false,
+        },
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     // dirs may linger empty on local fs; what matters is blob count: exactly
@@ -910,8 +959,6 @@ fn unreferenced_segment_blobs_are_garbage_collected() -> Result<()> {
         "rebuild must not leak old segment blobs"
     );
 
-    // a delete creates a dead-set; the NEXT dead-set supersedes it and the
-    // old one must be GC'd (never two dead files for one segment)
     bucket.delete("a");
     reindex(
         &bucket,
@@ -919,7 +966,11 @@ fn unreferenced_segment_blobs_are_garbage_collected() -> Result<()> {
         cache_dir.path(),
         Strategy::Trigram,
     )?;
-    assert_eq!(blob_files(store_dir.path()), 4, "segment + one dead-set");
+    assert_eq!(
+        blob_files(store_dir.path()),
+        3,
+        "deleted segment was repacked"
+    );
     bucket.put("c", b"needle three");
     bucket.delete("b");
     reindex(
@@ -1013,7 +1064,7 @@ fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
         &test_source(),
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )
     .expect_err("losing writer must error");
@@ -1106,7 +1157,7 @@ fn interrupted_root_swap_preserves_old_index_and_restart_converges() -> Result<(
         &test_source(),
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| Ok(Box::new(new_bucket.corpus_over(shard))),
     )
     .expect_err("rejected root swap must error");
@@ -1166,7 +1217,7 @@ fn same_run_compacted_newborns_are_garbage_collected() -> Result<()> {
         &test_source(),
         Strategy::Trigram,
         &bucket.listing(),
-        false,
+        UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     let dirs_on_disk = std::fs::read_dir(store_dir.path().join("segments"))?
@@ -1189,6 +1240,295 @@ fn same_run_compacted_newborns_are_garbage_collected() -> Result<()> {
         &["needle"],
         "post-churn",
     )?;
+    Ok(())
+}
+
+#[test]
+fn same_run_compacted_tombstones_are_garbage_collected_once() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    for batch in 0..8 {
+        for offset in 0..8 {
+            let document = batch * 8 + offset;
+            bucket.put(
+                &format!("doc{document:02}"),
+                format!("needle {document}").as_bytes(),
+            );
+        }
+        reindex(
+            &bucket,
+            store_dir.path(),
+            cache_dir.path(),
+            Strategy::Trigram,
+        )?;
+    }
+
+    bucket.delete("doc00");
+    for document in 64..72 {
+        bucket.put(
+            &format!("doc{document:02}"),
+            format!("needle {document}").as_bytes(),
+        );
+    }
+    let store = RangeCountingStore {
+        inner: LocalBlobStore::new(store_dir.path()),
+        pack_reads: std::cell::Cell::new(0),
+        deleted: std::cell::RefCell::new(Vec::new()),
+    };
+    let report = update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Strategy::Trigram,
+        &bucket.listing(),
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    assert!(report.compacted);
+    let deleted = store.deleted.borrow();
+    let unique: std::collections::HashSet<&str> = deleted.iter().map(String::as_str).collect();
+    assert_eq!(deleted.len(), unique.len());
+
+    let segment_dirs = std::fs::read_dir(store_dir.path().join("segments"))?
+        .filter(|entry| {
+            entry.as_ref().unwrap().file_type().unwrap().is_dir()
+                && std::fs::read_dir(entry.as_ref().unwrap().path())
+                    .unwrap()
+                    .count()
+                    > 0
+        })
+        .count();
+    let pack_files = std::fs::read_dir(store_dir.path().join("packs"))?
+        .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_file())
+        .count();
+    assert_eq!(segment_dirs, report.segments);
+    assert_eq!(pack_files, report.segments);
+    assert_matches_oracle(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        &["needle"],
+        "post-tombstone-compaction",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn tombstones_bound_update_work_and_purge_physically() -> Result<()> {
+    fn names(path: &Path) -> Result<Vec<String>> {
+        let mut names = std::fs::read_dir(path)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>>>()?;
+        names.sort_unstable();
+        Ok(names)
+    }
+
+    fn dead_files(path: &Path) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        for segment in std::fs::read_dir(path.join("segments"))? {
+            for entry in std::fs::read_dir(segment?.path())? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                if name.starts_with("dead-") {
+                    files.push(name);
+                }
+            }
+        }
+        files.sort_unstable();
+        Ok(files)
+    }
+
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    for i in 0..64 {
+        bucket.put(&format!("doc{i:02}"), format!("needle {i:02}").as_bytes());
+    }
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    let original_packs = names(&store_dir.path().join("packs"))?;
+
+    bucket.delete("doc00");
+    let store = RangeCountingStore {
+        inner: LocalBlobStore::new(store_dir.path()),
+        pack_reads: std::cell::Cell::new(0),
+        deleted: std::cell::RefCell::new(Vec::new()),
+    };
+    let report = update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Strategy::Trigram,
+        &bucket.listing(),
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    assert_eq!(store.pack_reads.get(), 0);
+    assert!(!report.compacted);
+    assert_eq!(names(&store_dir.path().join("packs"))?, original_packs);
+    let first_dead = dead_files(store_dir.path())?;
+    assert_eq!(first_dead.len(), 1);
+
+    bucket.delete("doc01");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    let second_dead = dead_files(store_dir.path())?;
+    assert_eq!(second_dead.len(), 1);
+    assert_ne!(second_dead, first_dead);
+
+    let store = RangeCountingStore {
+        inner: LocalBlobStore::new(store_dir.path()),
+        pack_reads: std::cell::Cell::new(0),
+        deleted: std::cell::RefCell::new(Vec::new()),
+    };
+    let report = update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Strategy::Trigram,
+        &bucket.listing(),
+        UpdateOptions {
+            rebuild: false,
+            purge_deleted: true,
+        },
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    assert_eq!(store.pack_reads.get(), 1);
+    assert!(report.compacted);
+    let deleted = store.deleted.borrow();
+    let unique: std::collections::HashSet<&str> = deleted.iter().map(String::as_str).collect();
+    assert_eq!(deleted.len(), unique.len());
+    assert!(dead_files(store_dir.path())?.is_empty());
+    assert_ne!(names(&store_dir.path().join("packs"))?, original_packs);
+    assert_matches_oracle(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        &["needle"],
+        "purged tombstones",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn tombstone_thresholds_repack_by_documents_and_bytes() -> Result<()> {
+    for large in [false, true] {
+        let store_dir = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+        let mut bucket = Bucket::default();
+        for i in 0..8 {
+            let size = if large && i == 0 { 128 * 1024 } else { 1024 };
+            bucket.put(&format!("doc{i:02}"), &vec![b'a' + i; size]);
+        }
+        reindex(
+            &bucket,
+            store_dir.path(),
+            cache_dir.path(),
+            Strategy::Trigram,
+        )?;
+        bucket.delete("doc00");
+        if !large {
+            bucket.delete("doc01");
+        }
+        let store = RangeCountingStore {
+            inner: LocalBlobStore::new(store_dir.path()),
+            pack_reads: std::cell::Cell::new(0),
+            deleted: std::cell::RefCell::new(Vec::new()),
+        };
+        let report = update_index(
+            &store,
+            cache_dir.path(),
+            &test_source(),
+            Strategy::Trigram,
+            &bucket.listing(),
+            UpdateOptions::default(),
+            &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+        )?;
+        assert_eq!(store.pack_reads.get(), 1);
+        assert!(report.compacted);
+    }
+    Ok(())
+}
+
+#[test]
+fn repack_coalesces_pack_reads_across_sources() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    for i in 0..64 {
+        let body = format!("needle {i:02} {}\n", "x".repeat(4 * 1024));
+        bucket.put(&format!("doc{i:02}"), body.as_bytes());
+    }
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+
+    bucket.delete("doc00");
+    let store = RangeCountingStore {
+        inner: LocalBlobStore::new(store_dir.path()),
+        pack_reads: std::cell::Cell::new(0),
+        deleted: std::cell::RefCell::new(Vec::new()),
+    };
+    update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Strategy::Trigram,
+        &bucket.listing(),
+        UpdateOptions {
+            rebuild: false,
+            purge_deleted: true,
+        },
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    assert_eq!(store.pack_reads.get(), 1);
+    Ok(())
+}
+
+#[test]
+fn repack_fetches_all_window_ranges_in_one_call() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    for i in 0..20 {
+        bucket.put(&format!("doc{i:02}"), &vec![b'a' + i; 128 * 1024]);
+    }
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+
+    for i in (0..20).step_by(2) {
+        bucket.delete(&format!("doc{i:02}"));
+    }
+    let store = RangeCountingStore {
+        inner: LocalBlobStore::new(store_dir.path()),
+        pack_reads: std::cell::Cell::new(0),
+        deleted: std::cell::RefCell::new(Vec::new()),
+    };
+    update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Strategy::Trigram,
+        &bucket.listing(),
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    assert_eq!(store.pack_reads.get(), 1);
     Ok(())
 }
 
@@ -1259,7 +1599,7 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
         &test_source(),
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     );
     assert!(
@@ -1284,7 +1624,7 @@ fn duplicate_listing_fails_before_fetching() -> Result<()> {
         &test_source(),
         Strategy::Trigram,
         &listing,
-        false,
+        UpdateOptions::default(),
         &|_| {
             calls.fetch_add(1, Ordering::Relaxed);
             anyhow::bail!("factory should not run")

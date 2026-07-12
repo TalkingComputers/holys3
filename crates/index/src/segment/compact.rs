@@ -4,9 +4,10 @@ use super::{
     MERGE_TERMS_CAP, SEGMENT_COUNT_TARGET, SEGMENT_DOC_CAP,
 };
 use crate::format::{DeadSet, DocEntry, SegmentTables, SourceEntry};
+use crate::pack::{fetch_documents, request_windows, PackBuilder, PackRequest, PackSlice};
 use crate::terms::TermMap;
 use anyhow::{Context, Result};
-use holys3_core::{BlobStore, DocId, Strategy};
+use holys3_core::{BlobStore, DocId, DocumentBody, Strategy};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -128,7 +129,7 @@ fn write_compaction_run(
     Ok(file.into_temp_path())
 }
 
-fn merge_segments(
+pub(super) fn merge_segments(
     store: &dyn BlobStore,
     cache_dir: &Path,
     strategy: Strategy,
@@ -139,11 +140,13 @@ fn merge_segments(
     let mut tables = SegmentTables {
         sources: Vec::new(),
         documents: Vec::new(),
+        blocks: Vec::new(),
     };
     let mut remaps: Vec<Vec<Option<u32>>> = Vec::with_capacity(victims.len());
     let mut entries: Vec<MergedSource> = Vec::new();
+    let mut victim_tables = Vec::with_capacity(victims.len());
     for (seg_idx, (meta, dead)) in victims.iter().enumerate() {
-        let victim_tables = crate::format::parse_tables(&cached_blob(
+        let loaded = crate::format::parse_tables(&cached_blob(
             store,
             cache_dir,
             &meta.seg_id,
@@ -151,15 +154,15 @@ fn merge_segments(
             meta.docs_len,
             &meta.docs_hash,
         )?)?;
-        validate_segment_tables(meta, &victim_tables)?;
-        remaps.push(vec![None; victim_tables.documents.len()]);
-        for (source_id, source) in victim_tables.sources.into_iter().enumerate() {
+        validate_segment_tables(meta, &loaded)?;
+        remaps.push(vec![None; loaded.documents.len()]);
+        for (source_id, source) in loaded.sources.iter().cloned().enumerate() {
             if dead.sources.binary_search(&(source_id as u32)).is_ok() {
                 continue;
             }
             let start = source.first_doc as usize;
             let end = start + source.doc_count as usize;
-            let documents = victim_tables.documents[start..end]
+            let documents = loaded.documents[start..end]
                 .iter()
                 .cloned()
                 .enumerate()
@@ -173,21 +176,86 @@ fn merge_segments(
                 .collect();
             entries.push((source, documents, seg_idx));
         }
+        victim_tables.push(loaded);
     }
     entries.sort_unstable_by(|(left, _, _), (right, _, _)| left.key.cmp(&right.key));
-    for (mut source, documents, seg_idx) in entries {
+    let mut merged_documents = Vec::new();
+    for (mut source, source_documents, seg_idx) in entries {
         let source_id = u32::try_from(tables.sources.len())?;
-        source.first_doc = u32::try_from(tables.documents.len())?;
-        source.doc_count = u32::try_from(documents.len())?;
-        for (mut document, old_id) in documents {
-            let new_id = u32::try_from(tables.documents.len())?;
-            remaps[seg_idx][old_id as usize] = Some(new_id);
+        source.first_doc = u32::try_from(merged_documents.len())?;
+        source.doc_count = u32::try_from(source_documents.len())?;
+        for (mut document, old_id) in source_documents {
             document.source_id = source_id;
-            tables.documents.push(document);
+            merged_documents.push((Some(document), old_id, seg_idx));
         }
         tables.sources.push(source);
     }
 
+    let requests = merged_documents
+        .iter()
+        .enumerate()
+        .map(|(index, (document, _, _))| {
+            let document = document.as_ref().expect("document exists");
+            PackRequest {
+                index,
+                slice: PackSlice {
+                    first_block: document.first_block,
+                    block_offset: document.block_offset,
+                },
+                decoded_size: document.decoded_size,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut pack_builder = PackBuilder::production()?;
+    for window in request_windows(&requests) {
+        let window_start = window.start;
+        let mut fetched = std::iter::repeat_with(|| None)
+            .take(window.len())
+            .collect::<Vec<Option<DocumentBody>>>();
+        for seg_idx in 0..victims.len() {
+            let selected = requests[window.clone()]
+                .iter()
+                .filter(|request| merged_documents[request.index].2 == seg_idx)
+                .copied()
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                continue;
+            }
+            fetch_documents(
+                store,
+                &victims[seg_idx].0.packs,
+                &victim_tables[seg_idx].blocks,
+                &selected,
+                &mut |index, body| {
+                    let slot = index
+                        .checked_sub(window_start)
+                        .filter(|slot| *slot < fetched.len())
+                        .context("compaction document is outside its fetch window")?;
+                    anyhow::ensure!(
+                        fetched[slot].replace(body).is_none(),
+                        "compaction document was fetched twice"
+                    );
+                    Ok(())
+                },
+            )?;
+        }
+        for index in window {
+            let body = fetched[index - window_start]
+                .take()
+                .context("compaction did not fetch every live document")?;
+            let (document, old_id, seg_idx) = &mut merged_documents[index];
+            let mut document = document.take().context("compaction document was reused")?;
+            let slice = pack_builder.append(body.into_reader(), document.decoded_size)?;
+            document.first_block = slice.first_block;
+            document.block_offset = slice.block_offset;
+            let new_id = u32::try_from(tables.documents.len())?;
+            remaps[*seg_idx][*old_id as usize] = Some(new_id);
+            tables.documents.push(document);
+        }
+    }
+
+    let packed = pack_builder.finish()?;
+    tables.blocks = packed.blocks;
     tables.validate()?;
     let runs = victims
         .iter()
@@ -196,5 +264,5 @@ fn merge_segments(
         .collect::<Result<Vec<_>>>()?;
     let (fst, postings) =
         crate::build::merge_posting_runs(runs, strategy, u32::try_from(tables.documents.len())?)?;
-    put_segment_files(store, &fst, &postings, &tables)
+    put_segment_files(store, &fst, &postings, &tables, &packed.packs)
 }

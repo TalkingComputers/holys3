@@ -1,4 +1,5 @@
 use crate::format::{DocEntry, SegmentTables, SourceEntry};
+use crate::pack::{PackBuilder, PackFile};
 use anyhow::{Context, Result};
 use holys3_core::{
     decode_source_body, is_raw_body, pack_trigram_grams, Corpus, DecodeSink, DocumentBody,
@@ -7,7 +8,7 @@ use holys3_core::{
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::Path;
 
@@ -118,17 +119,51 @@ pub(crate) struct BuiltIndexFiles {
     pub fst: TempBlob,
     pub postings: TempBlob,
     pub tables: SegmentTables,
+    pub packs: Vec<PackFile>,
 }
 
 struct BuiltDocument {
     meta: LogicalDocumentMeta,
     grams: IndexedGrams,
     decoded_size: u64,
+    content: BuiltContent,
 }
 
 enum IndexOutput {
     Bytes(Vec<bytes::Bytes>),
-    File { grams: IndexedGrams, len: u64 },
+    File {
+        grams: Option<IndexedGrams>,
+        len: u64,
+        content: File,
+    },
+}
+
+enum BuiltContent {
+    Bytes(bytes::Bytes),
+    File(File),
+    Spool { offset: u64 },
+}
+
+impl BuiltContent {
+    fn append(
+        self,
+        builder: &mut PackBuilder,
+        len: u64,
+        spool: Option<&mut tempfile::NamedTempFile>,
+    ) -> Result<crate::pack::PackSlice> {
+        match self {
+            Self::Bytes(bytes) => builder.append(std::io::Cursor::new(bytes), len),
+            Self::File(mut file) => {
+                file.seek(SeekFrom::Start(0))?;
+                builder.append(file, len)
+            }
+            Self::Spool { offset } => {
+                let spool = spool.context("spooled document has no content file")?;
+                spool.as_file_mut().seek(SeekFrom::Start(offset))?;
+                builder.append(spool.as_file_mut().take(len), len)
+            }
+        }
+    }
 }
 
 struct IndexDecodeSink {
@@ -137,17 +172,47 @@ struct IndexDecodeSink {
     current_meta: Option<LogicalDocumentMeta>,
     current_output: IndexOutput,
     documents: Vec<BuiltDocument>,
+    spool: Option<tempfile::NamedTempFile>,
+    spool_len: u64,
 }
 
 impl IndexDecodeSink {
-    fn new(strategy: Strategy, document_limit: Option<usize>) -> Self {
-        Self {
+    fn new(strategy: Strategy, document_limit: Option<usize>, spool_content: bool) -> Result<Self> {
+        Ok(Self {
             strategy,
             document_limit,
             current_meta: None,
             current_output: IndexOutput::Bytes(Vec::new()),
             documents: Vec::new(),
-        }
+            spool: spool_content
+                .then(tempfile::NamedTempFile::new)
+                .transpose()?,
+            spool_len: 0,
+        })
+    }
+
+    fn store_content(&mut self, mut content: BuiltContent, len: u64) -> Result<BuiltContent> {
+        let Some(spool) = &mut self.spool else {
+            return Ok(content);
+        };
+        let offset = self.spool_len;
+        let written = match &mut content {
+            BuiltContent::Bytes(bytes) => {
+                spool.write_all(bytes)?;
+                u64::try_from(bytes.len())?
+            }
+            BuiltContent::File(file) => {
+                file.seek(SeekFrom::Start(0))?;
+                std::io::copy(&mut file.take(len), spool)?
+            }
+            BuiltContent::Spool { .. } => anyhow::bail!("document content was spooled twice"),
+        };
+        anyhow::ensure!(written == len, "decoded document content length changed");
+        self.spool_len = self
+            .spool_len
+            .checked_add(len)
+            .context("decoded content spool length overflows")?;
+        Ok(BuiltContent::Spool { offset })
     }
 }
 
@@ -200,22 +265,31 @@ impl DecodeSink for IndexDecodeSink {
             anyhow::bail!("decoder wrote more than one file for one document");
         };
         anyhow::ensure!(chunks.is_empty(), "decoder mixed file and byte output");
-        let grams = match self.strategy {
-            Strategy::Trigram => collect_file_trigrams(&mut file, len)?,
-            Strategy::Sparse
-                if self
-                    .current_meta
-                    .as_ref()
-                    .is_some_and(|meta| meta.member_path.is_some()) =>
-            {
-                file.seek(SeekFrom::Start(0))?;
-                let mut temp = tempfile::NamedTempFile::new()?;
-                std::io::copy(&mut file, &mut temp)?;
-                IndexedGrams::SparsePath(temp.into_temp_path())
-            }
-            Strategy::Sparse => IndexedGrams::SparseFile(file),
+        let content = file.try_clone()?;
+        let grams = if self.spool.is_some() {
+            None
+        } else {
+            Some(match self.strategy {
+                Strategy::Trigram => collect_file_trigrams(&mut file, 0, len)?,
+                Strategy::Sparse
+                    if self
+                        .current_meta
+                        .as_ref()
+                        .is_some_and(|meta| meta.member_path.is_some()) =>
+                {
+                    file.seek(SeekFrom::Start(0))?;
+                    let mut temp = tempfile::NamedTempFile::new()?;
+                    std::io::copy(&mut file, &mut temp)?;
+                    IndexedGrams::SparsePath(temp.into_temp_path())
+                }
+                Strategy::Sparse => IndexedGrams::SparseFile(file),
+            })
         };
-        self.current_output = IndexOutput::File { grams, len };
+        self.current_output = IndexOutput::File {
+            grams,
+            len,
+            content,
+        };
         Ok(())
     }
 
@@ -225,8 +299,12 @@ impl DecodeSink for IndexDecodeSink {
             .take()
             .context("decoder finished without beginning a document")?;
         let output = std::mem::replace(&mut self.current_output, IndexOutput::Bytes(Vec::new()));
-        let (grams, decoded_size) = match output {
-            IndexOutput::File { grams, len } => (grams, len),
+        let (grams, decoded_size, content) = match output {
+            IndexOutput::File {
+                grams,
+                len,
+                content,
+            } => (grams, len, BuiltContent::File(content)),
             IndexOutput::Bytes(mut chunks) => {
                 let bytes = match chunks.len() {
                     0 => bytes::Bytes::new(),
@@ -244,17 +322,36 @@ impl DecodeSink for IndexDecodeSink {
                     }
                 };
                 let decoded_size = u64::try_from(bytes.len())?;
-                let grams = match self.strategy {
-                    Strategy::Trigram => IndexedGrams::Trigram(pack_trigram_grams(&bytes)),
-                    Strategy::Sparse => IndexedGrams::Sparse(bytes),
+                let grams = match (self.spool.is_some(), self.strategy) {
+                    (true, _) => None,
+                    (false, Strategy::Trigram) => {
+                        Some(IndexedGrams::Trigram(pack_trigram_grams(&bytes)))
+                    }
+                    (false, Strategy::Sparse) => Some(IndexedGrams::Sparse(bytes.clone())),
                 };
-                (grams, decoded_size)
+                (grams, decoded_size, BuiltContent::Bytes(bytes))
             }
+        };
+        let content = self.store_content(content, decoded_size)?;
+        let grams = match (grams, &content, self.strategy) {
+            (Some(grams), _, _) => grams,
+            (None, BuiltContent::Spool { offset }, Strategy::Trigram) => {
+                IndexedGrams::TrigramSpool {
+                    offset: *offset,
+                    len: decoded_size,
+                }
+            }
+            (None, BuiltContent::Spool { offset }, Strategy::Sparse) => IndexedGrams::SparseSpool {
+                offset: *offset,
+                len: decoded_size,
+            },
+            (None, _, _) => anyhow::bail!("deferred grams have no content spool"),
         };
         self.documents.push(BuiltDocument {
             meta,
             grams,
             decoded_size,
+            content,
         });
         Ok(())
     }
@@ -264,6 +361,7 @@ enum SourceBuild {
     Decoded {
         encoding: SourceEncoding,
         documents: Vec<BuiltDocument>,
+        spool: Option<tempfile::NamedTempFile>,
     },
     Failed,
 }
@@ -284,12 +382,14 @@ fn build_source(
     body: DocumentBody,
     strategy: Strategy,
     document_limit: Option<usize>,
+    spool_content: bool,
 ) -> Result<SourceBuild> {
-    let mut sink = IndexDecodeSink::new(strategy, document_limit);
+    let mut sink = IndexDecodeSink::new(strategy, document_limit, spool_content)?;
     match decode_source_body(&source.key, body, DECODE_LIMITS, &mut sink) {
         Ok(summary) => Ok(SourceBuild::Decoded {
             encoding: summary.encoding,
             documents: sink.documents,
+            spool: sink.spool,
         }),
         Err(err) if err.is::<DocumentCapExceeded>() => Err(err),
         Err(err) => {
@@ -316,6 +416,7 @@ fn build_raw_source(
         body.try_clone()?,
         strategy,
         document_limit,
+        false,
     )?))
 }
 
@@ -331,7 +432,9 @@ pub(crate) fn build_index_files(
     let mut tables = SegmentTables {
         sources: Vec::with_capacity(sources.len()),
         documents: Vec::new(),
+        blocks: Vec::new(),
     };
+    let mut pack_builder = PackBuilder::production()?;
     let mut failed = 0usize;
     let mut runs = Vec::new();
     for chunk in build_chunks(sources) {
@@ -379,6 +482,7 @@ pub(crate) fn build_index_files(
                     std::mem::take(&mut grammed),
                     strategy,
                     SPARSE_RUN_BYTES,
+                    None,
                 )?);
             }
             let outcome = match (raw[offset].take(), bodies[offset].take()) {
@@ -389,24 +493,25 @@ pub(crate) fn build_index_files(
                     if document_limit == Some(0) {
                         return Err(anyhow::Error::new(DocumentCapExceeded));
                     }
-                    Some(build_source(source, body, strategy, document_limit)?)
+                    Some(build_source(source, body, strategy, document_limit, true)?)
                 }
                 (None, None) => None,
             };
             let source_id = u32::try_from(tables.sources.len())?;
             let first_doc = u32::try_from(tables.documents.len())?;
-            let (encoding, retry, source_failed, mut documents) = match outcome {
+            let (encoding, retry, source_failed, mut documents, mut spool) = match outcome {
                 Some(SourceBuild::Decoded {
                     encoding,
                     documents,
-                }) => (encoding, false, false, documents),
+                    spool,
+                }) => (encoding, false, false, documents, spool),
                 Some(SourceBuild::Failed) => {
                     failed += 1;
-                    (SourceEncoding::Raw, false, true, Vec::new())
+                    (SourceEncoding::Raw, false, true, Vec::new(), None)
                 }
                 None => {
                     failed += 1;
-                    (SourceEncoding::Raw, true, true, Vec::new())
+                    (SourceEncoding::Raw, true, true, Vec::new(), None)
                 }
             };
             documents
@@ -421,12 +526,19 @@ pub(crate) fn build_index_files(
             }
             for document in documents {
                 let doc_id = tables.documents.len();
+                let slice = document.content.append(
+                    &mut pack_builder,
+                    document.decoded_size,
+                    spool.as_mut(),
+                )?;
                 grammed.push((doc_id, document.grams));
                 tables.documents.push(DocEntry {
                     display_key: document.meta.display_key,
                     source_id,
                     member_path: document.meta.member_path,
                     decoded_size: document.decoded_size,
+                    first_block: slice.first_block,
+                    block_offset: slice.block_offset,
                 });
             }
             tables.sources.push(SourceEntry {
@@ -444,11 +556,17 @@ pub(crate) fn build_index_files(
                     std::mem::take(&mut grammed),
                     strategy,
                     SPARSE_RUN_BYTES,
+                    spool.as_ref().map(tempfile::NamedTempFile::as_file),
                 )?);
             }
         }
         if !grammed.is_empty() {
-            runs.extend(write_posting_runs(grammed, strategy, SPARSE_RUN_BYTES)?);
+            runs.extend(write_posting_runs(
+                grammed,
+                strategy,
+                SPARSE_RUN_BYTES,
+                None,
+            )?);
         }
     }
     if failed > 0 {
@@ -457,6 +575,8 @@ pub(crate) fn build_index_files(
             failed
         );
     }
+    let packed = pack_builder.finish()?;
+    tables.blocks = packed.blocks;
     tables.validate()?;
     let (fst, postings) =
         merge_posting_runs(runs, strategy, u32::try_from(tables.documents.len())?)?;
@@ -464,5 +584,38 @@ pub(crate) fn build_index_files(
         fst,
         postings,
         tables,
+        packs: packed.packs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expanding_sink_spools_document_content() {
+        for strategy in [Strategy::Trigram, Strategy::Sparse] {
+            let mut sink = IndexDecodeSink::new(strategy, None, true).unwrap();
+            for (key, body) in [("a", b"alpha".as_slice()), ("b", b"beta".as_slice())] {
+                sink.begin(&LogicalDocumentMeta {
+                    display_key: key.to_owned(),
+                    member_path: Some(key.to_owned()),
+                })
+                .unwrap();
+                sink.write(body).unwrap();
+                sink.finish().unwrap();
+            }
+
+            assert!(sink
+                .documents
+                .iter()
+                .all(|document| matches!(document.content, BuiltContent::Spool { .. })));
+            assert!(sink.documents.iter().all(|document| match document.grams {
+                IndexedGrams::TrigramSpool { .. } => strategy == Strategy::Trigram,
+                IndexedGrams::SparseSpool { .. } => strategy == Strategy::Sparse,
+                _ => false,
+            }));
+            assert_eq!(sink.spool_len, 9);
+        }
+    }
 }

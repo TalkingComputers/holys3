@@ -414,6 +414,7 @@ mod tests {
                 encoded_size: body.len() as u64,
                 encoding: SourceEncoding::Zip,
                 member_path: Some("a.log".into()),
+                index: None,
             },
             DocAddress {
                 display_key: "bundle.zip!/b.log".into(),
@@ -422,6 +423,7 @@ mod tests {
                 encoded_size: body.len() as u64,
                 encoding: SourceEncoding::Zip,
                 member_path: Some("b.log".into()),
+                index: None,
             },
         ];
         let cache = tempfile::tempdir().unwrap();
