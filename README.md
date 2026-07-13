@@ -26,7 +26,7 @@ holys3 -i 'timeout' s3://my-logs -g '*.gz' -C2 --since 6h
 [Architecture](ARCHITECTURE.md) •
 [Changelog](CHANGELOG.md)
 
-### Why use holys3?
+## Why use holys3?
 
 S3 has no grep. The usual workarounds scan: downloading everything and running
 rg pays for every object on every query, and Athena bills per byte scanned.
@@ -54,7 +54,7 @@ holys3 pays the scan once, at index time. After that:
 - Search keeps working after the source objects are deleted, because it only
   reads the snapshot.
 
-### Why not use holys3?
+## Why not use holys3?
 
 - The index contains a compressed copy of your decoded content, not just
   trigrams. Protect it with the same access controls, retention policy, and
@@ -70,7 +70,7 @@ holys3 pays the scan once, at index time. After that:
 - S3 Express directory buckets aren't supported yet.
 - The CLI is the supported surface. The library crates are not a stable API.
 
-### Installation
+## Installation
 
 Prebuilt binaries for Linux (x86_64, arm64), macOS (Intel, Apple Silicon), and
 Windows ship with every
@@ -85,7 +85,7 @@ Release archives include SHA-256 checksums and GitHub build-provenance
 attestations. Verify one with
 `gh attestation verify <archive> -R TalkingComputers/holys3`.
 
-### Usage
+## Usage
 
 The shape is `holys3 PATTERN TARGET`, where TARGET is `s3://bucket[/prefix]`.
 Credentials come from the standard AWS SDK provider chain, so environment
@@ -168,7 +168,7 @@ Flag summary:
 -A/-B/-C NUM      context lines with -/-- separators --stats      candidate stats to stderr
 ```
 
-### Object formats
+## Object formats
 
 Format detection is magic-first: extensions are not trusted, with one
 exception. Brotli and zlib have no reliable container magic, so only `.br`,
@@ -196,7 +196,7 @@ decoded. Expansion is capped at 64 GiB per physical source, 100,000 archive
 members, and four nested format layers; oversized decoded output spills to
 private temporary files instead of memory.
 
-### How it works
+## How it works
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/how-it-works-dark.svg">
@@ -235,7 +235,7 @@ rebuilds automatically.
 [ARCHITECTURE.md](ARCHITECTURE.md) covers the crate boundaries, segment
 format, and memory bounds in detail.
 
-### Performance
+## Performance
 
 Numbers from the tracked benchmark: 25,000 synthetic 4 KiB objects on MinIO,
 release build, three measured iterations after one warmup. Every corpus,
@@ -274,7 +274,7 @@ distribution on local MinIO. Your latencies against real S3 will include
 network round-trips; the shape (pruning ratio drives cost) is the durable
 part, not the exact milliseconds.
 
-### Security
+## Security
 
 Use private buckets. The default index lives under `<source-prefix>/.holys3/`,
 and `--index` can place it in a separately permissioned bucket. The index
@@ -286,7 +286,7 @@ provider chain, and nothing else.
 
 Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
-### Contributing
+## Contributing
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing index, query, or S3
 behavior, and [CONTRIBUTING.md](CONTRIBUTING.md) for setup and the CI checks.
@@ -294,7 +294,7 @@ The differential test suites are the correctness contract: indexed search must
 exactly equal a decoded full scan, for every format, both gram strategies, and
 every index lifecycle state.
 
-### License
+## License
 
 Licensed under either of:
 

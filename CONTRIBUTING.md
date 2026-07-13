@@ -2,10 +2,11 @@
 
 Bug reports, documentation fixes, features, and questions are all welcome.
 File bugs and feature requests as
-[issues](https://github.com/TalkingComputers/holys3/issues). For a large
-change, open a
-[discussion](https://github.com/TalkingComputers/holys3/discussions) or an
-issue before writing the code, so we can agree on the approach first.
+[issues](https://github.com/TalkingComputers/holys3/issues); general questions
+belong in
+[discussions](https://github.com/TalkingComputers/holys3/discussions). For a
+large change, open a discussion or an issue before writing the code, so we can
+agree on the approach first.
 
 ## Project layout
 
