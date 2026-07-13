@@ -158,13 +158,13 @@ Format detection is magic-first: extensions are not trusted, with one
 exception. Brotli and zlib have no reliable container magic, so only `.br`,
 `.zlib`, and `.zz` select those decoders, and the entire stream must validate.
 
-| format                                | how it's searched                                                                                                                                  |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| gzip, zstd, bzip2, xz, snappy, lz4    | decompressed transparently, including multi-member/multi-stream concatenations and skippable frames                                                |
-| brotli, zlib                          | decompressed via validated `.br`/`.zlib`/`.zz` extension hint                                                                                      |
-| ZIP, TAR                              | every regular member is its own document at `object.zip!/member/path`; nested archives recurse to four layers; encrypted members reject the source |
-| Parquet, Avro, Arrow IPC/Feather, ORC | each row becomes one canonical JSON line; line numbers refer to rows                                                                               |
-| everything else                       | searched as plain text (JSONL, CSV, syslog, …)                                                                                                     |
+| format                                | how it's searched                                                                                                                                                                                      |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| gzip, zstd, bzip2, xz, snappy, lz4    | decompressed transparently, including multi-member/multi-stream concatenations and skippable frames                                                                                                    |
+| brotli, zlib                          | decompressed via validated `.br`/`.zlib`/`.zz` extension hint                                                                                                                                          |
+| ZIP, TAR                              | every regular member is its own document at `object.zip!/member/path`; nested archives recurse to four layers; encrypted members and ZIPs with byte-identical duplicate member names reject the source |
+| Parquet, Avro, Arrow IPC/Feather, ORC | each row becomes one canonical JSON line; line numbers refer to rows                                                                                                                                   |
+| everything else                       | searched as plain text (JSONL, CSV, syslog, …)                                                                                                                                                         |
 
 Projection and decompression happen at one canonical decoder boundary, so the
 index and the verifier see identical bytes. Truncated or corrupt-tailed

@@ -340,6 +340,23 @@ impl DecodeState<'_> {
         parent: Option<String>,
         depth: u8,
     ) -> AnyhowResult<()> {
+        let archive = zip::ZipArchive::new(reader)
+            .with_context(|| format!("zip decode failed for {}", self.source_key))?;
+        let directory_start = archive.central_directory_start();
+        let mut reader = archive.into_inner();
+        // The zip reader keys members by name, so byte-identical duplicate
+        // names collapse to the last entry before iteration can see them.
+        if let Some(name) = first_duplicate_zip_member_name(
+            &mut reader,
+            directory_start,
+            self.limits.max_members,
+            self.source_key,
+        )? {
+            anyhow::bail!(
+                "duplicate zip member name {name} in {}; entries with repeated names would be searched incompletely",
+                self.source_key
+            );
+        }
         let mut archive = zip::ZipArchive::new(reader)
             .with_context(|| format!("zip decode failed for {}", self.source_key))?;
         for index in 0..archive.len() {
@@ -458,6 +475,44 @@ impl DecodeState<'_> {
             if self.used_paths.insert(candidate.clone()) {
                 return candidate;
             }
+        }
+    }
+}
+
+fn first_duplicate_zip_member_name(
+    reader: &mut (impl Read + Seek),
+    directory_start: u64,
+    max_members: u32,
+    source_key: &str,
+) -> AnyhowResult<Option<String>> {
+    const CENTRAL_HEADER_MAGIC: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+    let scan_context = || format!("zip central directory scan failed for {source_key}");
+    reader
+        .seek(SeekFrom::Start(directory_start))
+        .with_context(scan_context)?;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let mut magic = [0u8; 4];
+        reader.read_exact(&mut magic).with_context(scan_context)?;
+        if magic != CENTRAL_HEADER_MAGIC {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            seen.len() < max_members as usize,
+            "archive member count exceeds {max_members} for {source_key}"
+        );
+        let mut fixed = [0u8; 42];
+        reader.read_exact(&mut fixed).with_context(scan_context)?;
+        let name_length = u16::from_le_bytes([fixed[24], fixed[25]]) as usize;
+        let extra_length = u16::from_le_bytes([fixed[26], fixed[27]]) as i64;
+        let comment_length = u16::from_le_bytes([fixed[28], fixed[29]]) as i64;
+        let mut name = vec![0u8; name_length];
+        reader.read_exact(&mut name).with_context(scan_context)?;
+        reader
+            .seek(SeekFrom::Current(extra_length + comment_length))
+            .with_context(scan_context)?;
+        if !seen.insert(name.clone()) {
+            return Ok(Some(String::from_utf8_lossy(&name).into_owned()));
         }
     }
 }
@@ -962,6 +1017,77 @@ mod tests {
         );
     }
 
+    fn stored_zip_with_names(names: &[&str]) -> Vec<u8> {
+        let body = b"payload\n";
+        let crc = 0x5f48ce12u32;
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for name in names {
+            let offset = out.len() as u32;
+            out.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(body);
+            central.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_offset = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(names.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(names.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn decode_source_rejects_literal_duplicate_zip_member_names() {
+        let bytes = stored_zip_with_names(&["dup/name.log", "dup/name.log"]);
+        let mut sink = RecordingSink::default();
+        let error = decode_source("dupnames.zip", bytes.into(), DECODE_LIMITS, &mut sink)
+            .expect_err("literal duplicate member names must not decode silently");
+        assert!(
+            error.to_string().contains("duplicate zip member name"),
+            "{error:#}"
+        );
+        assert!(sink.documents.is_empty());
+    }
+
+    #[test]
+    fn decode_source_accepts_unique_names_in_handcrafted_zip() {
+        let bytes = stored_zip_with_names(&["a.log", "b.log"]);
+        let mut sink = RecordingSink::default();
+        decode_source("plain.zip", bytes.into(), DECODE_LIMITS, &mut sink).unwrap();
+        assert_eq!(sink.documents.len(), 2);
+    }
+
     #[test]
     fn decode_requested_rejects_missing_logical_documents() {
         let error = decode_requested(
@@ -1137,6 +1263,44 @@ mod tests {
             sink.documents[0].1,
             b"{\"id\":1,\"msg\":\"arrow needle\"}\n{\"id\":2,\"msg\":null}\n"
         );
+    }
+
+    #[test]
+    fn decode_source_projects_compressed_arrow_ipc_file() {
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use std::sync::Arc;
+        for (compression, key) in [
+            (arrow_ipc::CompressionType::LZ4_FRAME, "events-lz4.feather"),
+            (arrow_ipc::CompressionType::ZSTD, "events-zstd.feather"),
+        ] {
+            let batch = RecordBatch::try_from_iter(vec![
+                ("id", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+                (
+                    "msg",
+                    Arc::new(StringArray::from(vec![Some("compressed needle"), None])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let options = arrow_ipc::writer::IpcWriteOptions::default()
+                .try_with_compression(Some(compression))
+                .unwrap();
+            let mut writer = arrow_ipc::writer::FileWriter::try_new_with_options(
+                Vec::new(),
+                batch.schema().as_ref(),
+                options,
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            let bytes = writer.into_inner().unwrap();
+            let mut sink = RecordingSink::default();
+            let summary = decode_source(key, bytes.into(), DECODE_LIMITS, &mut sink).unwrap();
+            assert_eq!(summary.encoding, SourceEncoding::ArrowIpc);
+            assert_eq!(
+                sink.documents[0].1,
+                b"{\"id\":1,\"msg\":\"compressed needle\"}\n{\"id\":2,\"msg\":null}\n",
+                "{key}"
+            );
+        }
     }
 
     #[test]
