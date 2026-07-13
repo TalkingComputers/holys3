@@ -691,28 +691,25 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn finished_packs_do_not_hold_open_files() {
-        fn open_files() -> usize {
-            let path = if std::path::Path::new("/proc/self/fd").is_dir() {
-                "/proc/self/fd"
-            } else {
-                "/dev/fd"
-            };
-            std::fs::read_dir(path).unwrap().count()
-        }
+        use std::os::unix::fs::MetadataExt;
 
-        let before = open_files();
         let mut builder = PackBuilder::new(1, 1).unwrap();
         builder.append(Cursor::new(vec![0; 512]), 512).unwrap();
         let built = builder.finish().unwrap();
-        let after = open_files();
+        let open_files = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+            .collect::<std::collections::HashSet<_>>();
 
         assert_eq!(built.packs.len(), 512);
-        assert!(
-            after <= before + 8,
-            "open files grew from {before} to {after}"
-        );
+        assert!(built.packs.iter().all(|pack| {
+            let metadata = std::fs::metadata(pack.path()).unwrap();
+            !open_files.contains(&(metadata.dev(), metadata.ino()))
+        }));
     }
 }
