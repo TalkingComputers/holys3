@@ -54,22 +54,6 @@ holys3 pays the scan once, at index time. After that:
 - Search keeps working after the source objects are deleted, because it only
   reads the snapshot.
 
-## Why not use holys3?
-
-- The index contains a compressed copy of your decoded content, not just
-  trigrams. Protect it with the same access controls, retention policy, and
-  encryption requirements as the source data. Use private buckets.
-- The first index build reads every object once. That is the price of never
-  scanning again.
-- No multiline mode: patterns are line-oriented exactly like rg without `-U`.
-- Continuous indexing (`--watch`) polls after each cycle. It doesn't consume
-  bucket notifications, daemonize, or install a system service.
-- The design assumes occasional index writers, not a write-heavy pipeline.
-  Concurrent `holys3 index` runs are safe, but a losing writer errors instead
-  of retrying forever.
-- S3 Express directory buckets aren't supported yet.
-- The CLI is the supported surface. The library crates are not a stable API.
-
 ## Installation
 
 Prebuilt binaries for Linux (x86_64, arm64), macOS (Intel, Apple Silicon), and
