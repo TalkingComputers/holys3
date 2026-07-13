@@ -1,7 +1,44 @@
-use super::*;
-use std::io::SeekFrom;
-use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use super::{
+    classify_sdk_error, multipart_concurrency, multipart_part_size, upload_deadline, Outcome,
+    S3Client, MULTIPART_PART_SIZE,
+};
+use anyhow::{Context, Result};
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_smithy_types::byte_stream::Length;
+use bytes::Bytes;
+use futures::stream::{self, StreamExt};
+use std::path::{Path, PathBuf};
+
+const FILE_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
+
+#[derive(Clone)]
+enum PartSource {
+    Bytes(Bytes),
+    File { path: PathBuf, start: u64, len: u64 },
+}
+
+impl PartSource {
+    fn count_bytes(&self) -> Result<usize> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes.len()),
+            Self::File { len, .. } => Ok(usize::try_from(*len)?),
+        }
+    }
+
+    async fn build_stream(&self) -> Result<ByteStream> {
+        match self {
+            Self::Bytes(bytes) => Ok(ByteStream::from(bytes.clone())),
+            Self::File { path, start, len } => Ok(ByteStream::read_from()
+                .path(path)
+                .offset(*start)
+                .length(Length::Exact(*len))
+                .buffer_size(FILE_STREAM_BUFFER_SIZE)
+                .build()
+                .await?),
+        }
+    }
+}
 
 impl S3Client {
     pub fn put(&self, bucket: &str, key: &str, body: &[u8]) -> Result<()> {
@@ -22,18 +59,31 @@ impl S3Client {
         if body.len() > MULTIPART_PART_SIZE {
             return self.put_multipart(bucket, key, body).await;
         }
-        let req = S3Request {
-            method: "PUT",
-            bucket,
-            key: Some(key),
-            canonical_query: "",
-            range: None,
-            body: Some(Bytes::copy_from_slice(body)),
-            precondition: None,
-        };
-        self.send_resilient(&req, None)
-            .await?
-            .with_context(|| format!("PUT s3://{bucket}/{key} returned HTTP 404"))?;
+        self.put_bytes(bucket, key, Bytes::copy_from_slice(body))
+            .await
+    }
+
+    async fn put_bytes(&self, bucket: &str, key: &str, body: Bytes) -> Result<()> {
+        let label = format!("PUT s3://{bucket}/{key}");
+        let body_len = body.len();
+        self.run_resilient(&label, None, || {
+            let request = self
+                .0
+                .upload_sdk
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(body.clone()));
+            async move {
+                match tokio::time::timeout(upload_deadline(body_len), request.send()).await {
+                    Ok(Ok(output)) => Outcome::Success(output),
+                    Ok(Err(error)) => classify_sdk_error(error),
+                    Err(error) => Outcome::Transient(error.into()),
+                }
+            }
+        })
+        .await?
+        .with_context(|| format!("{label}: bucket not found"))?;
         Ok(())
     }
 
@@ -50,7 +100,7 @@ impl S3Client {
                 return Err(error);
             }
         };
-        self.finish_multipart(bucket, key, &upload_id, &parts).await
+        self.finish_multipart(bucket, key, &upload_id, parts).await
     }
 
     async fn put_file_multipart(
@@ -72,29 +122,25 @@ impl S3Client {
                 return Err(error);
             }
         };
-        self.finish_multipart(bucket, key, &upload_id, &parts).await
+        self.finish_multipart(bucket, key, &upload_id, parts).await
     }
 
     async fn start_multipart(&self, bucket: &str, key: &str) -> Result<String> {
-        let initiate = canonical_query(&mut vec![("uploads", String::new())]);
-        let (_, _, body) = self
-            .send_resilient(
-                &S3Request {
-                    method: "POST",
-                    bucket,
-                    key: Some(key),
-                    canonical_query: &initiate,
-                    range: None,
-                    body: None,
-                    precondition: None,
-                },
-                None,
-            )
-            .await?
-            .with_context(|| format!("initiate multipart s3://{bucket}/{key}: HTTP 404"))?;
-        let body = body.into_bytes()?;
-        read_xml_text(&body, b"UploadId")?
-            .with_context(|| format!("initiate multipart s3://{bucket}/{key}: no UploadId"))
+        let label = format!("initiate multipart s3://{bucket}/{key}");
+        self.run_resilient(&label, None, || {
+            let request = self.0.sdk.create_multipart_upload().bucket(bucket).key(key);
+            async move {
+                match request.send().await {
+                    Ok(output) => Outcome::Success(output),
+                    Err(error) => classify_sdk_error(error),
+                }
+            }
+        })
+        .await?
+        .with_context(|| format!("{label}: bucket not found"))?
+        .upload_id()
+        .with_context(|| format!("{label}: no UploadId"))
+        .map(str::to_owned)
     }
 
     async fn finish_multipart(
@@ -102,47 +148,35 @@ impl S3Client {
         bucket: &str,
         key: &str,
         upload_id: &str,
-        parts: &[(usize, String)],
+        parts: Vec<CompletedPart>,
     ) -> Result<()> {
-        let mut body = String::from(
-            r#"<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
-        );
-        for (number, etag) in parts {
-            body.push_str(&format!(
-                "<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>",
-                quick_xml::escape::escape(etag)
-            ));
-        }
-        body.push_str("</CompleteMultipartUpload>");
-        let query = canonical_query(&mut vec![("uploadId", upload_id.to_owned())]);
-        let completed = self
-            .send_resilient(
-                &S3Request {
-                    method: "POST",
-                    bucket,
-                    key: Some(key),
-                    canonical_query: &query,
-                    range: None,
-                    body: Some(Bytes::from(body)),
-                    precondition: None,
-                },
-                None,
-            )
-            .await;
-        match completed {
-            Ok(Some((_, _, response))) => {
-                let response = response.into_bytes()?;
-                if let Err(error) = validate_complete_multipart(&response) {
-                    self.abort_multipart(bucket, key, upload_id).await;
-                    return Err(error).with_context(|| {
-                        format!("complete multipart s3://{bucket}/{key} returned an error")
-                    });
+        let label = format!("complete multipart s3://{bucket}/{key}");
+        let upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(parts))
+            .build();
+        let result = self
+            .run_resilient(&label, None, || {
+                let request = self
+                    .0
+                    .sdk
+                    .complete_multipart_upload()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .multipart_upload(upload.clone());
+                async move {
+                    match request.send().await {
+                        Ok(output) => Outcome::Success(output),
+                        Err(error) => classify_sdk_error(error),
+                    }
                 }
-                Ok(())
-            }
+            })
+            .await;
+        match result {
+            Ok(Some(_)) => Ok(()),
             Ok(None) => {
                 self.abort_multipart(bucket, key, upload_id).await;
-                anyhow::bail!("complete multipart s3://{bucket}/{key}: HTTP 404")
+                anyhow::bail!("{label}: bucket not found")
             }
             Err(error) => {
                 self.abort_multipart(bucket, key, upload_id).await;
@@ -158,32 +192,18 @@ impl S3Client {
         upload_id: &str,
         body: &[u8],
         part_size: usize,
-    ) -> Result<Vec<(usize, String)>> {
+    ) -> Result<Vec<CompletedPart>> {
         let mut uploads = stream::iter(body.chunks(part_size).enumerate().map(
             |(index, chunk)| async move {
-                let number = index + 1;
-                let query = canonical_query(&mut vec![
-                    ("partNumber", number.to_string()),
-                    ("uploadId", upload_id.to_owned()),
-                ]);
-                let (_, etag, _) = self
-                    .send_resilient(
-                        &S3Request {
-                            method: "PUT",
-                            bucket,
-                            key: Some(key),
-                            canonical_query: &query,
-                            range: None,
-                            body: Some(Bytes::copy_from_slice(chunk)),
-                            precondition: None,
-                        },
-                        None,
-                    )
-                    .await?
-                    .with_context(|| format!("upload part {number} of s3://{bucket}/{key}"))?;
-                let etag =
-                    etag.with_context(|| format!("part {number} of s3://{bucket}/{key}: no ETag"))?;
-                Ok::<_, anyhow::Error>((number, etag))
+                let number = i32::try_from(index + 1)?;
+                self.upload_part(
+                    bucket,
+                    key,
+                    upload_id,
+                    number,
+                    PartSource::Bytes(Bytes::copy_from_slice(chunk)),
+                )
+                .await
             },
         ))
         .buffer_unordered(multipart_concurrency(part_size));
@@ -191,7 +211,7 @@ impl S3Client {
         while let Some(result) = uploads.next().await {
             parts.push(result?);
         }
-        parts.sort_unstable_by_key(|(number, _)| *number);
+        parts.sort_unstable_by_key(|part| part.part_number().unwrap_or_default());
         Ok(parts)
     }
 
@@ -203,41 +223,26 @@ impl S3Client {
         path: &Path,
         len: u64,
         part_size: usize,
-    ) -> Result<Vec<(usize, String)>> {
+    ) -> Result<Vec<CompletedPart>> {
         let part_len = part_size as u64;
         let part_count = len.div_ceil(part_len);
         let mut uploads = stream::iter((0..part_count).map(|part_index| {
             let path = path.to_path_buf();
             async move {
                 let start = part_index * part_len;
-                let read_len = usize::try_from((len - start).min(part_len))?;
-                let mut body = vec![0u8; read_len];
-                let mut file = tokio::fs::File::open(&path).await?;
-                file.seek(SeekFrom::Start(start)).await?;
-                file.read_exact(&mut body).await?;
-                let number = usize::try_from(part_index + 1)?;
-                let query = canonical_query(&mut vec![
-                    ("partNumber", number.to_string()),
-                    ("uploadId", upload_id.to_owned()),
-                ]);
-                let (_, etag, _) = self
-                    .send_resilient(
-                        &S3Request {
-                            method: "PUT",
-                            bucket,
-                            key: Some(key),
-                            canonical_query: &query,
-                            range: None,
-                            body: Some(Bytes::from(body)),
-                            precondition: None,
-                        },
-                        None,
-                    )
-                    .await?
-                    .with_context(|| format!("upload part {number} of s3://{bucket}/{key}"))?;
-                let etag =
-                    etag.with_context(|| format!("part {number} of s3://{bucket}/{key}: no ETag"))?;
-                Ok::<_, anyhow::Error>((number, etag))
+                let read_len = (len - start).min(part_len);
+                self.upload_part(
+                    bucket,
+                    key,
+                    upload_id,
+                    i32::try_from(part_index + 1)?,
+                    PartSource::File {
+                        path,
+                        start,
+                        len: read_len,
+                    },
+                )
+                .await
             }
         }))
         .buffer_unordered(multipart_concurrency(part_size));
@@ -245,22 +250,75 @@ impl S3Client {
         while let Some(result) = uploads.next().await {
             parts.push(result?);
         }
-        parts.sort_unstable_by_key(|(number, _)| *number);
+        parts.sort_unstable_by_key(|part| part.part_number().unwrap_or_default());
         Ok(parts)
     }
 
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        number: i32,
+        source: PartSource,
+    ) -> Result<CompletedPart> {
+        let label = format!("upload part {number} of s3://{bucket}/{key}");
+        let deadline = upload_deadline(source.count_bytes()?);
+        let output = self
+            .run_resilient(&label, None, || {
+                let source = source.clone();
+                async move {
+                    let body = match source.build_stream().await {
+                        Ok(body) => body,
+                        Err(error) => return Outcome::Fatal(error),
+                    };
+                    let request = self
+                        .0
+                        .upload_sdk
+                        .upload_part()
+                        .bucket(bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .part_number(number)
+                        .body(body);
+                    match tokio::time::timeout(deadline, request.send()).await {
+                        Ok(Ok(output)) => Outcome::Success(output),
+                        Ok(Err(error)) => classify_sdk_error(error),
+                        Err(error) => Outcome::Transient(error.into()),
+                    }
+                }
+            })
+            .await?
+            .with_context(|| format!("{label}: bucket not found"))?;
+        let etag = output
+            .e_tag()
+            .with_context(|| format!("{label}: no ETag"))?;
+        Ok(CompletedPart::builder()
+            .part_number(number)
+            .e_tag(etag)
+            .build())
+    }
+
     async fn abort_multipart(&self, bucket: &str, key: &str, upload_id: &str) {
-        let query = canonical_query(&mut vec![("uploadId", upload_id.to_owned())]);
-        let request = S3Request {
-            method: "DELETE",
-            bucket,
-            key: Some(key),
-            canonical_query: &query,
-            range: None,
-            body: None,
-            precondition: None,
-        };
-        if self.send_resilient(&request, None).await.is_err() {
+        let label = format!("abort multipart s3://{bucket}/{key}");
+        let result = self
+            .run_resilient(&label, None, || {
+                let request = self
+                    .0
+                    .sdk
+                    .abort_multipart_upload()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(upload_id);
+                async move {
+                    match request.send().await {
+                        Ok(output) => Outcome::Success(output),
+                        Err(error) => classify_sdk_error(error),
+                    }
+                }
+            })
+            .await;
+        if !matches!(result, Ok(Some(_))) {
             eprintln!("warning: failed to abort multipart upload of s3://{bucket}/{key}");
         }
     }

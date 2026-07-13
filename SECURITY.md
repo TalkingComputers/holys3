@@ -4,7 +4,7 @@
 
 Report SigV4, credential, authentication, authorization, or private-bucket issues privately. Do not open a public issue with exploit details.
 
-Use a private GitHub security advisory for this repository. If that is unavailable, contact a maintainer privately and share only a short non-sensitive summary until a private channel is established.
+Use a [private GitHub security advisory](https://github.com/TalkingComputers/holys3/security/advisories/new) for this repository. If that is unavailable, contact a maintainer privately and share only a short non-sensitive summary until a private channel is established.
 
 Include:
 
@@ -20,5 +20,5 @@ Never include AWS access keys, secret keys, session tokens, or private object co
 Every release archive has a SHA-256 checksum and a GitHub build-provenance attestation. Verify a downloaded archive with:
 
 ```console
-$ gh attestation verify -R TalkingComputers/holys3 holys3-<target>.tar.gz
+$ gh attestation verify <downloaded-archive> -R TalkingComputers/holys3
 ```

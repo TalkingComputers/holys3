@@ -1,14 +1,15 @@
 use crate::gen::{
     churn_run_path, doc_path, local_index_dir, objects_dir, read_manifest, reports_dir,
 };
-use crate::{dir_cache_dir, percentile_ms, DEFAULT_CONCURRENCY};
+use crate::{dir_cache_dir, dir_source_identity, percentile_ms};
 use anyhow::{Context, Result};
-use holys3_core::{LocalBlobStore, MatchOptions, Strategy};
+use holys3_core::{BlobStore, LocalBlobStore, MatchOptions, Strategy};
 use holys3_index::{
-    search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, LocalFetcher, NullSink,
-    SegmentedReader,
+    search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, NullSink, SegmentedReader,
+    UpdateOptions,
 };
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,71 @@ pub(crate) struct ChurnSummary {
     pub listing_p95_ms: f64,
     pub update_p50_ms: f64,
     pub update_p95_ms: f64,
+    pub update_max_ms: f64,
+    pub pack_bytes_written: u64,
     pub final_segments: usize,
+}
+
+struct ChurnStore {
+    inner: LocalBlobStore,
+    pack_bytes_written: Cell<u64>,
+}
+
+impl ChurnStore {
+    fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: LocalBlobStore::new(root),
+            pack_bytes_written: Cell::new(0),
+        }
+    }
+
+    fn record_pack_write(&self, name: &str, len: u64) -> Result<()> {
+        if name.starts_with("packs/") {
+            self.pack_bytes_written.set(
+                self.pack_bytes_written
+                    .get()
+                    .checked_add(len)
+                    .context("churn pack write count overflows")?,
+            );
+        }
+        Ok(())
+    }
+
+    fn read_pack_bytes_written(&self) -> u64 {
+        self.pack_bytes_written.get()
+    }
+}
+
+impl BlobStore for ChurnStore {
+    fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put(name, bytes)?;
+        self.record_pack_write(name, u64::try_from(bytes.len())?)
+    }
+
+    fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.put_file(name, path)?;
+        self.record_pack_write(name, std::fs::metadata(path)?.len())
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name)
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(name, start, len)
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        self.inner.delete(name)
+    }
+
+    fn get_versioned(&self, name: &str) -> Result<Option<(Vec<u8>, String)>> {
+        self.inner.get_versioned(name)
+    }
+
+    fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
+        self.inner.put_if(name, bytes, expected)
+    }
 }
 
 #[derive(Serialize)]
@@ -76,6 +141,7 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
     let initial_reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(local_index_dir())),
         &dir_cache_dir(),
+        &dir_source_identity()?,
     )
     .context("opening local benchmark index")?;
     anyhow::ensure!(
@@ -91,6 +157,7 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
     let mut churn_paths = BTreeSet::new();
     let mut sequence = manifest.objects;
     let mut final_segments = None;
+    let store = ChurnStore::new(local_index_dir());
     for cycle in 1..=cycles {
         for _ in 0..changes {
             let old_path = live_paths
@@ -120,11 +187,12 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
 
         let update_started = Instant::now();
         let report = update_index(
-            &LocalBlobStore::new(local_index_dir()),
+            &store,
             &dir_cache_dir(),
+            &dir_source_identity()?,
             Strategy::Trigram,
             &listing,
-            false,
+            UpdateOptions::default(),
             &|shard| Ok(Box::new(LocalCorpus::from_listing(shard))),
         )
         .with_context(|| format!("updating churn cycle {cycle}"))?;
@@ -151,11 +219,10 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
     let reader = SegmentedReader::open(
         Box::new(LocalBlobStore::new(local_index_dir())),
         &dir_cache_dir(),
+        &dir_source_identity()?,
     )?;
-    let fetcher = LocalFetcher::new(DEFAULT_CONCURRENCY)?;
     let stats = search_streaming(
         &reader,
-        &fetcher,
         "CHURN_NEEDLE",
         KeyScope::default(),
         MatchOptions::default(),
@@ -194,6 +261,8 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
         listing_p95_ms: percentile_ms(&listing_times, 95),
         update_p50_ms: percentile_ms(&update_times, 50),
         update_p95_ms: percentile_ms(&update_times, 95),
+        update_max_ms: percentile_ms(&update_times, 100),
+        pack_bytes_written: store.read_pack_bytes_written(),
         final_segments: final_segments.context("missing final segment count")?,
     };
     std::fs::create_dir_all(reports_dir()).context("creating benchmark reports directory")?;
@@ -276,5 +345,22 @@ mod tests {
         assert!(build_churn_path(42).ends_with(Path::new(
             "year=2026/month=07/day=12/hour=18/churn-00000042.jsonl"
         )));
+    }
+
+    #[test]
+    fn churn_store_counts_only_pack_writes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::write(&first, b"abc")?;
+        std::fs::write(&second, b"other")?;
+        let store = ChurnStore::new(root.path().join("store"));
+
+        BlobStore::put_file(&store, "packs/a.pack", &first)?;
+        BlobStore::put(&store, "packs/b.pack", b"de")?;
+        BlobStore::put_file(&store, "segments/a/docs.bin", &second)?;
+
+        assert_eq!(store.read_pack_bytes_written(), 5);
+        Ok(())
     }
 }

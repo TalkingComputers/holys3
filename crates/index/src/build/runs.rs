@@ -15,15 +15,21 @@ pub(crate) const SPARSE_FILE_CHUNK: usize = 1024 * 1024;
 const SPARSE_TRIGRAM_BITMAP_MIN: usize = 512 * 1024;
 const TRIGRAM_RADIX_ENTRIES_CAP: usize = 4 * 1024 * 1024;
 const TRIGRAM_BITMAP_WORDS: usize = (1 << 24) / 64;
+const TRIGRAM_RUN_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const TRIGRAM_SHARD_RUN_BYTES: u64 = 7 * 1024 * 1024;
 
 fn uses_sharded_terms(strategy: Strategy, run_bytes: u64) -> bool {
     strategy == Strategy::Trigram && run_bytes >= TRIGRAM_SHARD_RUN_BYTES
 }
 
-fn read_file_trigrams(file: &mut File, len: u64, mut visit: impl FnMut(u32)) -> Result<()> {
+fn read_file_trigrams(
+    file: &mut File,
+    start: u64,
+    len: u64,
+    mut visit: impl FnMut(u32),
+) -> Result<()> {
     const CHUNK_BYTES: usize = 1024 * 1024;
-    file.seek(SeekFrom::Start(0))?;
+    file.seek(SeekFrom::Start(start))?;
     let chunk_bytes = usize::try_from(len.min(u64::try_from(CHUNK_BYTES)?))?;
     let mut chunk = vec![0u8; chunk_bytes + 2];
     let mut carry = 0usize;
@@ -47,9 +53,9 @@ fn uses_trigram_bitmap(len: u64) -> Result<bool> {
     Ok(len.saturating_sub(2) > threshold)
 }
 
-fn read_trigram_bitmap(file: &mut File, len: u64) -> Result<Vec<u64>> {
+fn read_trigram_bitmap(file: &mut File, start: u64, len: u64) -> Result<Vec<u64>> {
     let mut bitmap = vec![0u64; TRIGRAM_BITMAP_WORDS];
-    read_file_trigrams(file, len, |gram| {
+    read_file_trigrams(file, start, len, |gram| {
         let gram = usize::try_from(gram).expect("u32 fits usize");
         bitmap[gram / 64] |= 1u64 << (gram % 64);
     })?;
@@ -72,12 +78,12 @@ fn pack_trigram_bitmap(bitmap: Vec<u64>) -> Vec<u32> {
     packed
 }
 
-pub(crate) fn pack_file_trigrams(file: &mut File, len: u64) -> Result<Vec<u32>> {
+pub(crate) fn pack_file_trigrams(file: &mut File, start: u64, len: u64) -> Result<Vec<u32>> {
     if uses_trigram_bitmap(len)? {
-        return Ok(pack_trigram_bitmap(read_trigram_bitmap(file, len)?));
+        return Ok(pack_trigram_bitmap(read_trigram_bitmap(file, start, len)?));
     }
     let mut packed = Vec::with_capacity(usize::try_from(len.saturating_sub(2))?);
-    read_file_trigrams(file, len, |gram| packed.push(gram))?;
+    read_file_trigrams(file, start, len, |gram| packed.push(gram))?;
     if packed.len() < 512 {
         packed.sort_unstable();
     } else {
@@ -87,11 +93,13 @@ pub(crate) fn pack_file_trigrams(file: &mut File, len: u64) -> Result<Vec<u32>> 
     Ok(packed)
 }
 
-pub(crate) fn collect_file_trigrams(file: &mut File, len: u64) -> Result<IndexedGrams> {
+pub(crate) fn collect_file_trigrams(file: &mut File, start: u64, len: u64) -> Result<IndexedGrams> {
     if uses_trigram_bitmap(len)? {
-        Ok(IndexedGrams::TrigramBitmap(read_trigram_bitmap(file, len)?))
+        Ok(IndexedGrams::TrigramBitmap(read_trigram_bitmap(
+            file, start, len,
+        )?))
     } else {
-        Ok(IndexedGrams::Trigram(pack_file_trigrams(file, len)?))
+        Ok(IndexedGrams::Trigram(pack_file_trigrams(file, start, len)?))
     }
 }
 
@@ -105,6 +113,7 @@ struct SparseRunWriter {
 
 struct SparseFileReader {
     file: File,
+    base: u64,
     len: usize,
     chunk_start: usize,
     chunk: Vec<u8>,
@@ -114,10 +123,22 @@ struct SparseFileReader {
 
 impl SparseFileReader {
     fn open(file: File) -> Result<Self> {
-        let len = usize::try_from(file.metadata()?.len())?;
+        let len = file.metadata()?.len();
+        Self::open_range(file, 0, len)
+    }
+
+    fn open_range(file: File, start: u64, len: u64) -> Result<Self> {
+        let end = start
+            .checked_add(len)
+            .context("sparse gram file range overflows")?;
+        anyhow::ensure!(
+            end <= file.metadata()?.len(),
+            "sparse gram file range is out of bounds"
+        );
         Ok(Self {
             file,
-            len,
+            base: start,
+            len: usize::try_from(len)?,
             chunk_start: 0,
             chunk: Vec::new(),
             left: vec![0; 64 * 1024],
@@ -125,12 +146,19 @@ impl SparseFileReader {
         })
     }
 
+    fn file_offset(&self, index: usize) -> Result<u64> {
+        self.base
+            .checked_add(u64::try_from(index)?)
+            .context("sparse gram file offset overflows")
+    }
+
     fn load_chunk(&mut self, index: usize) -> Result<()> {
         anyhow::ensure!(index < self.len, "sparse gram byte is out of bounds");
         let start = index / SPARSE_FILE_CHUNK * SPARSE_FILE_CHUNK;
         let len = (self.len - start).min(SPARSE_FILE_CHUNK);
         self.chunk.resize(len, 0);
-        self.file.seek(SeekFrom::Start(u64::try_from(start)?))?;
+        let offset = self.file_offset(start)?;
+        self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(&mut self.chunk)?;
         self.chunk_start = start;
         Ok(())
@@ -162,8 +190,8 @@ impl SparseFileReader {
             bytes.copy_from_slice(&self.chunk[range]);
             return Ok(());
         }
-        self.file
-            .seek(SeekFrom::Start(u64::try_from(range.start)?))?;
+        let offset = self.file_offset(range.start)?;
+        self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(bytes)?;
         Ok(())
     }
@@ -203,11 +231,11 @@ impl SparseFileReader {
         let mut at = 0usize;
         while at < left.len() {
             let len = (left.len() - at).min(self.left.len());
-            self.file
-                .seek(SeekFrom::Start(u64::try_from(left.start + at)?))?;
+            let left_offset = self.file_offset(left.start + at)?;
+            let right_offset = self.file_offset(right.start + at)?;
+            self.file.seek(SeekFrom::Start(left_offset))?;
             self.file.read_exact(&mut self.left[..len])?;
-            self.file
-                .seek(SeekFrom::Start(u64::try_from(right.start + at)?))?;
+            self.file.seek(SeekFrom::Start(right_offset))?;
             self.file.read_exact(&mut self.right[..len])?;
             if self.left[..len] != self.right[..len] {
                 return Ok(false);
@@ -261,6 +289,10 @@ impl SparseRunWriter {
 
     fn add_file(&mut self, file: File) -> Result<()> {
         self.add_reader(&mut SparseFileReader::open(file)?)
+    }
+
+    fn add_range(&mut self, file: File, start: u64, len: u64) -> Result<()> {
+        self.add_reader(&mut SparseFileReader::open_range(file, start, len)?)
     }
 
     fn add_reader(&mut self, text: &mut SparseFileReader) -> Result<()> {
@@ -371,15 +403,18 @@ pub(crate) enum IndexedGrams {
     Sparse(bytes::Bytes),
     SparseFile(File),
     SparsePath(TempPath),
+    TrigramSpool { offset: u64, len: u64 },
+    SparseSpool { offset: u64, len: u64 },
 }
 
 pub(crate) fn write_posting_runs(
     grammed: Vec<(usize, IndexedGrams)>,
     strategy: Strategy,
     sparse_run_bytes: usize,
+    spool: Option<&File>,
 ) -> Result<Vec<TempPath>> {
     match strategy {
-        Strategy::Trigram => write_trigram_runs(grammed),
+        Strategy::Trigram => write_trigram_runs(grammed, spool),
         Strategy::Sparse => {
             let mut runs = Vec::new();
             for (idx, grams) in grammed {
@@ -391,7 +426,16 @@ pub(crate) fn write_posting_runs(
                         let file = File::open(&path)?;
                         writer.add_file(file)?;
                     }
-                    IndexedGrams::Trigram(_) | IndexedGrams::TrigramBitmap(_) => {
+                    IndexedGrams::SparseSpool { offset, len } => writer.add_range(
+                        spool
+                            .context("spooled grams have no content spool")?
+                            .try_clone()?,
+                        offset,
+                        len,
+                    )?,
+                    IndexedGrams::Trigram(_)
+                    | IndexedGrams::TrigramBitmap(_)
+                    | IndexedGrams::TrigramSpool { .. } => {
                         anyhow::bail!("mixed gram strategies in build chunk");
                     }
                 }
@@ -402,16 +446,51 @@ pub(crate) fn write_posting_runs(
     }
 }
 
-fn write_trigram_runs(grammed: Vec<(usize, IndexedGrams)>) -> Result<Vec<TempPath>> {
+fn write_trigram_runs(
+    grammed: Vec<(usize, IndexedGrams)>,
+    spool: Option<&File>,
+) -> Result<Vec<TempPath>> {
     let mut documents = Vec::new();
     let mut runs = Vec::new();
+    let mut pending_bytes = 0usize;
     for (idx, grams) in grammed {
+        let grams = match grams {
+            IndexedGrams::TrigramSpool { offset, len } => collect_file_trigrams(
+                &mut spool
+                    .context("spooled grams have no content spool")?
+                    .try_clone()?,
+                offset,
+                len,
+            )?,
+            grams => grams,
+        };
         match grams {
-            IndexedGrams::Trigram(grams) => documents.push((idx, grams)),
+            IndexedGrams::Trigram(grams) => {
+                let bytes = grams
+                    .len()
+                    .checked_mul(size_of::<u32>())
+                    .context("trigram run memory size overflows")?;
+                if !documents.is_empty()
+                    && bytes > TRIGRAM_RUN_BUDGET_BYTES.saturating_sub(pending_bytes)
+                {
+                    runs.push(write_trigram_documents(std::mem::take(&mut documents))?);
+                    pending_bytes = 0;
+                }
+                pending_bytes = pending_bytes
+                    .checked_add(bytes)
+                    .context("trigram run memory size overflows")?;
+                documents.push((idx, grams));
+            }
             IndexedGrams::TrigramBitmap(bitmap) => {
                 runs.push(write_trigram_bitmap_run(idx, bitmap)?);
             }
-            _ => anyhow::bail!("mixed gram strategies in build chunk"),
+            IndexedGrams::Sparse(_)
+            | IndexedGrams::SparseFile(_)
+            | IndexedGrams::SparsePath(_)
+            | IndexedGrams::SparseSpool { .. } => {
+                anyhow::bail!("mixed gram strategies in build chunk");
+            }
+            IndexedGrams::TrigramSpool { .. } => unreachable!(),
         }
     }
     if !documents.is_empty() {

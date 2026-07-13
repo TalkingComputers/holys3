@@ -1,9 +1,11 @@
-use super::{S3Client, S3Request, BYTE_PERMIT_SIZE, SMALL_READ_HEDGE, SMALL_READ_MAX};
+use super::{
+    classify_sdk_error, read_body, Outcome, PreconditionFailed, S3Client, BYTE_PERMIT_SIZE,
+    SMALL_READ_HEDGE, SMALL_READ_MAX,
+};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use holys3_core::{DocId, DocumentBody, DocumentSpool, StaleSource};
-use reqwest::StatusCode;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -86,6 +88,62 @@ fn check_range_version(
 }
 
 impl S3Client {
+    async fn send_get(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<(u64, u64)>,
+        etag: Option<&str>,
+    ) -> Outcome<(DocumentBody, Option<String>)> {
+        let mut request = self.0.sdk.get_object().bucket(bucket).key(key);
+        if let Some((start, end)) = range {
+            request = request.range(format!("bytes={start}-{end}"));
+        }
+        if let Some(etag) = etag {
+            request = request.if_match(etag);
+        }
+        match request.send().await {
+            Ok(output) => {
+                if let Some((start, end)) = range {
+                    let expected = format!("bytes {start}-{end}/");
+                    match output.content_range() {
+                        Some(content_range) if content_range.starts_with(&expected) => {}
+                        Some(content_range) => {
+                            return Outcome::Fatal(anyhow::anyhow!(
+                                "range GET s3://{bucket}/{key} returned wrong Content-Range {content_range}, expected {expected}..."
+                            ));
+                        }
+                        None => {
+                            return Outcome::Fatal(anyhow::anyhow!(
+                                "range GET s3://{bucket}/{key} did not return Content-Range"
+                            ));
+                        }
+                    }
+                }
+                let version = output.e_tag().map(str::to_owned);
+                let hint = output
+                    .content_length()
+                    .and_then(|length| u64::try_from(length).ok())
+                    .unwrap_or(0);
+                match read_body(output.body, hint).await {
+                    Ok(body) => Outcome::Success((body, version)),
+                    Err(error) => Outcome::Transient(error),
+                }
+            }
+            Err(error) => match classify_sdk_error(error) {
+                Outcome::Fatal(error)
+                    if etag.is_some() && error.root_cause().is::<PreconditionFailed>() =>
+                {
+                    Outcome::Fatal(anyhow::Error::new(StaleSource {
+                        key: key.to_owned(),
+                        expected: etag.unwrap_or_default().to_owned(),
+                    }))
+                }
+                outcome => outcome,
+            },
+        }
+    }
+
     async fn fetch_hedged_version(
         &self,
         bucket: &str,
@@ -99,17 +157,11 @@ impl S3Client {
             }
             _ => self.0.cfg.hedge_after,
         };
-        let request = S3Request {
-            method: "GET",
-            bucket,
-            key: Some(key),
-            canonical_query: "",
-            range,
-            body: None,
-            precondition: etag.map(Some),
-        };
+        let label = format!("GET s3://{bucket}/{key}");
         let started = Notify::new();
-        let primary = self.send_resilient(&request, Some(&started));
+        let primary = self.run_resilient(&label, Some(&started), || {
+            self.send_get(bucket, key, range, etag)
+        });
         tokio::pin!(primary);
         let result = tokio::select! {
             biased;
@@ -120,7 +172,10 @@ impl S3Client {
                     Some(token) => {
                         let hedge = async {
                             let _token = token;
-                            self.send_resilient(&request, None).await
+                            self.run_resilient(&label, None, || {
+                                self.send_get(bucket, key, range, etag)
+                            })
+                            .await
                         };
                         tokio::pin!(hedge);
                         tokio::select! {
@@ -132,14 +187,10 @@ impl S3Client {
                 }
             }
         };
-        let Some((status, version, body)) = result? else {
+        let Some((body, version)) = result? else {
             return Ok(None);
         };
         if let Some((start, end)) = range {
-            anyhow::ensure!(
-                status == StatusCode::PARTIAL_CONTENT,
-                "range GET s3://{bucket}/{key} returned HTTP {status} instead of 206 (endpoint ignores Range?)"
-            );
             let expected = end - start + 1;
             anyhow::ensure!(
                 body.len() == expected,
@@ -341,7 +392,7 @@ impl S3Client {
         bucket: &str,
         key: &str,
         ranges: &[(u64, u64)],
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+    ) -> Result<Option<Vec<Bytes>>> {
         let mut order: Vec<usize> = (0..ranges.len()).collect();
         order.sort_by_key(|&index| ranges[index]);
         let sorted: Vec<(u64, u64)> = order.iter().map(|&index| ranges[index]).collect();
@@ -380,7 +431,7 @@ impl S3Client {
         let Some(blobs) = blobs else {
             return Ok(None);
         };
-        let mut output: Vec<Vec<u8>> = vec![Vec::new(); ranges.len()];
+        let mut output = vec![Bytes::new(); ranges.len()];
         for (index, &original) in order.iter().enumerate() {
             let (blob_index, start) = coalesced.placements[index];
             let len = usize::try_from(sorted[index].1)?;
@@ -395,7 +446,7 @@ impl S3Client {
                     end
                 )
             })?;
-            output[original] = slice.to_vec();
+            output[original] = blob.slice_ref(slice);
         }
         Ok(Some(output))
     }
@@ -518,18 +569,13 @@ impl S3Client {
     }
 
     pub fn get_with_version(&self, bucket: &str, key: &str) -> Result<Option<(Vec<u8>, String)>> {
-        let request = S3Request {
-            method: "GET",
-            bucket,
-            key: Some(key),
-            canonical_query: "",
-            range: None,
-            body: None,
-            precondition: None,
-        };
-        match self.0.rt.block_on(self.send_resilient(&request, None))? {
+        match self
+            .0
+            .rt
+            .block_on(self.fetch_hedged_version(bucket, key, None, None))?
+        {
             None => Ok(None),
-            Some((_, etag, bytes)) => {
+            Some((bytes, etag)) => {
                 let etag = etag.with_context(|| format!("GET s3://{bucket}/{key}: no ETag"))?;
                 Ok(Some((bytes.into_bytes()?.to_vec(), etag)))
             }

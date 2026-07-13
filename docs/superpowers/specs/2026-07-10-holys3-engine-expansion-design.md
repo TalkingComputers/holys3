@@ -1,5 +1,8 @@
 # holys3 Engine Expansion Design
 
+> [!NOTE]
+> Historical design record from 2026-07-10. It does not describe the current CLI or architecture. See [README](../../../README.md), [Architecture](../../../ARCHITECTURE.md), and [Changelog](../../../CHANGELOG.md).
+
 ## Objective
 
 Make holys3 materially faster and more scalable while preserving its exact-search contract, then expand the decoder from one searchable document per object to multiple logical documents per source object.

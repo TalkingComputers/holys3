@@ -6,6 +6,31 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Added
+
+- `--index` accepts an independent prefixed S3 location, with separate `--index-region` and `--index-endpoint` controls for read-only source buckets and cross-region or S3-compatible index storage.
+- Immutable content-addressed packs store canonical decoded snapshot bytes as independent 128 KiB checksummed zstd frames with per-block SHA-256 verification and bounded coalesced range reads.
+- CI deletes the complete source prefix after building an independent index and requires identical search results from index packs alone.
+- CI indexes a 20,000-member, 640 MiB TAR snapshot under a 96 MiB RSS ceiling, removes the source archive, and verifies exact search results from the index.
+
+### Changed
+
+- Index format 11 binds every root to its canonical S3 endpoint, bucket, and prefix plus immutable content-pack metadata; searches may narrow that scope but reject broader or different sources.
+- Searches verify against the indexed snapshot without reading mutable source objects. Deletions write immutable tombstones; segments repack at 25% dead documents or bytes, during compaction, or with `--purge-deleted`, and obsolete packs are garbage-collected after the atomic root swap.
+- Expanding sources spool member content and gram coordinates instead of retaining every member in memory; file-backed TAR and ZIP inputs decode directly from their file handles.
+- Compaction batches snapshot reads across sources, candidate windows submit all bounded pack ranges together, and completed pack files release their descriptors before upload.
+- `IndexReader` now owns candidate delivery and snapshot-byte fetching; `search_collect` and `search_streaming` no longer accept a separate source fetcher.
+- Source targets and index storage locations are S3-only.
+- The workspace version is now 0.6.0 for the index-format and public library API break.
+- S3 now uses the official AWS SDK credential, endpoint, signing, and operation implementations while retaining holys3's adaptive concurrency, retries, hedging, range coalescing, and bounded body storage.
+- The minimum supported Rust version is now 1.94.1, required by the current AWS SDK.
+
+### Removed
+
+- The internal `holys3-sigv4` crate and custom IAM Identity Center credential exchange.
+- The `--object-cache` and `--object-cache-cap` CLI flags; search reads immutable packed index content instead of source-object bodies.
+- Local source targets and the legacy `--out` flag.
+
 ## [0.5.1] - 2026-07-12
 
 ### Fixed

@@ -1,5 +1,8 @@
 # Continuous Indexing Design
 
+> [!NOTE]
+> Historical design record from 2026-07-11. It does not describe the current CLI or architecture. See [README](../../../README.md), [Architecture](../../../ARCHITECTURE.md), and [Changelog](../../../CHANGELOG.md).
+
 ## Goal
 
 Add a provider-neutral continuous indexing mode that repeatedly applies the existing incremental index update, reports each attempt in human or JSON form, survives post-start transient failures, exits cleanly on process termination, and remains covered by deterministic churn and interrupted-update tests.

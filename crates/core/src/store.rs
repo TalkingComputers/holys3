@@ -15,6 +15,12 @@ pub struct SourceObject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexAddress {
+    pub segment: u32,
+    pub document: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocAddress {
     pub display_key: String,
     pub source_key: String,
@@ -22,6 +28,7 @@ pub struct DocAddress {
     pub encoded_size: u64,
     pub encoding: crate::SourceEncoding,
     pub member_path: Option<String>,
+    pub index: Option<IndexAddress>,
 }
 
 #[derive(Debug)]
@@ -42,16 +49,16 @@ impl std::fmt::Display for StaleSource {
 
 impl std::error::Error for StaleSource {}
 
-/// A source of objects for INDEX BUILDS, which need full enumeration.
-/// Implemented by a local dir (tests) and S3 (prod).
+/// A fully enumerable source used to build an index.
+/// Implemented by the local benchmark/test adapter and the S3 product adapter.
 pub trait Corpus {
     /// All sources; a source's id is its position in this slice.
     fn sources(&self) -> &[SourceObject];
     /// Fetch the full bytes of one source by position.
     fn fetch(&self, idx: usize) -> AnyhowResult<Bytes>;
-    /// Fetch a contiguous run of docs concurrently. Result order is NOT
+    /// Fetch a contiguous run of sources concurrently. Result order is NOT
     /// guaranteed; each item carries its position. Implementations may
-    /// return fewer docs than requested when a doc vanished between
+    /// return fewer sources than requested when an object vanished between
     /// indexing and fetching. Default = sequential, fail-fast.
     fn fetch_many(&self, docs: Range<usize>) -> AnyhowResult<Vec<(usize, Bytes)>> {
         docs.map(|idx| Ok((idx, self.fetch(idx)?))).collect()
@@ -64,11 +71,10 @@ pub trait Corpus {
     }
 }
 
-/// Fetches sources by key for SEARCH verification without enumeration.
+/// Fetches canonical bodies for candidate-document verification.
 /// `consume` receives the index into `documents` plus the body, as
 /// fetches complete (order NOT guaranteed). Implementations may fetch
-/// concurrently and may skip vanished docs; the first `consume` error
-/// aborts the remaining fetches.
+/// concurrently; the first `consume` error aborts the remaining fetches.
 pub trait DocFetcher {
     fn fetch_each(
         &self,
@@ -119,10 +125,10 @@ pub trait BlobStore {
     fn get_range(&self, name: &str, start: u64, len: u64) -> AnyhowResult<Vec<u8>>;
     /// Fetch many byte ranges of one blob, preserving order. Implementations
     /// may fetch concurrently. Default = sequential.
-    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> AnyhowResult<Vec<Vec<u8>>> {
+    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> AnyhowResult<Vec<Bytes>> {
         ranges
             .iter()
-            .map(|&(start, len)| self.get_range(name, start, len))
+            .map(|&(start, len)| self.get_range(name, start, len).map(Bytes::from))
             .collect()
     }
     /// Remove a blob; deleting an absent blob is not an error.
@@ -322,6 +328,7 @@ mod tests {
             encoded_size: source.encoded_size,
             encoding: crate::SourceEncoding::Zip,
             member_path: Some("app.log".to_owned()),
+            index: None,
         };
         assert_eq!(document.source_key, source.key);
         assert_eq!(document.source_version, source.version);
@@ -369,9 +376,10 @@ mod tests {
         );
         assert_eq!(store.get("missing")?, None);
         assert_eq!(store.get_range("builds/a/postings.bin", 2, 3)?, b"cde");
+        let ranges: Vec<Bytes> = store.get_ranges("builds/a/postings.bin", &[(0, 2), (4, 2)])?;
         assert_eq!(
-            store.get_ranges("builds/a/postings.bin", &[(0, 2), (4, 2)])?,
-            vec![b"ab".to_vec(), b"ef".to_vec()]
+            ranges,
+            [Bytes::from_static(b"ab"), Bytes::from_static(b"ef")]
         );
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -416,6 +424,7 @@ mod tests {
                 encoded_size: 3,
                 encoding: crate::SourceEncoding::Raw,
                 member_path: None,
+                index: None,
             },
             DocAddress {
                 display_key: "a".into(),
@@ -424,6 +433,7 @@ mod tests {
                 encoded_size: 3,
                 encoding: crate::SourceEncoding::Raw,
                 member_path: None,
+                index: None,
             },
         ];
         let mut seen = Vec::new();
@@ -452,6 +462,7 @@ mod tests {
             encoded_size: 7,
             encoding: crate::SourceEncoding::Raw,
             member_path: None,
+            index: None,
         }];
         let error = corpus
             .fetch_each(&documents, &mut |_, _| Ok(()))

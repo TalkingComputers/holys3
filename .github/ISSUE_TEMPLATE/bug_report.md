@@ -35,6 +35,9 @@ RUST_BACKTRACE=1 output here
 - holys3 version (`holys3 --version`):
 - OS / arch:
 - Rust toolchain (`rustc --version`):
+- S3 service, region, and custom endpoint (if any):
+- Source and index locations (redact bucket names if needed):
+- Credential provider (environment, profile, SSO, web identity, container, or instance):
 
 ## Additional context
 

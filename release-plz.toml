@@ -12,7 +12,6 @@ changelog_include = [
   "holys3-index",
   "holys3-query",
   "holys3-s3",
-  "holys3-sigv4",
 ]
 changelog_path = "./CHANGELOG.md"
 changelog_update = true

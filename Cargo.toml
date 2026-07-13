@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/query", "crates/index", "crates/sigv4", "crates/s3", "crates/cli", "crates/xbench"]
+members = ["crates/core", "crates/query", "crates/index", "crates/s3", "crates/cli", "crates/xbench"]
 
 [workspace.package]
 edition = "2021"
-version = "0.5.1"
-rust-version = "1.88"
+version = "0.6.0"
+rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
-description = "Indexed regex search for local files and private S3 buckets"
+description = "Indexed regex search for private S3 buckets"
 repository = "https://github.com/TalkingComputers/holys3"
 homepage = "https://github.com/TalkingComputers/holys3"
 documentation = "https://docs.rs/holys3"
 authors = ["holys3 contributors"]
 keywords = ["s3", "grep", "regex", "search", "trigram"]
-categories = ["command-line-utilities", "text-processing", "filesystem"]
+categories = ["command-line-utilities", "text-processing"]
 
 [workspace.dependencies]
 anyhow = "1"
@@ -23,12 +23,13 @@ toml = "1.1.2"
 postcard = { version = "1", features = ["use-std"] }
 regex = "1"
 regex-syntax = "0.8"
-hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "http2"] }
 tokio = { version = "1", features = ["full"] }
-quick-xml = "0.41.0"
+aws-config = { version = "1.9.0", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.138.0", default-features = false, features = ["rt-tokio", "http-1x", "default-https-client"] }
+aws-smithy-runtime-api = "1.13.0"
+aws-smithy-types = "1.6.1"
 clap = { version = "4", features = ["derive"] }
 fs4 = { version = "1.1.0", features = ["sync"] }
 tempfile = "3.27.0"
@@ -37,6 +38,7 @@ radsort = "0.1.1"
 rapidhash = "4.5.1"
 blake3 = "1.8.5"
 bytes = "1"
+url = "2.5.8"
 percent-encoding = "2.3.2"
 zip = { version = "8.6.0", default-features = false, features = ["bzip2", "deflate-flate2-zlib-rs", "deflate64", "lzma", "xz", "zstd"] }
 tar = { version = "0.4.46", default-features = false }
@@ -51,6 +53,7 @@ arrow-json-58 = { package = "arrow-json", version = "58.0.0" }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+panic = "abort"
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }

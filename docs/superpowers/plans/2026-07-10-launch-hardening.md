@@ -1,5 +1,8 @@
 # Launch Hardening Implementation Plan
 
+> [!NOTE]
+> Historical planning record from 2026-07-10. It does not describe the current CLI or architecture. See [README](../../../README.md), [Architecture](../../../ARCHITECTURE.md), and [Changelog](../../../CHANGELOG.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Land, validate, publish, and verify holys3 0.4.0 through one protected release path.

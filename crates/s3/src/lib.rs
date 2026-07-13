@@ -4,14 +4,13 @@
 mod cache;
 mod client;
 pub mod fetch;
-mod sso;
 
 use anyhow::Context;
+use bytes::Bytes;
 use holys3_core::{
     decode_requested_body, BlobStore, Corpus, DocAddress, DocFetcher, DocId, DocumentBody,
     SourceObject,
 };
-use holys3_sigv4::Credentials;
 use std::ops::Range;
 
 pub use cache::{CacheKey, ObjectCache, ObjectCacheConfig};
@@ -27,270 +26,11 @@ pub fn build_fetch_config(concurrency: usize) -> FetchConfig {
     }
 }
 
-pub fn region_from_env() -> anyhow::Result<String> {
-    let region = std::env::var("AWS_REGION");
-    let default_region = std::env::var("AWS_DEFAULT_REGION");
-    let has_environment = !matches!(&region, Err(std::env::VarError::NotPresent))
-        || !matches!(&default_region, Err(std::env::VarError::NotPresent));
-    let profile_region = if has_environment {
-        None
-    } else {
-        holys3_sigv4::region_from_config()?
-    };
-    read_region(region, default_region, profile_region)
-}
-
-fn read_region(
-    region: Result<String, std::env::VarError>,
-    default_region: Result<String, std::env::VarError>,
-    profile_region: Option<String>,
-) -> anyhow::Result<String> {
-    let region = match region {
-        Ok(region) => region,
-        Err(std::env::VarError::NotPresent) => match default_region {
-            Ok(region) => region,
-            Err(std::env::VarError::NotPresent) => profile_region.context(
-                "provide --region, set AWS_REGION/AWS_DEFAULT_REGION, or configure region in the active AWS profile",
-            )?,
-            Err(error) => return Err(error.into()),
-        },
-        Err(err) => return Err(err.into()),
-    };
-    anyhow::ensure!(!region.is_empty(), "AWS region is empty");
-    Ok(region)
-}
-
-/// Credentials plus the instant they stop working (None = static, never).
-pub struct ResolvedCredentials {
-    pub credentials: Credentials,
-    pub expires_at: Option<time::OffsetDateTime>,
-}
-
-/// Credential chain in standardized precedence order: env vars, static keys
-/// in ~/.aws/credentials, then the active profile's IAM Identity Center config.
-pub fn resolve_credentials() -> anyhow::Result<ResolvedCredentials> {
-    if let Some(credentials) = holys3_sigv4::from_env()? {
-        return Ok(ResolvedCredentials {
-            credentials,
-            expires_at: None,
-        });
-    }
-    if let Some(credentials) = holys3_sigv4::resolve_static()? {
-        return Ok(ResolvedCredentials {
-            credentials,
-            expires_at: None,
-        });
-    }
-    if let Some(profile) = holys3_sigv4::sso_profile()? {
-        let (credentials, expires_at) = sso::role_credentials(&profile)?;
-        return Ok(ResolvedCredentials {
-            credentials,
-            expires_at: Some(expires_at),
-        });
-    }
-    let profile = holys3_sigv4::profile_name()?;
-    anyhow::bail!(
-        "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, add profile `{profile}` \
-         to ~/.aws/credentials, or configure SSO for it in ~/.aws/config"
-    )
-}
-
-pub fn s3_client_from_env(
-    region: &str,
-    endpoint: Option<String>,
-    cfg: FetchConfig,
-) -> anyhow::Result<S3Client> {
-    let resolved = resolve_credentials()?;
-    let client = S3Client::new(region.to_owned(), resolved.credentials, endpoint, cfg)?;
-    if let Some(expires_at) = resolved.expires_at {
-        client.enable_refresh(expires_at, || {
-            let resolved = resolve_credentials()?;
-            Ok((resolved.credentials, resolved.expires_at))
-        });
-    }
-    Ok(client)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
     pub key: String,
     pub etag: String,
     pub size: u64,
-}
-
-fn read_xml_element(
-    reader: &mut quick_xml::Reader<&[u8]>,
-    name: quick_xml::name::QName<'_>,
-) -> anyhow::Result<String> {
-    let text = reader.read_text(name)?;
-    let decoded = text.xml10_content()?;
-    Ok(quick_xml::escape::unescape(&decoded)?.into_owned())
-}
-
-/// Parse one `ListObjectsV2` XML page: returns (`objects`, `next_continuation_token`).
-pub fn parse_list_v2(xml: &str) -> anyhow::Result<(Vec<ObjectMeta>, Option<String>)> {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-    let mut reader = Reader::from_str(xml);
-    let mut objs = Vec::new();
-    let mut next = None;
-    let mut encoding = None;
-    let (mut key, mut etag, mut size) = (None, None, None);
-    let mut truncated: Option<bool> = None;
-    let mut in_contents = false;
-    let mut root_open = false;
-    let mut root_closed = false;
-    loop {
-        match reader.read_event()? {
-            Event::Start(e) => {
-                let name = e.local_name();
-                if name.as_ref() != b"ListBucketResult" {
-                    anyhow::ensure!(root_open && !root_closed, "invalid ListObjectsV2 document");
-                }
-                match name.as_ref() {
-                    b"ListBucketResult" => {
-                        anyhow::ensure!(!root_open && !root_closed, "invalid ListObjectsV2 root");
-                        root_open = true;
-                    }
-                    b"Contents" => {
-                        anyhow::ensure!(
-                            root_open && !in_contents,
-                            "invalid ListObjectsV2 Contents"
-                        );
-                        in_contents = true;
-                        key = None;
-                        etag = None;
-                        size = None;
-                    }
-                    b"Key" if in_contents => {
-                        key = Some(read_xml_element(&mut reader, e.name())?);
-                    }
-                    b"ETag" if in_contents => {
-                        etag = Some(read_xml_element(&mut reader, e.name())?);
-                    }
-                    b"Size" if in_contents => {
-                        size = Some(
-                            read_xml_element(&mut reader, e.name())?
-                                .parse()
-                                .context("invalid Size in ListObjectsV2")?,
-                        );
-                    }
-                    b"NextContinuationToken" => {
-                        next = Some(read_xml_element(&mut reader, e.name())?);
-                    }
-                    b"EncodingType" => {
-                        encoding = Some(read_xml_element(&mut reader, e.name())?);
-                    }
-                    b"IsTruncated" => {
-                        truncated = Some(
-                            read_xml_element(&mut reader, e.name())?
-                                .parse()
-                                .context("invalid IsTruncated in ListObjectsV2")?,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            Event::End(e) => match e.local_name().as_ref() {
-                b"Contents" => {
-                    anyhow::ensure!(in_contents, "invalid ListObjectsV2 Contents");
-                    in_contents = false;
-                    objs.push(ObjectMeta {
-                        key: key
-                            .take()
-                            .context("Contents missing Key in ListObjectsV2")?,
-                        etag: etag
-                            .take()
-                            .context("Contents missing ETag in ListObjectsV2")?,
-                        size: size
-                            .take()
-                            .context("Contents missing Size in ListObjectsV2")?,
-                    });
-                }
-                b"ListBucketResult" => {
-                    anyhow::ensure!(root_open && !in_contents, "invalid ListObjectsV2 root");
-                    root_open = false;
-                    root_closed = true;
-                }
-                _ => {}
-            },
-            Event::Eof => {
-                anyhow::ensure!(
-                    root_closed && !root_open,
-                    "incomplete ListObjectsV2 response"
-                );
-                break;
-            }
-            Event::Empty(_) if !root_open || root_closed => {
-                anyhow::bail!("invalid ListObjectsV2 document")
-            }
-            Event::Text(text) if !root_open || root_closed => {
-                let bytes: &[u8] = text.as_ref();
-                anyhow::ensure!(
-                    bytes.iter().all(u8::is_ascii_whitespace),
-                    "invalid ListObjectsV2 document"
-                );
-            }
-            Event::CData(_) if !root_open || root_closed => {
-                anyhow::bail!("invalid ListObjectsV2 document")
-            }
-            _ => {}
-        }
-    }
-    match encoding.as_deref() {
-        Some("url") => {
-            for object in &mut objs {
-                object.key = decode_list_key(&object.key)?;
-            }
-        }
-        Some(other) => anyhow::bail!("unsupported ListObjectsV2 EncodingType {other}"),
-        None => {}
-    }
-    let truncated = truncated.context("ListObjectsV2 response missing IsTruncated")?;
-    anyhow::ensure!(
-        !truncated || next.as_ref().is_some_and(|token| !token.is_empty()),
-        "truncated ListObjectsV2 response missing NextContinuationToken"
-    );
-    anyhow::ensure!(
-        truncated || next.is_none(),
-        "untruncated ListObjectsV2 response included NextContinuationToken"
-    );
-    Ok((objs, next))
-}
-
-fn decode_list_key(value: &str) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        valid_percent_encoding(value),
-        "ListObjectsV2 returned malformed URL-encoded Key"
-    );
-    let value = if value.contains('+') {
-        std::borrow::Cow::Owned(value.replace('+', " "))
-    } else {
-        std::borrow::Cow::Borrowed(value)
-    };
-    Ok(percent_encoding::percent_decode_str(&value)
-        .decode_utf8()
-        .context("ListObjectsV2 Key is not valid UTF-8")?
-        .into_owned())
-}
-
-fn valid_percent_encoding(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if bytes
-                .get(index + 1..index + 3)
-                .is_none_or(|hex| !hex.iter().all(u8::is_ascii_hexdigit))
-            {
-                return false;
-            }
-            index += 3;
-        } else {
-            index += 1;
-        }
-    }
-    true
 }
 
 pub fn build_index_key(prefix: &str, name: &str) -> String {
@@ -327,24 +67,33 @@ pub fn is_index_key(prefix: &str, key: &str) -> bool {
             .is_some_and(|relative| relative.starts_with('/'))
 }
 
-/// Index blob storage under `<prefix>/.holys3/` in the bucket.
+/// Index blob storage under an S3 key prefix.
 pub struct S3BlobStore {
     client: S3Client,
     bucket: String,
-    prefix: String,
+    root: String,
 }
 
 impl S3BlobStore {
     pub fn new(client: S3Client, bucket: String, prefix: String) -> S3BlobStore {
+        Self::at(client, bucket, build_index_namespace(&prefix))
+    }
+
+    pub fn at(client: S3Client, bucket: String, root: String) -> S3BlobStore {
         S3BlobStore {
             client,
             bucket,
-            prefix,
+            root: root.trim_matches('/').to_owned(),
         }
     }
 
     fn build_key(&self, name: &str) -> String {
-        build_index_key(&self.prefix, name)
+        let name = name.trim_start_matches('/');
+        if self.root.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{}/{name}", self.root)
+        }
     }
 
     fn blob_context(&self, name: &str) -> String {
@@ -383,7 +132,7 @@ impl BlobStore for S3BlobStore {
             .with_context(|| self.blob_context(name))
     }
 
-    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> anyhow::Result<Vec<Vec<u8>>> {
+    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> anyhow::Result<Vec<Bytes>> {
         self.client
             .get_ranges(&self.bucket, &self.build_key(name), ranges)?
             .with_context(|| self.blob_context(name))
@@ -466,7 +215,7 @@ impl Corpus for S3Corpus {
         &self.sources
     }
 
-    fn fetch(&self, idx: usize) -> anyhow::Result<bytes::Bytes> {
+    fn fetch(&self, idx: usize) -> anyhow::Result<Bytes> {
         let source = &self.sources[idx];
         self.client
             .get_if_match(&self.bucket, &source.key, &source.version)?
@@ -475,7 +224,7 @@ impl Corpus for S3Corpus {
 
     /// Concurrent batch fetch. Objects deleted since listing (404) are
     /// skipped with a warning.
-    fn fetch_many(&self, sources: Range<usize>) -> anyhow::Result<Vec<(usize, bytes::Bytes)>> {
+    fn fetch_many(&self, sources: Range<usize>) -> anyhow::Result<Vec<(usize, Bytes)>> {
         self.fetch_body_batch(sources)?
             .into_iter()
             .map(|(idx, body)| Ok((idx, body.into_bytes()?)))
@@ -487,7 +236,8 @@ impl Corpus for S3Corpus {
     }
 }
 
-/// Fetches objects by key for search verification — no doc table at all.
+/// Direct S3-source candidate fetcher for library callers and tests.
+/// The product CLI reads canonical bodies from index snapshot packs instead.
 pub struct S3Fetcher {
     client: S3Client,
     bucket: String,
@@ -522,8 +272,8 @@ impl S3Fetcher {
 }
 
 impl DocFetcher for S3Fetcher {
-    /// Concurrent streaming fetch. Objects deleted since indexing (404) are
-    /// skipped with a warning — the index entry is stale, not the search.
+    /// Concurrent streaming fetch. Source objects deleted since indexing
+    /// are skipped with a warning.
     fn fetch_each(
         &self,
         documents: &[DocAddress],
@@ -646,44 +396,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_two_objects_with_token() {
-        let xml = r#"<?xml version="1.0"?>
-        <ListBucketResult>
-          <Contents><Key>a.txt</Key><Size>10</Size><ETag>"abc"</ETag></Contents>
-          <Contents><Key>b/c.log</Key><Size>20</Size><ETag>"def"</ETag></Contents>
-          <IsTruncated>true</IsTruncated>
-          <NextContinuationToken>TOK</NextContinuationToken>
-        </ListBucketResult>"#;
-        let (objs, next) = parse_list_v2(xml).unwrap();
-        assert_eq!(
-            objs,
-            vec![
-                ObjectMeta {
-                    key: "a.txt".into(),
-                    etag: "\"abc\"".into(),
-                    size: 10
-                },
-                ObjectMeta {
-                    key: "b/c.log".into(),
-                    etag: "\"def\"".into(),
-                    size: 20
-                },
-            ]
-        );
-        assert_eq!(next.as_deref(), Some("TOK"));
-    }
-
-    #[test]
     fn grouped_archive_fetches_once_and_warm_cache_avoids_origin() {
         let body = holys3_core::testutil::encode::zip(&[("a.log", b"alpha"), ("b.log", b"beta")]);
         let (endpoint, server) = start_body_server(body.clone());
-        let client = S3Client::new(
+        let client = S3Client::connect_static(
             "us-east-1".into(),
-            Credentials {
-                access_key: "test".into(),
-                secret_key: "test".into(),
-                session_token: None,
-            },
+            "test".into(),
+            "test".into(),
+            None,
             Some(endpoint),
             FetchConfig::default(),
         )
@@ -696,6 +416,7 @@ mod tests {
                 encoded_size: body.len() as u64,
                 encoding: SourceEncoding::Zip,
                 member_path: Some("a.log".into()),
+                index: None,
             },
             DocAddress {
                 display_key: "bundle.zip!/b.log".into(),
@@ -704,6 +425,7 @@ mod tests {
                 encoded_size: body.len() as u64,
                 encoding: SourceEncoding::Zip,
                 member_path: Some("b.log".into()),
+                index: None,
             },
         ];
         let cache = tempfile::tempdir().unwrap();
@@ -724,8 +446,8 @@ mod tests {
         assert_eq!(
             first,
             [
-                (0, bytes::Bytes::from_static(b"alpha")),
-                (1, bytes::Bytes::from_static(b"beta"))
+                (0, Bytes::from_static(b"alpha")),
+                (1, Bytes::from_static(b"beta"))
             ]
         );
         let request = server.join().unwrap().to_ascii_lowercase();
@@ -744,112 +466,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_list_v2_unescapes_keys_and_tokens() {
-        let xml = r#"<ListBucketResult><Contents><Key>a&amp;b</Key><Size>1</Size><ETag>&quot;abc&quot;</ETag></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>x&amp;y</NextContinuationToken></ListBucketResult>"#;
-        let (objects, next) = parse_list_v2(xml).unwrap();
-        assert_eq!(objects[0].key, "a&b");
-        assert_eq!(objects[0].etag, "\"abc\"");
-        assert_eq!(next.as_deref(), Some("x&y"));
-    }
-
-    #[test]
-    fn parse_list_v2_decodes_url_encoded_keys_only() {
-        let xml = r#"<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>logs%2Fspace+and%2Bplus%2F%F0%9F%92%BE%25100.log</Key><Size>1</Size><ETag>&quot;abc&quot;</ETag></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>x%2Fy+z</NextContinuationToken></ListBucketResult>"#;
-        let (objects, next) = parse_list_v2(xml).unwrap();
-        assert_eq!(objects[0].key, "logs/space and+plus/💾%100.log");
-        assert_eq!(next.as_deref(), Some("x%2Fy+z"));
-
-        let malformed = r#"<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>bad%2</Key><Size>1</Size><ETag>&quot;abc&quot;</ETag></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#;
-        assert!(parse_list_v2(malformed).is_err());
-    }
-
-    #[test]
-    fn parse_list_v2_rejects_invalid_size() {
-        let xml = r#"<ListBucketResult><Contents><Key>a.txt</Key><Size>nope</Size><ETag>"abc"</ETag></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#;
-        let err = parse_list_v2(xml).unwrap_err();
-        assert!(err.to_string().contains("invalid Size in ListObjectsV2"));
-    }
-
-    #[test]
-    fn parse_list_v2_rejects_missing_object_fields() {
-        for (xml, field) in [
-            (
-                r#"<ListBucketResult><Contents><Size>1</Size><ETag>"abc"</ETag></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#,
-                "Key",
-            ),
-            (
-                r#"<ListBucketResult><Contents><Key>a</Key><ETag>"abc"</ETag></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#,
-                "Size",
-            ),
-            (
-                r#"<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#,
-                "ETag",
-            ),
-        ] {
-            let err = parse_list_v2(xml).unwrap_err();
-            assert!(err.to_string().contains(field), "{err:#}");
-        }
-    }
-
-    #[test]
-    fn parse_list_v2_requires_token_for_truncated_page() {
-        let xml = r#"<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>"#;
-        let err = parse_list_v2(xml).unwrap_err();
-        assert!(err.to_string().contains("NextContinuationToken"));
-    }
-
-    #[test]
-    fn parse_list_v2_rejects_incomplete_documents() {
-        for xml in [
-            r#"<ListBucketResult><IsTruncated>false</IsTruncated>"#,
-            r#"<ListBucketResult><Contents><Key>a</Key><Size>1</Size><ETag>e</ETag>"#,
-            r#"<IsTruncated>false</IsTruncated>"#,
-            r#"<ListBucketResult></ListBucketResult><IsTruncated>false</IsTruncated>"#,
-            r#"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult><Other/>"#,
-        ] {
-            assert!(parse_list_v2(xml).is_err(), "{xml}");
-        }
-    }
-
-    #[test]
     fn build_fetch_config_caps_initial_concurrency() {
         let cfg = build_fetch_config(16);
         assert_eq!(cfg.start, 16);
         assert_eq!(cfg.cap, 16);
-    }
-
-    #[test]
-    fn region_uses_sdk_then_cli_environment_order() {
-        let missing = || Err(std::env::VarError::NotPresent);
-        assert_eq!(
-            read_region(
-                Ok("us-east-2".into()),
-                Ok("us-west-1".into()),
-                Some("ca-central-1".into())
-            )
-            .unwrap(),
-            "us-east-2"
-        );
-        assert_eq!(
-            read_region(
-                missing(),
-                Ok("us-west-1".into()),
-                Some("ca-central-1".into())
-            )
-            .unwrap(),
-            "us-west-1"
-        );
-        assert!(read_region(missing(), missing(), None).is_err());
-        assert!(read_region(Ok(String::new()), missing(), None).is_err());
-    }
-
-    #[test]
-    fn region_uses_profile_after_environment() {
-        let missing = || Err(std::env::VarError::NotPresent);
-        assert_eq!(
-            read_region(missing(), missing(), Some("ca-central-1".into())).unwrap(),
-            "ca-central-1"
-        );
     }
 
     #[test]
@@ -874,5 +494,20 @@ mod tests {
         assert_eq!(list_prefix("foo"), "foo/");
         assert_eq!(list_prefix("foo/"), "foo/");
         assert_eq!(list_prefix("/a//b/"), "/a//b/");
+    }
+
+    #[test]
+    fn explicit_index_root_preserves_blob_name_semantics() {
+        let client = S3Client::connect_static(
+            "us-east-1".into(),
+            "test".into(),
+            "test".into(),
+            None,
+            Some("http://127.0.0.1:9000".into()),
+            FetchConfig::default(),
+        )
+        .unwrap();
+        let store = S3BlobStore::at(client, "bucket".into(), "/index/".into());
+        assert_eq!(store.build_key("/segments.bin"), "index/segments.bin");
     }
 }

@@ -1,3 +1,4 @@
+use crate::pack::{PackBlock, PACK_BLOCK_BYTES};
 use anyhow::{Context, Result};
 use holys3_core::SourceEncoding;
 use serde::{Deserialize, Serialize};
@@ -21,12 +22,15 @@ pub(crate) struct DocEntry {
     pub source_id: u32,
     pub member_path: Option<String>,
     pub decoded_size: u64,
+    pub first_block: u32,
+    pub block_offset: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SegmentTables {
     pub sources: Vec<SourceEntry>,
     pub documents: Vec<DocEntry>,
+    pub blocks: Vec<PackBlock>,
 }
 
 #[derive(Default, Serialize, Deserialize, Clone)]
@@ -112,6 +116,70 @@ impl SegmentTables {
                     })
             }),
             "document lies outside its source range"
+        );
+        let mut previous_pack = None;
+        let mut expected_offset = 0u64;
+        for block in &self.blocks {
+            anyhow::ensure!(
+                block.compressed_len > 0,
+                "pack block compressed length is zero"
+            );
+            anyhow::ensure!(
+                block.decoded_len > 0 && block.decoded_len as usize <= PACK_BLOCK_BYTES,
+                "pack block decoded length is invalid"
+            );
+            if previous_pack != Some(block.pack) {
+                anyhow::ensure!(
+                    previous_pack.is_none_or(|pack| block.pack == pack + 1),
+                    "pack IDs are not contiguous"
+                );
+                expected_offset = 0;
+                previous_pack = Some(block.pack);
+            }
+            anyhow::ensure!(
+                block.offset == expected_offset,
+                "pack blocks are not contiguous"
+            );
+            expected_offset = expected_offset
+                .checked_add(u64::from(block.compressed_len))
+                .context("pack block offsets overflow")?;
+        }
+        let mut next_block = 0usize;
+        let mut next_offset = 0usize;
+        for document in &self.documents {
+            if document.decoded_size == 0 {
+                anyhow::ensure!(
+                    document.first_block == 0 && document.block_offset == 0,
+                    "empty document has pack coordinates"
+                );
+                continue;
+            }
+            anyhow::ensure!(
+                usize::try_from(document.first_block)? == next_block
+                    && usize::try_from(document.block_offset)? == next_offset,
+                "document pack coordinates are not contiguous"
+            );
+            let mut remaining = document.decoded_size;
+            while remaining > 0 {
+                let block = self
+                    .blocks
+                    .get(next_block)
+                    .context("document points outside pack blocks")?;
+                let available = usize::try_from(block.decoded_len)?
+                    .checked_sub(next_offset)
+                    .context("document block offset is out of bounds")?;
+                let consumed = remaining.min(u64::try_from(available)?);
+                remaining -= consumed;
+                next_offset += usize::try_from(consumed)?;
+                if next_offset == usize::try_from(block.decoded_len)? {
+                    next_block += 1;
+                    next_offset = 0;
+                }
+            }
+        }
+        anyhow::ensure!(
+            next_block == self.blocks.len() && next_offset == 0,
+            "unowned decoded bytes remain in pack blocks"
         );
         Ok(())
     }
@@ -208,20 +276,33 @@ mod tests {
                     source_id: 0,
                     member_path: Some("a".into()),
                     decoded_size: 1,
+                    first_block: 0,
+                    block_offset: 0,
                 },
                 DocEntry {
                     display_key: "a.zip!/b".into(),
                     source_id: 0,
                     member_path: Some("b".into()),
                     decoded_size: 1,
+                    first_block: 0,
+                    block_offset: 1,
                 },
                 DocEntry {
                     display_key: "b".into(),
                     source_id: 1,
                     member_path: None,
                     decoded_size: 3,
+                    first_block: 0,
+                    block_offset: 2,
                 },
             ],
+            blocks: vec![PackBlock {
+                pack: 0,
+                offset: 0,
+                compressed_len: 1,
+                decoded_len: 5,
+                hash: [0; 32],
+            }],
         }
     }
 

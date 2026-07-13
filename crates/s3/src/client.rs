@@ -1,14 +1,21 @@
 use crate::fetch::{AimdLimiter, FetchConfig, HedgeBudget};
-use crate::{parse_list_v2, ObjectMeta};
+use crate::ObjectMeta;
 use anyhow::{Context, Result};
+use aws_sdk_s3::config::{
+    Credentials, ProvideCredentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+};
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::types::EncodingType;
+use aws_smithy_runtime_api::client::result::SdkError as SmithyError;
+use aws_smithy_types::byte_stream::ByteStream;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use holys3_core::{DocumentBody, DocumentSpool, StaleSource};
-use holys3_sigv4::{encode_path, encode_query_component, sign_request, Credentials, SignedHeaders};
-use reqwest::StatusCode;
-use std::sync::{Arc, LazyLock};
+use holys3_core::{DocumentBody, DocumentSpool};
+use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
+use url::Url;
 
 mod download;
 mod upload;
@@ -16,27 +23,15 @@ mod upload;
 #[cfg(test)]
 use download::coalesce_ranges;
 
-static FORMAT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
-    LazyLock::new(|| {
-        time::format_description::parse_borrowed::<2>("[year][month][day]T[hour][minute][second]Z")
-            .expect("invalid amz date format")
-    });
-
-/// Hedge window for small ranged reads (index blocks): ~2x a slow S3
-/// first-byte latency. Reads below `SMALL_READ_MAX` qualify.
 const SMALL_READ_HEDGE: Duration = Duration::from_millis(300);
 const SMALL_READ_MAX: u64 = 4 * 1024 * 1024;
 
-/// Bodies above one part upload as concurrent multipart parts: single PUTs
-/// of GB-scale blobs time out on slow uplinks and cap at 5 GiB anyway.
 const MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
 const MULTIPART_CONCURRENCY: usize = 4;
 const MULTIPART_BUFFER_BUDGET: usize = 256 * 1024 * 1024;
 const MAX_MULTIPART_PARTS: u64 = 10_000;
 const MAX_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_MULTIPART_OBJECT_SIZE: u64 = MAX_MULTIPART_PARTS * MAX_MULTIPART_PART_SIZE;
-/// Request bodies at or above this use the upload client + deadline.
-const UPLOAD_BODY_THRESHOLD: usize = 1024 * 1024;
 const BYTE_PERMIT_SIZE: u64 = 1024 * 1024;
 
 fn multipart_part_size(len: u64) -> Result<usize> {
@@ -60,159 +55,10 @@ fn multipart_concurrency(part_size: usize) -> usize {
     (MULTIPART_BUFFER_BUDGET / part_size).clamp(1, MULTIPART_CONCURRENCY)
 }
 
-/// `SigV4` canonical query string: sorted keys, both halves percent-encoded.
-fn canonical_query(params: &mut Vec<(&str, String)>) -> String {
-    params.sort_by(|a, b| a.0.cmp(b.0));
-    params
-        .iter()
-        .map(|(k, v)| {
-            format!(
-                "{}={}",
-                encode_query_component(k),
-                encode_query_component(v)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-fn read_xml_text(body: &[u8], element: &[u8]) -> Result<Option<String>> {
-    let mut reader = quick_xml::Reader::from_reader(body);
-    loop {
-        match reader.read_event()? {
-            quick_xml::events::Event::Start(start) if start.local_name().as_ref() == element => {
-                let text = reader.read_text(start.name())?;
-                let decoded = text.xml10_content()?;
-                return Ok(Some(quick_xml::escape::unescape(&decoded)?.into_owned()));
-            }
-            quick_xml::events::Event::Eof => return Ok(None),
-            _ => {}
-        }
-    }
-}
-
-fn validate_complete_multipart(body: &[u8]) -> Result<()> {
-    let mut reader = quick_xml::Reader::from_reader(body);
-    let mut success = false;
-    let mut depth = 0usize;
-    let mut closed = false;
-    loop {
-        match reader.read_event()? {
-            quick_xml::events::Event::Start(start) if !success => {
-                let root = start.local_name();
-                if root.as_ref() == b"CompleteMultipartUploadResult" {
-                    success = true;
-                    depth = 1;
-                    continue;
-                }
-                if root.as_ref() == b"Error" {
-                    let code = read_xml_text(body, b"Code")?
-                        .context("multipart error response missing Code")?;
-                    anyhow::bail!("S3 multipart error {code}");
-                }
-                anyhow::bail!(
-                    "unexpected multipart response root {}",
-                    String::from_utf8_lossy(root.as_ref())
-                );
-            }
-            quick_xml::events::Event::Start(_) => {
-                anyhow::ensure!(!closed, "multipart response has multiple roots");
-                depth = depth
-                    .checked_add(1)
-                    .context("multipart XML depth overflows")?;
-            }
-            quick_xml::events::Event::End(_) if success => {
-                depth = depth.checked_sub(1).context("multipart XML closes early")?;
-                closed = depth == 0;
-            }
-            quick_xml::events::Event::Text(text) if !success || closed => {
-                anyhow::ensure!(
-                    text.xml10_content()?.trim().is_empty(),
-                    "multipart response is not XML"
-                );
-            }
-            quick_xml::events::Event::Eof => {
-                anyhow::ensure!(success && closed, "incomplete multipart response");
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
-}
-
-fn build_http(pool_max_idle: usize) -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .pool_max_idle_per_host(pool_max_idle)
-        .pool_idle_timeout(Duration::from_secs(60))
-        .tcp_keepalive(Duration::from_secs(30))
-        // S3 never negotiates HTTP/2; forcing h1 also keeps a custom
-        // endpoint's proxy from multiplexing 750 streams onto one socket.
-        .http1_only()
-        .connect_timeout(Duration::from_secs(3))
-        .read_timeout(Duration::from_secs(20))
-        .build()
-}
-
-/// Client for large uploads: the server legitimately sends nothing while a
-/// multi-MB body is in flight, so a read timeout would kill every slow-uplink
-/// part. Robustness comes from `upload_deadline` per request instead.
-fn build_upload_http() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .pool_max_idle_per_host(MULTIPART_CONCURRENCY)
-        .pool_idle_timeout(Duration::from_secs(60))
-        .tcp_keepalive(Duration::from_secs(30))
-        .http1_only()
-        .connect_timeout(Duration::from_secs(3))
-        .build()
-}
-
-/// Total deadline for one upload request: a 256 KiB/s floor plus headroom.
 fn upload_deadline(body_len: usize) -> Duration {
     Duration::from_secs(60 + (body_len / (256 * 1024)) as u64)
 }
 
-/// Timestamp helper: returns (`amz_date`, `date`).
-fn now() -> (String, String) {
-    let dt = time::OffsetDateTime::now_utc();
-    let amz = dt
-        .format(FORMAT.as_slice())
-        .expect("invalid amz date format");
-    let date = amz[..8].to_string();
-    (amz, date)
-}
-
-fn apply_signed(
-    req: reqwest::RequestBuilder,
-    signed: &SignedHeaders,
-    host: &str,
-    session_token: Option<&str>,
-) -> reqwest::RequestBuilder {
-    let req = req
-        .header("host", host)
-        .header("x-amz-date", &signed.x_amz_date)
-        .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
-        .header("authorization", &signed.authorization);
-    match session_token {
-        Some(token) => req.header("x-amz-security-token", token),
-        None => req,
-    }
-}
-
-struct S3Request<'a> {
-    method: &'static str,
-    bucket: &'a str,
-    key: Option<&'a str>,
-    canonical_query: &'a str,
-    range: Option<(u64, u64)>,
-    body: Option<Bytes>,
-    /// Conditional write: `Some(Some(etag))` = If-Match, `Some(None)` =
-    /// If-None-Match: * (must not exist), `None` = unconditional.
-    precondition: Option<Option<&'a str>>,
-}
-
-/// Typed marker for a failed conditional write (HTTP 412/409).
 #[derive(Debug)]
 pub(crate) struct PreconditionFailed;
 
@@ -224,98 +70,206 @@ impl std::fmt::Display for PreconditionFailed {
 
 impl std::error::Error for PreconditionFailed {}
 
-enum Outcome {
-    Success(StatusCode, Option<String>, DocumentBody),
+pub(super) enum Outcome<T> {
+    Success(T),
     Throttle,
     NotFound,
     Transient(anyhow::Error),
     Fatal(anyhow::Error),
 }
 
-type RefreshFn =
-    dyn Fn() -> Result<(Credentials, Option<time::OffsetDateTime>)> + Send + Sync + 'static;
-
-/// Refresh when credentials expire within this margin.
-const REFRESH_MARGIN: time::Duration = time::Duration::minutes(5);
-
-struct CredentialCell {
-    state: std::sync::Mutex<(Arc<Credentials>, Option<time::OffsetDateTime>)>,
-    refresher: std::sync::OnceLock<Arc<RefreshFn>>,
-    refresh_gate: tokio::sync::Mutex<()>,
+fn parse_endpoint(endpoint: Option<&str>) -> Result<Option<String>> {
+    endpoint
+        .map(|endpoint| {
+            let url = Url::parse(endpoint)?;
+            anyhow::ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+                "S3 endpoint must be an HTTP(S) origin URL without path, query, fragment, or credentials: {endpoint}"
+            );
+            Ok(endpoint.trim_end_matches('/').to_owned())
+        })
+        .transpose()
 }
 
-impl CredentialCell {
-    fn snapshot(&self) -> Result<(Arc<Credentials>, Option<time::OffsetDateTime>)> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("credential refresh panicked"))?;
-        Ok(state.clone())
-    }
-
-    fn expiring(expires_at: Option<time::OffsetDateTime>) -> bool {
-        expires_at.is_some_and(|at| at - time::OffsetDateTime::now_utc() < REFRESH_MARGIN)
-    }
-
-    /// The credentials to sign with, refreshed via the registered resolver
-    /// when close to expiry. The portal call inside the resolver builds its
-    /// own runtime, so it runs on a blocking thread.
-    async fn current(&self) -> Result<Arc<Credentials>> {
-        let (creds, expires_at) = self.snapshot()?;
-        if !Self::expiring(expires_at) {
-            return Ok(creds);
+fn decode_list_key(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            anyhow::ensure!(
+                bytes
+                    .get(index + 1..index + 3)
+                    .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)),
+                "ListObjectsV2 returned malformed URL-encoded Key"
+            );
+            index += 3;
+        } else {
+            index += 1;
         }
-        let Some(refresher) = self.refresher.get() else {
-            return Ok(creds);
-        };
-        let _gate = self.refresh_gate.lock().await;
-        let (creds, expires_at) = self.snapshot()?;
-        if !Self::expiring(expires_at) {
-            return Ok(creds);
-        }
-        let refresher = Arc::clone(refresher);
-        let (fresh, fresh_expiry) = tokio::task::spawn_blocking(move || refresher())
-            .await
-            .map_err(|err| anyhow::anyhow!("credential refresh panicked: {err}"))?
-            .context("credential refresh failed")?;
-        let fresh = Arc::new(fresh);
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("credential refresh panicked"))?;
-        *state = (Arc::clone(&fresh), fresh_expiry);
-        Ok(fresh)
     }
+    let value = if value.as_bytes().contains(&b'+') {
+        std::borrow::Cow::Owned(value.replace('+', " "))
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    };
+    percent_encoding::percent_decode_str(&value)
+        .decode_utf8()
+        .context("ListObjectsV2 Key is not valid UTF-8")
+        .map(|key| key.into_owned())
+}
+
+pub(super) fn classify_sdk_error<E, T>(error: SdkError<E>) -> Outcome<T>
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    let status = error
+        .raw_response()
+        .map(|response| response.status().as_u16());
+    let code = error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code);
+    if matches!(status, Some(429 | 503))
+        || matches!(
+            code,
+            Some("SlowDown" | "Throttling" | "ThrottlingException")
+        )
+    {
+        return Outcome::Throttle;
+    }
+    if status == Some(404) || matches!(code, Some("NoSuchKey" | "NoSuchBucket")) {
+        return Outcome::NotFound;
+    }
+    if matches!(status, Some(409 | 412))
+        || matches!(
+            code,
+            Some("ConditionalRequestConflict" | "PreconditionFailed")
+        )
+    {
+        return Outcome::Fatal(anyhow::Error::new(PreconditionFailed));
+    }
+    let is_transport = matches!(
+        &error,
+        SmithyError::TimeoutError(_)
+            | SmithyError::DispatchFailure(_)
+            | SmithyError::ResponseError(_)
+    );
+    let is_server = status.is_some_and(|status| status == 408 || status >= 500);
+    let is_transient = matches!(
+        code,
+        Some("InternalError" | "RequestTimeout" | "RequestTimeoutException")
+    );
+    let error = anyhow::Error::new(error);
+    if is_transport || is_server || is_transient {
+        Outcome::Transient(error)
+    } else {
+        Outcome::Fatal(error)
+    }
+}
+
+pub(super) async fn read_body(mut stream: ByteStream, hint: u64) -> Result<DocumentBody> {
+    if hint < SMALL_READ_MAX {
+        return Ok(DocumentBody::from_bytes(
+            stream.collect().await?.into_bytes(),
+        ));
+    }
+    let mut body = DocumentSpool::new(hint)?;
+    let mut at = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let end = at
+            .checked_add(u64::try_from(chunk.len())?)
+            .context("streamed S3 response length overflows")?;
+        anyhow::ensure!(
+            end <= hint,
+            "streamed S3 response exceeds its expected length"
+        );
+        body.write_at(at, &chunk)?;
+        at = end;
+    }
+    anyhow::ensure!(
+        at == hint,
+        "streamed S3 response is {at} bytes, expected {hint}"
+    );
+    body.finish()
 }
 
 struct ClientInner {
     region: String,
-    creds: CredentialCell,
-    endpoint_host: Option<String>,
+    sdk: aws_sdk_s3::Client,
+    upload_sdk: aws_sdk_s3::Client,
     endpoint_base: Option<String>,
     cfg: FetchConfig,
-    http: reqwest::Client,
-    retry_http: reqwest::Client,
-    upload_http: reqwest::Client,
     limiter: AimdLimiter,
     hedges: HedgeBudget,
     rt: tokio::runtime::Runtime,
 }
 
-/// Signed S3 client with one owned runtime, two shared connection pools, and
-/// uniform retry + AIMD + hedging across every operation.
-///
-/// All methods are synchronous and must not be called from inside an async
-/// runtime (they `block_on` internally). Cloning is cheap (shared `Arc`).
 #[derive(Clone)]
 pub struct S3Client(Arc<ClientInner>);
 
+#[cfg(test)]
+#[derive(Clone)]
+struct TestCredentials {
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+}
+
 impl S3Client {
-    pub fn new(
+    #[cfg(test)]
+    fn new(
         region: String,
-        creds: Credentials,
+        credentials: TestCredentials,
         endpoint: Option<String>,
         cfg: FetchConfig,
+    ) -> Result<S3Client> {
+        Self::connect_static(
+            region,
+            credentials.access_key,
+            credentials.secret_key,
+            credentials.session_token,
+            endpoint,
+            cfg,
+        )
+    }
+
+    pub fn connect(
+        region: Option<String>,
+        endpoint: Option<String>,
+        cfg: FetchConfig,
+    ) -> Result<S3Client> {
+        Self::connect_with_credentials(region, endpoint, cfg, None)
+    }
+
+    pub fn connect_static(
+        region: String,
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: Option<String>,
+        endpoint: Option<String>,
+        cfg: FetchConfig,
+    ) -> Result<S3Client> {
+        let credentials = Credentials::new(
+            access_key_id,
+            secret_access_key,
+            session_token,
+            None,
+            "holys3-static",
+        );
+        Self::connect_with_credentials(Some(region), endpoint, cfg, Some(credentials))
+    }
+
+    fn connect_with_credentials(
+        region: Option<String>,
+        endpoint: Option<String>,
+        cfg: FetchConfig,
+        credentials: Option<Credentials>,
     ) -> Result<S3Client> {
         anyhow::ensure!(
             cfg.start > 0,
@@ -339,85 +293,101 @@ impl S3Client {
                 <= u64::try_from(tokio::sync::Semaphore::MAX_PERMITS)?,
             "in-flight S3 byte cap exceeds Tokio's semaphore limit"
         );
-        let (endpoint_host, endpoint_base) = match &endpoint {
-            Some(endpoint) => {
-                let url = reqwest::Url::parse(endpoint)?;
-                anyhow::ensure!(
-                    matches!(url.scheme(), "http" | "https")
-                        && url.path() == "/"
-                        && url.query().is_none()
-                        && url.fragment().is_none()
-                        && url.username().is_empty()
-                        && url.password().is_none(),
-                    "S3 endpoint must be an HTTP(S) origin URL without path, query, fragment, or credentials: {endpoint}"
-                );
-                let host = url
-                    .host_str()
-                    .ok_or_else(|| anyhow::anyhow!("S3 endpoint missing host: {endpoint}"))?;
-                let host = if host.starts_with('[') && host.ends_with(']') {
-                    host.to_owned()
-                } else if host.contains(':') {
-                    format!("[{host}]")
-                } else {
-                    host.to_owned()
-                };
-                let host = match url.port() {
-                    Some(port) => format!("{host}:{port}"),
-                    None => host,
-                };
-                (Some(host), Some(endpoint.trim_end_matches('/').to_owned()))
-            }
-            None => (None, None),
-        };
+        let endpoint_base = parse_endpoint(endpoint.as_deref())?;
+        let worker_threads = cfg
+            .cap
+            .min(std::thread::available_parallelism()?.get())
+            .min(4);
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(worker_threads)
             .enable_all()
             .build()?;
+        let endpoint_for_sdk = endpoint_base.clone();
+        let (sdk, upload_sdk, region) = rt.block_on(async move {
+            let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .retry_config(aws_config::retry::RetryConfig::disabled())
+                .timeout_config(
+                    aws_config::timeout::TimeoutConfig::builder()
+                        .connect_timeout(Duration::from_secs(3))
+                        .read_timeout(Duration::from_secs(20))
+                        .build(),
+                );
+            if let Some(region) = region {
+                loader = loader.region(Region::new(region));
+            }
+            let has_static_credentials = credentials.is_some();
+            if let Some(credentials) = credentials {
+                loader = loader.credentials_provider(credentials);
+            }
+            if endpoint_for_sdk.is_some() {
+                loader = loader
+                    .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                    .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+            }
+            let shared = loader.load().await;
+            let region = shared
+                .region()
+                .context(
+                    "provide --region, set AWS_REGION/AWS_DEFAULT_REGION, or configure region in the active AWS profile",
+                )?
+                .as_ref()
+                .to_owned();
+            if !has_static_credentials {
+                let provider = shared.credentials_provider().context(
+                    "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
+                )?;
+                provider.provide_credentials().await.context(
+                    "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
+                )?;
+            }
+            let mut service = aws_sdk_s3::config::Builder::from(&shared)
+                .retry_config(aws_config::retry::RetryConfig::disabled())
+                .timeout_config(
+                    aws_config::timeout::TimeoutConfig::builder()
+                        .connect_timeout(Duration::from_secs(3))
+                        .read_timeout(Duration::from_secs(20))
+                        .build(),
+                );
+            if let Some(endpoint) = endpoint_for_sdk {
+                service = service
+                    .endpoint_url(endpoint)
+                    .force_path_style(true)
+                    .disable_multi_region_access_points(true)
+                    .disable_s3_express_session_auth(true)
+                    .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                    .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+            }
+            let service = service.build();
+            let upload_service = service
+                .to_builder()
+                .timeout_config(
+                    aws_config::timeout::TimeoutConfig::disabled()
+                        .to_builder()
+                        .connect_timeout(Duration::from_secs(3))
+                        .build(),
+                )
+                .build();
+            Ok::<_, anyhow::Error>(
+                (
+                    aws_sdk_s3::Client::from_conf(service),
+                    aws_sdk_s3::Client::from_conf(upload_service),
+                    region,
+                ),
+            )
+        })?;
         Ok(S3Client(Arc::new(ClientInner {
-            http: build_http(cfg.cap)?,
-            retry_http: build_http(0)?,
-            upload_http: build_upload_http()?,
+            sdk,
+            upload_sdk,
             limiter: AimdLimiter::new(cfg.start, cfg.cap),
             hedges: HedgeBudget::new(cfg.hedge_tokens),
             region,
-            creds: CredentialCell {
-                state: std::sync::Mutex::new((Arc::new(creds), None)),
-                refresher: std::sync::OnceLock::new(),
-                refresh_gate: tokio::sync::Mutex::new(()),
-            },
-            endpoint_host,
             endpoint_base,
             cfg,
             rt,
         })))
     }
 
-    /// Arm credential refresh: `expires_at` marks the current credentials'
-    /// lifetime, and `refresh` re-resolves them (called off-runtime when they
-    /// near expiry). Static-credential clients never call this.
-    pub fn enable_refresh(
-        &self,
-        expires_at: time::OffsetDateTime,
-        refresh: impl Fn() -> Result<(Credentials, Option<time::OffsetDateTime>)>
-            + Send
-            + Sync
-            + 'static,
-    ) {
-        if let Ok(mut state) = self.0.creds.state.lock() {
-            state.1 = Some(expires_at);
-        }
-        self.0.creds.refresher.get_or_init(|| Arc::new(refresh));
-    }
-
-    fn host(&self, bucket: &str) -> String {
-        match &self.0.endpoint_host {
-            Some(host) => host.clone(),
-            None if bucket.contains('.') => format!("s3.{}.amazonaws.com", self.0.region),
-            None => format!("{bucket}.s3.{}.amazonaws.com", self.0.region),
-        }
-    }
-
-    pub(crate) fn endpoint_identity(&self) -> String {
+    pub fn endpoint_identity(&self) -> String {
         self.0
             .endpoint_base
             .clone()
@@ -428,240 +398,40 @@ impl S3Client {
         self.0.cfg.cap
     }
 
-    fn request_path(&self, bucket: &str, key: Option<&str>) -> String {
-        let path_style = self.0.endpoint_base.is_some() || bucket.contains('.');
-        let raw = match (path_style, key) {
-            (true, Some(key)) => format!("/{bucket}/{key}"),
-            (true, None) => format!("/{bucket}/"),
-            (false, Some(key)) => format!("/{key}"),
-            (false, None) => "/".to_owned(),
-        };
-        encode_path(&raw)
-    }
-
-    fn request_url(&self, host: &str, encoded_path: &str, canonical_query: &str) -> String {
-        let base = match &self.0.endpoint_base {
-            Some(base) => base.clone(),
-            None => format!("https://{host}"),
-        };
-        if canonical_query.is_empty() {
-            format!("{base}{encoded_path}")
-        } else {
-            format!("{base}{encoded_path}?{canonical_query}")
-        }
-    }
-
-    /// One signed attempt: build, sign, send, and read the full body.
-    async fn attempt(&self, req: &S3Request<'_>, http: &reqwest::Client) -> Outcome {
-        let creds = match self.0.creds.current().await {
-            Ok(creds) => creds,
-            Err(err) => return Outcome::Fatal(err),
-        };
-        let host = self.host(req.bucket);
-        let path = self.request_path(req.bucket, req.key);
-        let (amz, date) = now();
-        let range_header = req.range.map(|(a, b)| format!("bytes={a}-{b}"));
-        let mut extra = Vec::with_capacity(2);
-        if let Some(range) = &range_header {
-            extra.push(("range", range.as_str()));
-        }
-        match req.precondition {
-            Some(Some(etag)) => extra.push(("if-match", etag)),
-            Some(None) => extra.push(("if-none-match", "*")),
-            None => {}
-        }
-        let signed = sign_request(
-            req.method,
-            &creds,
-            &self.0.region,
-            &host,
-            &path,
-            req.canonical_query,
-            &extra,
-            &amz,
-            &date,
-            "UNSIGNED-PAYLOAD",
-        );
-        let url = self.request_url(&host, &path, req.canonical_query);
-        let http = if req
-            .body
-            .as_ref()
-            .is_some_and(|body| body.len() >= UPLOAD_BODY_THRESHOLD)
-        {
-            &self.0.upload_http
-        } else {
-            http
-        };
-        let builder = match req.method {
-            "GET" => http.get(url),
-            "PUT" => http.put(url),
-            "POST" => http.post(url),
-            "DELETE" => http.delete(url),
-            method => {
-                return Outcome::Fatal(anyhow::anyhow!("unsupported S3 request method {method}"));
-            }
-        };
-        let mut builder = apply_signed(builder, &signed, &host, creds.session_token.as_deref());
-        if let Some(range) = &range_header {
-            builder = builder.header("range", range);
-        }
-        if let Some(body) = &req.body {
-            builder = builder.header("content-length", body.len());
-            builder = builder.body(body.clone());
-            if body.len() >= UPLOAD_BODY_THRESHOLD {
-                builder = builder.timeout(upload_deadline(body.len()));
-            }
-        }
-        match req.precondition {
-            Some(Some(etag)) => builder = builder.header("if-match", etag),
-            Some(None) => builder = builder.header("if-none-match", "*"),
-            None => {}
-        }
-        let response = match builder.send().await {
-            Ok(response) => response,
-            Err(err) if err.is_builder() => return Outcome::Fatal(err.into()),
-            Err(err) => return Outcome::Transient(err.into()),
-        };
-        let status = response.status();
-        if status.is_success() {
-            if req.range.is_some() && status != StatusCode::PARTIAL_CONTENT {
-                return Outcome::Fatal(anyhow::anyhow!(
-                    "range GET s3://{}/{} returned HTTP {status} instead of 206 (endpoint ignores Range?)",
-                    req.bucket,
-                    req.key.unwrap_or_default()
-                ));
-            }
-            let etag = response
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let stream_len = req
-                .range
-                .and_then(|(start, end)| end.checked_sub(start))
-                .and_then(|len| len.checked_add(1))
-                .filter(|len| *len >= SMALL_READ_MAX);
-            let body = match stream_len {
-                Some(len) => {
-                    let mut spool = match DocumentSpool::new(len) {
-                        Ok(spool) => spool,
-                        Err(error) => return Outcome::Fatal(error),
-                    };
-                    let mut at = 0u64;
-                    let mut chunks = response.bytes_stream();
-                    while let Some(chunk) = chunks.next().await {
-                        let chunk = match chunk {
-                            Ok(chunk) => chunk,
-                            Err(error) => return Outcome::Transient(error.into()),
-                        };
-                        let end = match at.checked_add(chunk.len() as u64) {
-                            Some(end) if end <= len => end,
-                            _ => {
-                                return Outcome::Fatal(anyhow::anyhow!(
-                                    "streamed S3 response exceeds its range"
-                                ));
-                            }
-                        };
-                        if let Err(error) = spool.write_at(at, &chunk) {
-                            return Outcome::Fatal(error);
-                        }
-                        at = end;
-                    }
-                    if at != len {
-                        return Outcome::Transient(anyhow::anyhow!(
-                            "streamed S3 response is {at} bytes, expected {len}"
-                        ));
-                    }
-                    match spool.finish() {
-                        Ok(body) => body,
-                        Err(error) => return Outcome::Fatal(error),
-                    }
-                }
-                None => match response.bytes().await {
-                    Ok(bytes) => DocumentBody::from_bytes(bytes),
-                    Err(error) => return Outcome::Transient(error.into()),
-                },
-            };
-            return Outcome::Success(status, etag, body);
-        }
-        match status {
-            StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS => Outcome::Throttle,
-            StatusCode::NOT_FOUND => Outcome::NotFound,
-            // 412 = precondition failed; 409 = S3's concurrent-conditional
-            // conflict. Both mean: another writer won, do not retry blindly.
-            StatusCode::PRECONDITION_FAILED if req.method == "GET" => {
-                match (
-                    req.key,
-                    req.precondition.and_then(|precondition| precondition),
-                ) {
-                    (Some(key), Some(expected)) => {
-                        Outcome::Fatal(anyhow::Error::new(StaleSource {
-                            key: key.to_owned(),
-                            expected: expected.to_owned(),
-                        }))
-                    }
-                    _ => Outcome::Fatal(anyhow::anyhow!("HTTP {status} for {host}{path}")),
-                }
-            }
-            StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => {
-                Outcome::Fatal(anyhow::Error::new(PreconditionFailed))
-            }
-            StatusCode::REQUEST_TIMEOUT => {
-                Outcome::Transient(anyhow::anyhow!("HTTP {status} for {host}{path}"))
-            }
-            status if status.is_server_error() => {
-                Outcome::Transient(anyhow::anyhow!("HTTP {status} for {host}{path}"))
-            }
-            status => Outcome::Fatal(anyhow::anyhow!("HTTP {status} for {host}{path}")),
-        }
-    }
-
-    /// Retry loop shared by every operation: limiter permit per attempt,
-    /// re-signed requests, jittered exponential backoff, AIMD shrink on
-    /// throttle. Returns `None` on HTTP 404.
-    async fn send_resilient(
+    pub(super) async fn run_resilient<T, F, Fut>(
         &self,
-        req: &S3Request<'_>,
+        label: &str,
         on_permit: Option<&Notify>,
-    ) -> Result<Option<(StatusCode, Option<String>, DocumentBody)>> {
-        let label = || {
-            format!(
-                "{} s3://{}/{}",
-                req.method,
-                req.bucket,
-                req.key.unwrap_or_default()
-            )
-        };
+        mut send: F,
+    ) -> Result<Option<T>>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Outcome<T>>,
+    {
         let mut attempt = 0u32;
         loop {
-            let http = if attempt == 0 {
-                &self.0.http
-            } else {
-                &self.0.retry_http
-            };
             let permit = self.0.limiter.acquire().await?;
             if let Some(notify) = on_permit {
                 notify.notify_one();
             }
-            let outcome = self.attempt(req, http).await;
+            let outcome = send().await;
             drop(permit);
             let error = match outcome {
-                Outcome::Success(status, etag, bytes) => {
+                Outcome::Success(output) => {
                     self.0.limiter.on_success();
-                    return Ok(Some((status, etag, bytes)));
+                    return Ok(Some(output));
                 }
                 Outcome::NotFound => return Ok(None),
-                Outcome::Fatal(err) => return Err(err.context(label())),
+                Outcome::Fatal(error) => return Err(error.context(label.to_owned())),
                 Outcome::Throttle => {
                     self.0.limiter.on_throttle();
                     anyhow::anyhow!("throttled (HTTP 503/429)")
                 }
-                Outcome::Transient(err) => err,
+                Outcome::Transient(error) => error,
             };
             if attempt >= self.0.cfg.max_retries {
                 return Err(error.context(format!(
-                    "{} failed after {} retries",
-                    label(),
+                    "{label} failed after {} retries",
                     self.0.cfg.max_retries
                 )));
             }
@@ -676,9 +446,6 @@ impl S3Client {
         }
     }
 
-    /// Conditional PUT (compare-and-swap): `Some(etag)` = overwrite only if
-    /// unchanged, `None` = create only if absent. Returns false when another
-    /// writer won the race.
     pub fn put_if(
         &self,
         bucket: &str,
@@ -686,43 +453,133 @@ impl S3Client {
         body: &[u8],
         expected: Option<&str>,
     ) -> Result<bool> {
-        let req = S3Request {
-            method: "PUT",
-            bucket,
-            key: Some(key),
-            canonical_query: "",
-            range: None,
-            body: Some(Bytes::copy_from_slice(body)),
-            precondition: Some(expected),
-        };
-        match self.0.rt.block_on(self.send_resilient(&req, None)) {
+        let body = Bytes::copy_from_slice(body);
+        let body_len = body.len();
+        let expected = expected.map(str::to_owned);
+        let label = format!("conditional PUT s3://{bucket}/{key}");
+        let result = self.0.rt.block_on(self.run_resilient(&label, None, || {
+            let mut request = self
+                .0
+                .upload_sdk
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(body.clone()));
+            request = match &expected {
+                Some(etag) => request.if_match(etag),
+                None => request.if_none_match("*"),
+            };
+            async move {
+                match tokio::time::timeout(upload_deadline(body_len), request.send()).await {
+                    Ok(Ok(output)) => Outcome::Success(output),
+                    Ok(Err(error)) => classify_sdk_error(error),
+                    Err(error) => Outcome::Transient(error.into()),
+                }
+            }
+        }));
+        match result {
             Ok(Some(_)) => Ok(true),
-            Ok(None) => anyhow::bail!("conditional PUT s3://{bucket}/{key}: bucket not found"),
-            Err(err) if err.root_cause().is::<PreconditionFailed>() => Ok(false),
-            Err(err) => Err(err),
+            Ok(None) => anyhow::bail!("{label}: bucket not found"),
+            Err(error) if error.root_cause().is::<PreconditionFailed>() => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
-    /// Delete one object. Deleting an absent object is not an error (S3
-    /// DELETE returns 204 either way; a 404 here means the bucket).
     pub fn delete(&self, bucket: &str, key: &str) -> Result<()> {
-        let req = S3Request {
-            method: "DELETE",
-            bucket,
-            key: Some(key),
-            canonical_query: "",
-            range: None,
-            body: None,
-            precondition: None,
-        };
+        let label = format!("DELETE s3://{bucket}/{key}");
         self.0
             .rt
-            .block_on(self.send_resilient(&req, None))?
-            .with_context(|| format!("DELETE s3://{bucket}/{key}: bucket not found"))?;
+            .block_on(self.run_resilient(&label, None, || {
+                let request = self.0.sdk.delete_object().bucket(bucket).key(key);
+                async move {
+                    match request.send().await {
+                        Ok(output) => Outcome::Success(output),
+                        Err(error) => classify_sdk_error(error),
+                    }
+                }
+            }))?
+            .with_context(|| format!("{label}: bucket not found"))?;
         Ok(())
     }
 
-    /// Upload many objects concurrently; first failure aborts the rest.
+    pub fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        self.0.rt.block_on(async {
+            let mut objects = Vec::new();
+            let mut token: Option<String> = None;
+            let mut tokens = std::collections::HashSet::new();
+            loop {
+                let label = format!("LIST s3://{bucket}/{prefix}");
+                let output = self
+                    .run_resilient(&label, None, || {
+                        let request = self
+                            .0
+                            .sdk
+                            .list_objects_v2()
+                            .bucket(bucket)
+                            .prefix(prefix)
+                            .encoding_type(EncodingType::Url)
+                            .set_continuation_token(token.clone());
+                        async move {
+                            match request.send().await {
+                                Ok(output) => Outcome::Success(output),
+                                Err(error) => classify_sdk_error(error),
+                            }
+                        }
+                    })
+                    .await?
+                    .with_context(|| format!("list s3://{bucket}: bucket not found"))?;
+                let is_url_encoded = match output.encoding_type() {
+                    Some(EncodingType::Url) => true,
+                    Some(encoding) => anyhow::bail!(
+                        "unsupported ListObjectsV2 EncodingType {}",
+                        encoding.as_str()
+                    ),
+                    None => false,
+                };
+                for object in output.contents() {
+                    let mut key = object
+                        .key()
+                        .context("ListObjectsV2 object missing Key")?
+                        .to_owned();
+                    if is_url_encoded {
+                        key = decode_list_key(&key)?;
+                    }
+                    let etag = object
+                        .e_tag()
+                        .context("ListObjectsV2 object missing ETag")?
+                        .to_owned();
+                    let size =
+                        u64::try_from(object.size().context("ListObjectsV2 object missing Size")?)
+                            .context("ListObjectsV2 object has negative Size")?;
+                    objects.push(ObjectMeta { key, etag, size });
+                }
+                let truncated = output
+                    .is_truncated()
+                    .context("ListObjectsV2 response missing IsTruncated")?;
+                let next = output.next_continuation_token();
+                anyhow::ensure!(
+                    !truncated || next.is_some_and(|token| !token.is_empty()),
+                    "truncated ListObjectsV2 response missing NextContinuationToken"
+                );
+                anyhow::ensure!(
+                    truncated || next.is_none(),
+                    "untruncated ListObjectsV2 response included NextContinuationToken"
+                );
+                match next {
+                    Some(next) => {
+                        anyhow::ensure!(
+                            tokens.insert(next.to_owned()),
+                            "ListObjectsV2 repeated continuation token"
+                        );
+                        token = Some(next.to_owned());
+                    }
+                    None => break,
+                }
+            }
+            Ok(objects)
+        })
+    }
+
     pub fn put_many(&self, bucket: &str, objects: Vec<(String, Vec<u8>)>) -> Result<()> {
         self.0.rt.block_on(async {
             let mut puts = stream::iter(objects.iter().map(|(key, body)| {
@@ -736,64 +593,15 @@ impl S3Client {
             Ok(())
         })
     }
-
-    /// List all objects under `prefix` (paginated, retried).
-    pub fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectMeta>> {
-        self.0.rt.block_on(async {
-            let mut all = Vec::new();
-            let mut token: Option<String> = None;
-            let mut tokens = std::collections::HashSet::new();
-            loop {
-                let mut params = vec![
-                    ("encoding-type", "url".to_owned()),
-                    ("list-type", "2".to_owned()),
-                    ("prefix", prefix.to_owned()),
-                ];
-                if let Some(t) = &token {
-                    params.push(("continuation-token", t.clone()));
-                }
-                let canonical_query = canonical_query(&mut params);
-                let req = S3Request {
-                    method: "GET",
-                    bucket,
-                    key: None,
-                    canonical_query: &canonical_query,
-                    range: None,
-                    body: None,
-                    precondition: None,
-                };
-                let (_, _, body) = self
-                    .send_resilient(&req, None)
-                    .await?
-                    .with_context(|| format!("list s3://{bucket}: bucket not found"))?;
-                let body = String::from_utf8(body.into_bytes()?.to_vec())
-                    .context("ListObjectsV2 response not UTF-8")?;
-                let (objects, next) = parse_list_v2(&body)?;
-                all.extend(objects);
-                match next {
-                    Some(t) => {
-                        anyhow::ensure!(
-                            tokens.insert(t.clone()),
-                            "ListObjectsV2 repeated continuation token"
-                        );
-                        token = Some(t);
-                    }
-                    None => break,
-                }
-            }
-            Ok(all)
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        coalesce_ranges, multipart_concurrency, multipart_part_size, read_xml_text,
-        validate_complete_multipart, FetchConfig, S3Client, MAX_MULTIPART_OBJECT_SIZE,
-        MAX_MULTIPART_PARTS, MAX_MULTIPART_PART_SIZE, MULTIPART_PART_SIZE, SMALL_READ_MAX,
+        coalesce_ranges, multipart_concurrency, multipart_part_size, FetchConfig, S3Client,
+        TestCredentials as Credentials, MAX_MULTIPART_OBJECT_SIZE, MAX_MULTIPART_PARTS,
+        MAX_MULTIPART_PART_SIZE, MULTIPART_PART_SIZE, SMALL_READ_MAX,
     };
-    use holys3_sigv4::Credentials;
     use std::io::{Read, Seek, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -820,21 +628,21 @@ mod tests {
     fn start_response_server(
         status: &str,
         body: &[u8],
+        content_range: Option<&str>,
     ) -> (String, std::thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let status = status.to_owned();
         let body = body.to_vec();
+        let content_range = content_range.map(str::to_owned);
         let thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 8192];
             let read = stream.read(&mut request).unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
+            let content_range = content_range
+                .map(|value| format!("Content-Range: {value}\r\n"))
+                .unwrap_or_default();
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{content_range}Connection: close\r\n\r\n", body.len()).unwrap();
             stream.write_all(&body).unwrap();
             String::from_utf8_lossy(&request[..read]).into_owned()
         });
@@ -852,13 +660,65 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0u8; 8192];
                 let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let lower = request.to_ascii_lowercase();
+                let range = lower
+                    .lines()
+                    .find_map(|line| line.strip_prefix("range: bytes="))
+                    .unwrap();
                 write!(
                     stream,
-                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {part_len}\r\nETag: {etag}\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {part_len}\r\nContent-Range: bytes {range}/*\r\nETag: {etag}\r\nConnection: close\r\n\r\n"
                 )
                 .unwrap();
                 stream.write_all(&vec![byte; part_len]).unwrap();
-                requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
+                requests.push(request);
+            }
+            requests
+        });
+        (format!("http://{address}"), thread)
+    }
+
+    fn start_error_then_success_server(code: &str) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let code = code.to_owned();
+        let thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut requests = 0;
+            while requests < 2 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut request = [0u8; 8192];
+                        let _ = stream.read(&mut request).unwrap();
+                        requests += 1;
+                        if requests == 1 {
+                            let body = format!("<Error><Code>{code}</Code></Error>");
+                            write!(
+                                stream,
+                                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .unwrap();
+                            stream.write_all(body.as_bytes()).unwrap();
+                        } else {
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody"
+                            )
+                            .unwrap();
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("request timeout test server failed: {error}"),
+                }
             }
             requests
         });
@@ -885,16 +745,6 @@ mod tests {
     }
 
     #[test]
-    fn multipart_xml_requires_success_result() {
-        let success = br#"<?xml version="1.0"?><CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Key>a</Key></CompleteMultipartUploadResult>"#;
-        let error = br#"<?xml version="1.0"?><Error><Code>InternalError</Code></Error>"#;
-        assert!(validate_complete_multipart(success).is_ok());
-        assert!(validate_complete_multipart(error).is_err());
-        assert!(validate_complete_multipart(b"<CompleteMultipartUploadResult>").is_err());
-        assert!(validate_complete_multipart(b"").is_err());
-    }
-
-    #[test]
     fn multipart_shape_covers_current_s3_limits() {
         assert_eq!(
             multipart_part_size(MULTIPART_PART_SIZE as u64 + 1).unwrap(),
@@ -913,15 +763,6 @@ mod tests {
         assert_eq!(
             multipart_concurrency(usize::try_from(MAX_MULTIPART_PART_SIZE).unwrap()),
             1
-        );
-    }
-
-    #[test]
-    fn reads_xml_text_by_element_name() {
-        let xml = br#"<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><UploadId>a&amp;b</UploadId></InitiateMultipartUploadResult>"#;
-        assert_eq!(
-            read_xml_text(xml, b"UploadId").unwrap().as_deref(),
-            Some("a&b")
         );
     }
 
@@ -956,38 +797,7 @@ mod tests {
             FetchConfig::default(),
         )
         .unwrap();
-        assert_eq!(client.0.endpoint_host.as_deref(), Some("[::1]:9000"));
-    }
-
-    #[test]
-    fn aws_dotted_buckets_use_path_style() {
-        let client = S3Client::new(
-            "us-east-1".into(),
-            Credentials {
-                access_key: "test".into(),
-                secret_key: "test".into(),
-                session_token: None,
-            },
-            None,
-            FetchConfig::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            client.host("logs.example.com"),
-            "s3.us-east-1.amazonaws.com"
-        );
-        assert_eq!(
-            client.request_path("logs.example.com", Some("logs/a b")),
-            "/logs.example.com/logs/a%20b"
-        );
-        assert_eq!(
-            client.host("logs-example-com"),
-            "logs-example-com.s3.us-east-1.amazonaws.com"
-        );
-        assert_eq!(
-            client.request_path("logs-example-com", Some("logs/a b")),
-            "/logs/a%20b"
-        );
+        assert_eq!(client.endpoint_identity(), "http://[::1]:9000");
     }
 
     #[test]
@@ -1069,7 +879,7 @@ mod tests {
             secret_key: "test".into(),
             session_token: None,
         };
-        let (endpoint, server) = start_response_server("200 OK", b"body");
+        let (endpoint, server) = start_response_server("200 OK", b"body", None);
         let client = S3Client::new(
             "us-east-1".into(),
             credentials.clone(),
@@ -1091,7 +901,7 @@ mod tests {
             "{request}"
         );
 
-        let (endpoint, server) = start_response_server("412 Precondition Failed", b"");
+        let (endpoint, server) = start_response_server("412 Precondition Failed", b"", None);
         let client = S3Client::new(
             "us-east-1".into(),
             credentials,
@@ -1109,8 +919,8 @@ mod tests {
 
     #[test]
     fn list_requests_url_encoding_and_decodes_keys() {
-        let body = br#"<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>logs%2Fa%2Bb%25.log</Key><Size>4</Size><ETag>&quot;etag&quot;</ETag></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#;
-        let (endpoint, server) = start_response_server("200 OK", body);
+        let body = br#"<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>logs%2Fspace+and%2Bplus%25.log</Key><Size>4</Size><ETag>&quot;etag&quot;</ETag></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"#;
+        let (endpoint, server) = start_response_server("200 OK", body, None);
         let client = S3Client::new(
             "us-east-1".into(),
             Credentials {
@@ -1125,18 +935,63 @@ mod tests {
         assert_eq!(
             client.list("bucket", "logs/").unwrap(),
             vec![super::ObjectMeta {
-                key: "logs/a+b%.log".into(),
+                key: "logs/space and+plus%.log".into(),
                 etag: "\"etag\"".into(),
                 size: 4,
             }]
         );
         let request = server.join().unwrap();
+        let request_line = request.lines().next().unwrap();
+        assert!(request_line.starts_with("GET /bucket/?"), "{request}");
+        assert!(request_line.contains("encoding-type=url"), "{request}");
+        assert!(request_line.contains("list-type=2"), "{request}");
+        assert!(request_line.contains("prefix=logs%2F"), "{request}");
+    }
+
+    #[test]
+    fn rejects_truncated_listing_without_token() {
+        let body = br#"<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>"#;
+        let (endpoint, server) = start_response_server("200 OK", body, None);
+        let client = S3Client::new(
+            "us-east-1".into(),
+            Credentials {
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                session_token: None,
+            },
+            Some(endpoint),
+            FetchConfig::default(),
+        )
+        .unwrap();
+        let error = client.list("bucket", "").unwrap_err();
         assert!(
-            request.starts_with(
-                "GET /bucket/?encoding-type=url&list-type=2&prefix=logs%2F HTTP/1.1\r\n"
-            ),
-            "{request}"
+            format!("{error:#}").contains("NextContinuationToken"),
+            "{error:#}"
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_listing_encoding() {
+        let body = br#"<ListBucketResult><EncodingType>other</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>"#;
+        let (endpoint, server) = start_response_server("200 OK", body, None);
+        let client = S3Client::new(
+            "us-east-1".into(),
+            Credentials {
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                session_token: None,
+            },
+            Some(endpoint),
+            FetchConfig::default(),
+        )
+        .unwrap();
+        let error = client.list("bucket", "").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unsupported ListObjectsV2 EncodingType"),
+            "{error:#}"
+        );
+        server.join().unwrap();
     }
 
     #[test]
@@ -1227,8 +1082,9 @@ mod tests {
                 let bytes = &server_body[start..=end];
                 write!(
                     stream,
-                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    bytes.len()
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                    bytes.len(),
+                    server_body.len()
                 )
                 .unwrap();
                 stream.write_all(bytes).unwrap();
@@ -1274,7 +1130,9 @@ mod tests {
     #[test]
     fn streams_large_range_response_to_file() {
         let body = vec![b'x'; usize::try_from(SMALL_READ_MAX).unwrap() + 1];
-        let (endpoint, server) = start_response_server("206 Partial Content", &body);
+        let content_range = format!("bytes 0-{}/{}", body.len() - 1, body.len());
+        let (endpoint, server) =
+            start_response_server("206 Partial Content", &body, Some(&content_range));
         let client = S3Client::new(
             "us-east-1".into(),
             Credentials {
@@ -1305,7 +1163,9 @@ mod tests {
     #[test]
     fn writes_large_object_to_file_with_ranges() {
         let body = vec![b'x'; usize::try_from(SMALL_READ_MAX).unwrap() + 1];
-        let (endpoint, server) = start_response_server("206 Partial Content", &body);
+        let content_range = format!("bytes 0-{}/{}", body.len() - 1, body.len());
+        let (endpoint, server) =
+            start_response_server("206 Partial Content", &body, Some(&content_range));
         let client = S3Client::new(
             "us-east-1".into(),
             Credentials {
@@ -1384,7 +1244,7 @@ mod tests {
 
     #[test]
     fn writes_empty_object_to_file() {
-        let (endpoint, server) = start_response_server("200 OK", b"");
+        let (endpoint, server) = start_response_server("200 OK", b"", None);
         let client = S3Client::new(
             "us-east-1".into(),
             Credentials {
@@ -1406,7 +1266,7 @@ mod tests {
 
     #[test]
     fn rejects_range_ignoring_endpoint() {
-        let (endpoint, server) = start_response_server("200 OK", b"body");
+        let (endpoint, server) = start_response_server("200 OK", b"body", None);
         let client = S3Client::new(
             "us-east-1".into(),
             Credentials {
@@ -1419,8 +1279,104 @@ mod tests {
         )
         .unwrap();
         let error = client.get_range("bucket", "key", 0, 4).unwrap_err();
-        assert!(format!("{error:#}").contains("instead of 206"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("did not return Content-Range"),
+            "{error:#}"
+        );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_content_range() {
+        let (endpoint, server) =
+            start_response_server("206 Partial Content", b"body", Some("bytes 0-3/8"));
+        let client = S3Client::new(
+            "us-east-1".into(),
+            Credentials {
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                session_token: None,
+            },
+            Some(endpoint),
+            FetchConfig::default(),
+        )
+        .unwrap();
+        let error = client.get_range("bucket", "key", 4, 4).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("wrong Content-Range"),
+            "{error:#}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn retries_request_timeout_error_code() {
+        let (endpoint, server) = start_error_then_success_server("RequestTimeout");
+        let config = FetchConfig {
+            max_retries: 1,
+            backoff_base_ms: 0,
+            backoff_cap_ms: 0,
+            hedge_tokens: 0,
+            ..FetchConfig::default()
+        };
+        let client = S3Client::new(
+            "us-east-1".into(),
+            Credentials {
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                session_token: None,
+            },
+            Some(endpoint),
+            config,
+        )
+        .unwrap();
+        let result = client.get("bucket", "key");
+        assert_eq!(server.join().unwrap(), 2);
+        assert_eq!(result.unwrap(), Some(b"body".to_vec()));
+    }
+
+    #[test]
+    fn retries_internal_error_code() {
+        let (endpoint, server) = start_error_then_success_server("InternalError");
+        let config = FetchConfig {
+            max_retries: 1,
+            backoff_base_ms: 0,
+            backoff_cap_ms: 0,
+            hedge_tokens: 0,
+            ..FetchConfig::default()
+        };
+        let client = S3Client::new(
+            "us-east-1".into(),
+            Credentials {
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                session_token: None,
+            },
+            Some(endpoint),
+            config,
+        )
+        .unwrap();
+        let result = client.get("bucket", "key");
+        assert_eq!(server.join().unwrap(), 2);
+        assert_eq!(result.unwrap(), Some(b"body".to_vec()));
+    }
+
+    #[test]
+    fn upload_client_disables_time_to_first_byte_timeout() {
+        let client = S3Client::new(
+            "us-east-1".into(),
+            Credentials {
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                session_token: None,
+            },
+            Some("http://127.0.0.1:9000".into()),
+            FetchConfig::default(),
+        )
+        .unwrap();
+        let upload = client.0.upload_sdk.config().timeout_config().unwrap();
+        assert_eq!(upload.connect_timeout(), Some(Duration::from_secs(3)));
+        assert_eq!(upload.read_timeout(), None);
     }
 
     #[test]

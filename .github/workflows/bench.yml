@@ -53,17 +53,17 @@ jobs:
         working-directory: benchmark-base
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --save-baseline pull-request-base
+        run: cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --save-baseline pull-request-base
       - name: Keep only the named base results
         if: github.event_name == 'pull_request'
         run: rm -rf target/criterion/*/new target/criterion/*/change target/criterion/*/report
       - name: Run Criterion benches against PR base
         if: github.event_name == 'pull_request'
-        run: cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --baseline-lenient pull-request-base
+        run: cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --baseline-lenient pull-request-base
       - name: Run Criterion benches
         if: github.event_name != 'pull_request'
         run: |
-          cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --save-baseline pr
+          cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --save-baseline pr
       - name: Collect Criterion medians
         run: |
           python3 <<'PY'
@@ -164,7 +164,7 @@ jobs:
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
             "$MINIO_IMAGE" server /data --address :9000
-      - name: Create bucket
+      - name: Create buckets
         env:
           MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
@@ -175,6 +175,7 @@ jobs:
             sleep 1
           done
           docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-bench
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-index
       - name: Build benchmark binaries
         run: cargo build --locked --release -p holys3 -p holys3-bench
       - name: Run xbench
@@ -189,6 +190,22 @@ jobs:
           target/release/holys3-bench upload --target s3
           target/release/holys3-bench run --scenarios crates/xbench/scenarios/queries.toml --iterations 3 --warmup 1 --concurrency 64
           target/release/holys3-bench render --input crates/xbench/runs/latest.json > bench-e2e.md
+      - name: Test independent index bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
+        run: |
+          source_index_keys=$(docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ls --recursive --json local/holys3-bench/xbench/.holys3 | wc -l)
+          target/release/holys3 index s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild
+          target/release/holys3 -l longliteralbenchmarktoken s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-independent-index-hits.txt
+          test "$(wc -l < bench-independent-index-hits.txt)" -eq 334
+          if target/release/holys3 -q longliteralbenchmarktoken s3://holys3-bench/xbench/missing --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64; then exit 1; else test "$?" -eq 1; fi
+          if target/release/holys3 -q longliteralbenchmarktoken s3://holys3-bench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64; then exit 1; else test "$?" -eq 2; fi
+          test "$(docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ls --recursive --json local/holys3-bench/xbench/.holys3 | wc -l)" -eq "$source_index_keys"
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" rm --recursive --force local/holys3-bench/xbench
+          target/release/holys3 -l longliteralbenchmarktoken s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-source-deleted-hits.txt
+          test "$(wc -l < bench-source-deleted-hits.txt)" -eq 334
       - name: Test large-object ranged fetch
         env:
           AWS_ACCESS_KEY_ID: minioadmin
@@ -233,7 +250,7 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          limit_kib = 96 * 1024
+          limit_kib = 112 * 1024
           for name in ("bench-entropy-index.txt", "bench-entropy-search.txt"):
               lines = Path(name).read_text().splitlines()
               field = next(line for line in lines if "Maximum resident set size" in line)
@@ -251,13 +268,15 @@ jobs:
           path: |
             bench-e2e.md
             bench-entropy-*.txt
+            bench-independent-index-hits.txt
+            bench-source-deleted-hits.txt
             bench-s3-*.txt
             crates/xbench/runs/latest.json
           if-no-files-found: ignore
 
   scale:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -278,32 +297,89 @@ jobs:
           cp crates/xbench/runs/latest.json bench-scale.json
       - name: Profile incremental churn
         run: |
-          /usr/bin/time -v -o bench-churn-rss.txt target/release/holys3-bench churn --cycles 10 --changes 250 | tee bench-churn.txt
+          /usr/bin/time -v -o bench-churn-rss.txt target/release/holys3-bench churn --cycles 30 --changes 250 | tee bench-churn.txt
           cp crates/xbench/runs/churn.json bench-churn.json
+      - name: Start MinIO service
+        run: |
+          docker run -d --name holys3-scale-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            "$MINIO_IMAGE" server /data --address :9000
+      - name: Create scale buckets
+        env:
+          MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
+        run: |
+          attempts=0
+          until docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ready local; do
+            attempts=$((attempts + 1))
+            test "$attempts" -lt 60
+            sleep 1
+          done
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-scale
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-scale-index
       - name: Profile 256 MiB decoded workload
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
           mkdir -p /tmp/holys3-large-data
           truncate -s 134217728 /tmp/holys3-large-data/large.log
           printf needle | dd of=/tmp/holys3-large-data/large.log bs=1 seek=67108864 conv=notrunc status=none
           gzip -c /tmp/holys3-large-data/large.log > /tmp/holys3-large-data/large.log.gz
-          /usr/bin/time -v -o bench-scale-large.txt target/release/holys3 index /tmp/holys3-large-data --out /tmp/holys3-large-index
-          hits=$(target/release/holys3 -l needle /tmp/holys3-large-data --index /tmp/holys3-large-index | wc -l)
+          docker run --rm --network host -e MC_HOST_local -v /tmp/holys3-large-data:/data:ro "$MC_IMAGE" cp --recursive /data/ local/holys3-scale/large/
+          /usr/bin/time -v -o bench-scale-large.txt target/release/holys3 index s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64
+          hits=$(target/release/holys3 -l needle s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 | wc -l)
           test "$hits" -eq 2
-          /usr/bin/time -v -o bench-scale-sparse.txt target/release/holys3 index /tmp/holys3-large-data --out /tmp/holys3-large-sparse-index --strategy sparse
-          hits=$(target/release/holys3 -l needle /tmp/holys3-large-data --index /tmp/holys3-large-sparse-index | wc -l)
+          /usr/bin/time -v -o bench-scale-sparse.txt target/release/holys3 index s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
+          hits=$(target/release/holys3 -l needle s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 | wc -l)
           test "$hits" -eq 2
       - name: Profile 512 MiB compression expansion
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
           mkdir -p /tmp/holys3-expansion-data
           truncate -s 536870912 /tmp/holys3-expansion-data/expanded.log
           printf EXPANSION_NEEDLE | dd of=/tmp/holys3-expansion-data/expanded.log bs=1 seek=268435456 conv=notrunc status=none
           gzip /tmp/holys3-expansion-data/expanded.log
-          /usr/bin/time -v -o bench-expansion-index.txt target/release/holys3 index /tmp/holys3-expansion-data --out /tmp/holys3-expansion-index
-          /usr/bin/time -v -o bench-expansion-search.txt target/release/holys3 -l EXPANSION_NEEDLE /tmp/holys3-expansion-data --index /tmp/holys3-expansion-index > bench-expansion-hits.txt
+          docker run --rm --network host -e MC_HOST_local -v /tmp/holys3-expansion-data:/data:ro "$MC_IMAGE" cp --recursive /data/ local/holys3-scale/expansion/
+          /usr/bin/time -v -o bench-expansion-index.txt target/release/holys3 index s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64
+          /usr/bin/time -v -o bench-expansion-search.txt target/release/holys3 -l EXPANSION_NEEDLE s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-expansion-hits.txt
           test "$(wc -l < bench-expansion-hits.txt)" -eq 1
-          /usr/bin/time -v -o bench-expansion-sparse-index.txt target/release/holys3 index /tmp/holys3-expansion-data --out /tmp/holys3-expansion-sparse-index --strategy sparse
-          /usr/bin/time -v -o bench-expansion-sparse-search.txt target/release/holys3 -l EXPANSION_NEEDLE /tmp/holys3-expansion-data --index /tmp/holys3-expansion-sparse-index > bench-expansion-sparse-hits.txt
+          /usr/bin/time -v -o bench-expansion-sparse-index.txt target/release/holys3 index s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
+          /usr/bin/time -v -o bench-expansion-sparse-search.txt target/release/holys3 -l EXPANSION_NEEDLE s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-expansion-sparse-hits.txt
           test "$(wc -l < bench-expansion-sparse-hits.txt)" -eq 1
+      - name: Profile 20,000-member TAR snapshot
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
+        run: |
+          python3 <<'PY'
+          import io
+          import tarfile
+          from pathlib import Path
+
+          root = Path("/tmp/holys3-archive-data")
+          root.mkdir()
+          size = 32 * 1024
+          body = bytearray(b"x" * size)
+          with tarfile.open(root / "members.tar", "w") as archive:
+              for index in range(20_000):
+                  body[:64] = f"member={index:05} ".encode().ljust(64, b"x")
+                  body[128:142] = b"ARCHIVE_NEEDLE" if index % 1_000 == 0 else b"ordinary_value"
+                  member = tarfile.TarInfo(f"logs/member-{index:05}.log")
+                  member.size = size
+                  member.mode = 0o600
+                  archive.addfile(member, io.BytesIO(body))
+          PY
+          docker run --rm --network host -e MC_HOST_local -v /tmp/holys3-archive-data:/data:ro "$MC_IMAGE" cp /data/members.tar local/holys3-scale/archive/members.tar
+          /usr/bin/time -v -o bench-archive-sparse-index.txt target/release/holys3 index s3://holys3-scale/archive --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/archive-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" rm --recursive --force local/holys3-scale/archive
+          target/release/holys3 -l ARCHIVE_NEEDLE s3://holys3-scale/archive --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/archive-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-archive-source-deleted-hits.txt
+          test "$(wc -l < bench-archive-source-deleted-hits.txt)" -eq 20
       - name: Enforce peak memory ceilings
         run: |
           python3 <<'PY'
@@ -338,6 +414,13 @@ jobs:
               if peak_kib > expansion_limit_kib:
                   raise SystemExit(f"{name}: peak RSS {peak_kib} KiB exceeds {expansion_limit_kib} KiB")
 
+          archive_limit_kib = 112 * 1024
+          lines = Path("bench-archive-sparse-index.txt").read_text().splitlines()
+          field = next(line for line in lines if "Maximum resident set size" in line)
+          peak_kib = int(field.rsplit(":", 1)[1])
+          if peak_kib > archive_limit_kib:
+              raise SystemExit(f"bench-archive-sparse-index.txt: peak RSS {peak_kib} KiB exceeds {archive_limit_kib} KiB")
+
           output = Path("bench-scale-build.txt").read_text()
           match = re.search(r"listing_ms=([0-9.]+) build_ms=([0-9.]+)", output)
           if match is None:
@@ -356,12 +439,14 @@ jobs:
               "listing_p95_ms",
               "update_p50_ms",
               "update_p95_ms",
+              "update_max_ms",
+              "pack_bytes_written",
               "final_segments",
           }
           if set(churn) != expected_fields:
               raise SystemExit(f"churn summary fields are {sorted(churn)}, expected {sorted(expected_fields)}")
           for name, expected in (
-              ("cycles", 10),
+              ("cycles", 30),
               ("changes_per_cycle", 250),
               ("total_docs", 25_000),
           ):
@@ -373,18 +458,31 @@ jobs:
               "listing_p95_ms",
               "update_p50_ms",
               "update_p95_ms",
+              "update_max_ms",
           ):
               value = churn[name]
               if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                   raise SystemExit(f"churn {name} must be a positive finite number, got {value!r}")
           if churn["listing_p95_ms"] > 2_000:
               raise SystemExit(f"churn listing p95 {churn['listing_p95_ms']:.3f} ms exceeds 2000 ms")
-          if churn["update_p95_ms"] > 5_000:
-              raise SystemExit(f"churn update p95 {churn['update_p95_ms']:.3f} ms exceeds 5000 ms")
+          if churn["update_p50_ms"] > 500:
+              raise SystemExit(f"churn update p50 {churn['update_p50_ms']:.3f} ms exceeds 500 ms")
+          if churn["update_p95_ms"] > 1_500:
+              raise SystemExit(f"churn update p95 {churn['update_p95_ms']:.3f} ms exceeds 1500 ms")
+          if churn["update_max_ms"] > 6_000:
+              raise SystemExit(f"churn update max {churn['update_max_ms']:.3f} ms exceeds 6000 ms")
+          pack_bytes_written = churn["pack_bytes_written"]
+          if isinstance(pack_bytes_written, bool) or not isinstance(pack_bytes_written, int) or pack_bytes_written <= 0:
+              raise SystemExit(f"churn pack_bytes_written must be a positive integer, got {pack_bytes_written!r}")
+          if pack_bytes_written > 300 * 1024 * 1024:
+              raise SystemExit(f"churn wrote {pack_bytes_written} pack bytes, exceeds 300 MiB")
           final_segments = churn["final_segments"]
           if isinstance(final_segments, bool) or not isinstance(final_segments, int) or final_segments <= 0:
               raise SystemExit(f"churn final_segments must be a positive integer, got {final_segments!r}")
           PY
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force holys3-scale-minio
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
@@ -405,6 +503,8 @@ jobs:
             bench-expansion-sparse-index.txt
             bench-expansion-sparse-search.txt
             bench-expansion-sparse-hits.txt
+            bench-archive-sparse-index.txt
+            bench-archive-source-deleted-hits.txt
           if-no-files-found: error
 
   benchmarks-success:

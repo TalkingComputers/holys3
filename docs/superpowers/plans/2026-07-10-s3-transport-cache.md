@@ -1,5 +1,8 @@
 # S3 Transport And Object Cache Implementation Plan
 
+> [!NOTE]
+> Historical planning record from 2026-07-10. It does not describe the current CLI or architecture. See [README](../../../README.md), [Architecture](../../../ARCHITECTURE.md), and [Changelog](../../../CHANGELOG.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Make exact verification over S3 fast and race-safe by fetching each physical source once, binding reads to the indexed object version, using measured bounded range concurrency for large raw objects, and exposing a private opt-in object cache.

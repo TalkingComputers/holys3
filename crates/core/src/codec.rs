@@ -236,8 +236,12 @@ impl DecodeState<'_> {
                 self.emit(member_path, body.finish()?)?;
             }
             Codec::Raw => self.emit(member_path, DocumentBody::from_bytes(bytes))?,
-            Codec::Zip => self.decode_zip(bytes, member_path, depth)?,
-            Codec::Tar => self.decode_tar(&bytes, member_path, depth)?,
+            Codec::Zip => {
+                self.decode_zip(std::io::Cursor::new(bytes), member_path, depth)?;
+            }
+            Codec::Tar => {
+                self.decode_tar(std::io::Cursor::new(bytes), member_path, depth)?;
+            }
             Codec::Lz4Legacy => {
                 decode_body_inner(
                     self.source_key,
@@ -266,7 +270,7 @@ impl DecodeState<'_> {
             DocumentStorage::Bytes(bytes) => {
                 self.decode_frame(bytes, member_path, depth, allow_hint)
             }
-            DocumentStorage::File { file, len } => {
+            DocumentStorage::File { mut file, len } => {
                 // SAFETY: the private temporary file remains immutable while mapped.
                 let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
                 let key = member_path.as_deref().unwrap_or(self.source_key);
@@ -279,6 +283,21 @@ impl DecodeState<'_> {
                     drop(map);
                     self.emit(member_path, DocumentBody::from_file(file, len))?;
                     Ok(SourceEncoding::Raw)
+                } else if matches!(codec, Codec::Zip | Codec::Tar) {
+                    anyhow::ensure!(
+                        depth <= self.limits.max_depth,
+                        "decode depth exceeds {} for {}",
+                        self.limits.max_depth,
+                        self.source_key
+                    );
+                    drop(map);
+                    file.seek(SeekFrom::Start(0))?;
+                    match codec {
+                        Codec::Zip => self.decode_zip(file, member_path, depth)?,
+                        Codec::Tar => self.decode_tar(file, member_path, depth)?,
+                        _ => unreachable!(),
+                    }
+                    Ok(codec_encoding(codec))
                 } else if can_decode_stream(codec) {
                     anyhow::ensure!(
                         depth <= self.limits.max_depth,
@@ -317,11 +336,11 @@ impl DecodeState<'_> {
 
     fn decode_zip(
         &mut self,
-        bytes: bytes::Bytes,
+        reader: impl Read + Seek,
         parent: Option<String>,
         depth: u8,
     ) -> AnyhowResult<()> {
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        let mut archive = zip::ZipArchive::new(reader)
             .with_context(|| format!("zip decode failed for {}", self.source_key))?;
         for index in 0..archive.len() {
             let mut entry = archive
@@ -342,8 +361,13 @@ impl DecodeState<'_> {
         Ok(())
     }
 
-    fn decode_tar(&mut self, bytes: &[u8], parent: Option<String>, depth: u8) -> AnyhowResult<()> {
-        let mut archive = tar::Archive::new(bytes);
+    fn decode_tar(
+        &mut self,
+        reader: impl Read,
+        parent: Option<String>,
+        depth: u8,
+    ) -> AnyhowResult<()> {
+        let mut archive = tar::Archive::new(reader);
         for entry in archive
             .entries()
             .with_context(|| format!("tar decode failed for {}", self.source_key))?
@@ -806,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_source_streams_file_backed_compression() {
+    fn decode_source_streams_file_backed_formats() {
         let expected = b"file-backed compression needle\n";
         let cases = [
             ("body.gz", crate::testutil::encode::gzip(expected)),
@@ -818,6 +842,8 @@ mod tests {
             ),
             ("body.br", crate::testutil::encode::brotli(expected)),
             ("body.zlib", crate::testutil::encode::zlib(expected)),
+            ("body.zip", zip_bytes(&[("body.log", expected)])),
+            ("body.tar", tar_bytes(&[("body.log", expected)])),
         ];
         for (key, encoded) in cases {
             let mut spool = DocumentSpool::new(encoded.len() as u64).unwrap();

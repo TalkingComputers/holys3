@@ -1,49 +1,54 @@
 # holys3-bench
 
-Local MinIO run:
+`holys3-bench` is the unpublished deterministic performance harness. Its local
+backend exercises the index engine only; the `holys3` product CLI remains
+S3-only.
+
+## MinIO
+
+Run the complete seed, upload, index, query, and render workflow:
 
 ```sh
-docker compose -f docker-compose.bench.yml up -d
-env -u AWS_PROFILE AWS_ACCESS_KEY_ID=minioadmin \
-AWS_SECRET_ACCESS_KEY=minioadmin \
-HOLYS3_BENCH_BUCKET=holys3-bench \
-HOLYS3_BENCH_REGION=us-east-1 \
-HOLYS3_BENCH_ENDPOINT=http://localhost:9000 \
-cargo run --release -p holys3-bench -- seed --seed 1 --objects 1000 --size 4096
-env -u AWS_PROFILE AWS_ACCESS_KEY_ID=minioadmin \
-AWS_SECRET_ACCESS_KEY=minioadmin \
-HOLYS3_BENCH_BUCKET=holys3-bench \
-HOLYS3_BENCH_REGION=us-east-1 \
-HOLYS3_BENCH_ENDPOINT=http://localhost:9000 \
-cargo run --release -p holys3-bench -- upload --target s3
-env -u AWS_PROFILE AWS_ACCESS_KEY_ID=minioadmin \
-AWS_SECRET_ACCESS_KEY=minioadmin \
-HOLYS3_BENCH_BUCKET=holys3-bench \
-HOLYS3_BENCH_REGION=us-east-1 \
-HOLYS3_BENCH_ENDPOINT=http://localhost:9000 \
-cargo run --release -p holys3-bench -- run --scenarios crates/xbench/scenarios/queries.toml --iterations 5 --warmup 1 --concurrency 64
-cargo run --release -p holys3-bench -- render --input crates/xbench/runs/latest.json
+make bench-minio
+make bench-minio BENCH_OBJECTS=25000 BENCH_ITERATIONS=3
 ```
 
-Use `--objects 25000 --size 4096` for the CI scale corpus. The runner records
-concurrent and `--concurrency 1` medians, exact hits/candidates/bytes, and the
-backend configuration in `crates/xbench/runs/latest.json`.
+The Makefile uses the canonical `http://127.0.0.1:9000` endpoint identity.
+Results are written to `crates/xbench/runs/latest.json` and
+`crates/xbench/runs/minio.json`.
 
-Real S3 run:
+## AWS S3
+
+Use a dedicated benchmark bucket. The harness writes source objects under
+`xbench/` and index data under `xbench/.holys3/`.
 
 ```sh
 AWS_PROFILE=your-profile \
 HOLYS3_BENCH_BUCKET=your-bucket \
 HOLYS3_BENCH_REGION=us-east-1 \
-cargo run --release -p holys3-bench -- seed --seed 1 --objects 1000 --size 4096
-AWS_PROFILE=your-profile \
-HOLYS3_BENCH_BUCKET=your-bucket \
-HOLYS3_BENCH_REGION=us-east-1 \
-cargo run --release -p holys3-bench -- upload --target s3
-AWS_PROFILE=your-profile \
-HOLYS3_BENCH_BUCKET=your-bucket \
-HOLYS3_BENCH_REGION=us-east-1 \
-cargo run --release -p holys3-bench -- run --scenarios crates/xbench/scenarios/queries.toml --iterations 5 --warmup 1 --concurrency 64
-cp crates/xbench/runs/latest.json crates/xbench/runs/s3.json
-cargo run --release -p holys3-bench -- render --input crates/xbench/runs/s3.json
+make bench-s3 BENCH_OBJECTS=25000 BENCH_ITERATIONS=3
 ```
+
+Results are written to `crates/xbench/runs/latest.json` and
+`crates/xbench/runs/s3.json`. Every timed scenario validates its expected hit,
+candidate, and byte counts first.
+
+## Engine microbenchmarks
+
+```sh
+make bench-micro
+```
+
+## Incremental churn
+
+The churn benchmark is local and deterministic. It requires a freshly seeded
+and locally indexed benchmark corpus:
+
+```sh
+cargo run --locked --release -p holys3-bench -- seed --seed 1 --objects 25000 --size 4096
+cargo run --locked --release -p holys3-bench -- upload --target dir
+cargo run --locked --release -p holys3-bench -- churn --cycles 30 --changes 250
+```
+
+It writes `crates/xbench/runs/churn.json` and mutates the generated corpus;
+reseed before another run.
