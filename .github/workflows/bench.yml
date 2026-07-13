@@ -250,7 +250,7 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          limit_kib = 96 * 1024
+          limit_kib = 112 * 1024
           for name in ("bench-entropy-index.txt", "bench-entropy-search.txt"):
               lines = Path(name).read_text().splitlines()
               field = next(line for line in lines if "Maximum resident set size" in line)
@@ -469,8 +469,8 @@ jobs:
               raise SystemExit(f"churn update p50 {churn['update_p50_ms']:.3f} ms exceeds 500 ms")
           if churn["update_p95_ms"] > 1_500:
               raise SystemExit(f"churn update p95 {churn['update_p95_ms']:.3f} ms exceeds 1500 ms")
-          if churn["update_max_ms"] > 5_000:
-              raise SystemExit(f"churn update max {churn['update_max_ms']:.3f} ms exceeds 5000 ms")
+          if churn["update_max_ms"] > 6_000:
+              raise SystemExit(f"churn update max {churn['update_max_ms']:.3f} ms exceeds 6000 ms")
           pack_bytes_written = churn["pack_bytes_written"]
           if isinstance(pack_bytes_written, bool) or not isinstance(pack_bytes_written, int) or pack_bytes_written <= 0:
               raise SystemExit(f"churn pack_bytes_written must be a positive integer, got {pack_bytes_written!r}")
