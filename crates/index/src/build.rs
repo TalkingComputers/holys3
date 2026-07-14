@@ -469,29 +469,29 @@ fn build_raw_source(
     )?))
 }
 
-pub(crate) fn build_index_files(
-    corpus: &dyn Corpus,
+/// Everything one fetched chunk mutates while it is ingested: decoded
+/// documents append to the pack builder and tables, grams flow into posting
+/// runs, and vanished/undecodable sources count as failed.
+struct ChunkIngest<'a> {
+    sources: &'a [SourceObject],
     strategy: Strategy,
     document_cap: Option<usize>,
-    progress: Option<&holys3_core::ProgressSender>,
-) -> Result<BuiltIndexFiles> {
-    if let Some(document_cap) = document_cap {
-        anyhow::ensure!(document_cap > 0, "segment document cap must be positive");
-    }
-    let sources = corpus.sources();
-    let mut tables = SegmentTables {
-        sources: Vec::with_capacity(sources.len()),
-        documents: Vec::new(),
-        blocks: Vec::new(),
-    };
-    let mut pack_builder = PackBuilder::production()?;
-    let mut failed = 0usize;
-    let mut runs = Vec::new();
-    let chunks: Vec<Range<usize>> = build_chunks(sources).collect();
-    let fetch = |chunk: Range<usize>| corpus.fetch_bodies(chunk);
-    let prefetchable =
-        |chunk: &Range<usize>| chunk_encoded_bytes(sources, chunk) <= BUILD_FETCH_BYTES;
-    drive_prefetched(&chunks, &prefetchable, &fetch, &mut |chunk, fetched| {
+    progress: Option<&'a holys3_core::ProgressSender>,
+    tables: &'a mut SegmentTables,
+    pack_builder: &'a mut PackBuilder,
+    failed: &'a mut usize,
+    runs: &'a mut Vec<tempfile::TempPath>,
+}
+
+impl ChunkIngest<'_> {
+    /// Decode, gram, and pack one fetched chunk of sources, in listing order.
+    fn ingest(&mut self, chunk: Range<usize>, fetched: Vec<(usize, DocumentBody)>) -> Result<()> {
+        let (sources, strategy, document_cap, progress) = (
+            self.sources,
+            self.strategy,
+            self.document_cap,
+            self.progress,
+        );
         let chunk_start = chunk.start;
         let mut bodies = (0..chunk.len()).map(|_| None).collect::<Vec<_>>();
         for (idx, bytes) in fetched {
@@ -531,7 +531,7 @@ pub(crate) fn build_index_files(
             let source = &sources[chunk_start + offset];
             let expanding = bodies[offset].is_some() && raw[offset].is_none();
             if expanding && !grammed.is_empty() {
-                runs.extend(write_posting_runs(
+                self.runs.extend(write_posting_runs(
                     std::mem::take(&mut grammed),
                     strategy,
                     SPARSE_RUN_BYTES,
@@ -542,7 +542,7 @@ pub(crate) fn build_index_files(
                 (Some(outcome), _) => Some(outcome),
                 (None, Some(body)) => {
                     let document_limit =
-                        document_cap.map(|cap| cap.saturating_sub(tables.documents.len()));
+                        document_cap.map(|cap| cap.saturating_sub(self.tables.documents.len()));
                     if document_limit == Some(0) {
                         return Err(anyhow::Error::new(DocumentCapExceeded));
                     }
@@ -550,8 +550,8 @@ pub(crate) fn build_index_files(
                 }
                 (None, None) => None,
             };
-            let source_id = u32::try_from(tables.sources.len())?;
-            let first_doc = u32::try_from(tables.documents.len())?;
+            let source_id = u32::try_from(self.tables.sources.len())?;
+            let first_doc = u32::try_from(self.tables.documents.len())?;
             let (encoding, retry, source_failed, mut documents, mut spool, expanded_bytes) =
                 match outcome {
                     Some(SourceBuild::Decoded {
@@ -561,11 +561,11 @@ pub(crate) fn build_index_files(
                         expanded_bytes,
                     }) => (encoding, false, false, documents, spool, expanded_bytes),
                     Some(SourceBuild::Failed) => {
-                        failed += 1;
+                        *self.failed += 1;
                         (SourceEncoding::Raw, false, true, Vec::new(), None, 0)
                     }
                     None => {
-                        failed += 1;
+                        *self.failed += 1;
                         (SourceEncoding::Raw, true, true, Vec::new(), None, 0)
                     }
                 };
@@ -576,7 +576,8 @@ pub(crate) fn build_index_files(
             }
             documents
                 .sort_unstable_by(|left, right| left.meta.display_key.cmp(&right.meta.display_key));
-            let next_document_count = tables
+            let next_document_count = self
+                .tables
                 .documents
                 .len()
                 .checked_add(documents.len())
@@ -585,14 +586,14 @@ pub(crate) fn build_index_files(
                 return Err(anyhow::Error::new(DocumentCapExceeded));
             }
             for document in documents {
-                let doc_id = tables.documents.len();
+                let doc_id = self.tables.documents.len();
                 let slice = document.content.append(
-                    &mut pack_builder,
+                    self.pack_builder,
                     document.decoded_size,
                     spool.as_mut(),
                 )?;
                 grammed.push((doc_id, document.grams));
-                tables.documents.push(DocEntry {
+                self.tables.documents.push(DocEntry {
                     display_key: document.meta.display_key,
                     source_id,
                     member_path: document.meta.member_path,
@@ -601,18 +602,18 @@ pub(crate) fn build_index_files(
                     block_offset: slice.block_offset,
                 });
             }
-            tables.sources.push(SourceEntry {
+            self.tables.sources.push(SourceEntry {
                 key: source.key.clone(),
                 version: source.version.clone(),
                 encoded_size: source.encoded_size,
                 encoding,
                 first_doc,
-                doc_count: u32::try_from(tables.documents.len())? - first_doc,
+                doc_count: u32::try_from(self.tables.documents.len())? - first_doc,
                 failed: source_failed,
                 retry,
             });
             if expanding && !grammed.is_empty() {
-                runs.extend(write_posting_runs(
+                self.runs.extend(write_posting_runs(
                     std::mem::take(&mut grammed),
                     strategy,
                     SPARSE_RUN_BYTES,
@@ -621,7 +622,7 @@ pub(crate) fn build_index_files(
             }
         }
         if !grammed.is_empty() {
-            runs.extend(write_posting_runs(
+            self.runs.extend(write_posting_runs(
                 grammed,
                 strategy,
                 SPARSE_RUN_BYTES,
@@ -629,6 +630,43 @@ pub(crate) fn build_index_files(
             )?);
         }
         Ok(())
+    }
+}
+
+pub(crate) fn build_index_files(
+    corpus: &dyn Corpus,
+    strategy: Strategy,
+    document_cap: Option<usize>,
+    progress: Option<&holys3_core::ProgressSender>,
+) -> Result<BuiltIndexFiles> {
+    if let Some(document_cap) = document_cap {
+        anyhow::ensure!(document_cap > 0, "segment document cap must be positive");
+    }
+    let sources = corpus.sources();
+    let mut tables = SegmentTables {
+        sources: Vec::with_capacity(sources.len()),
+        documents: Vec::new(),
+        blocks: Vec::new(),
+    };
+    let mut pack_builder = PackBuilder::production()?;
+    let mut failed = 0usize;
+    let mut runs = Vec::new();
+    let chunks: Vec<Range<usize>> = build_chunks(sources).collect();
+    let fetch = |chunk: Range<usize>| corpus.fetch_bodies(chunk);
+    let prefetchable =
+        |chunk: &Range<usize>| chunk_encoded_bytes(sources, chunk) <= BUILD_FETCH_BYTES;
+    let mut ingest = ChunkIngest {
+        sources,
+        strategy,
+        document_cap,
+        progress,
+        tables: &mut tables,
+        pack_builder: &mut pack_builder,
+        failed: &mut failed,
+        runs: &mut runs,
+    };
+    drive_prefetched(&chunks, &prefetchable, &fetch, &mut |chunk, fetched| {
+        ingest.ingest(chunk, fetched)
     })?;
     if failed > 0 {
         eprintln!(
