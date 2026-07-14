@@ -33,7 +33,8 @@ const SPARSE_RUN_BYTES: usize = 16 * 1024 * 1024;
 
 /// Drives chunk processing with one chunk of prefetch: while `process` works
 /// on chunk N, chunk N+1's `fetch` runs on a scoped thread — but only when
-/// `prefetchable` allows it, so in-flight bytes stay bounded. Errors from a
+/// `prefetchable` allows both chunks, so an over-budget chunk is never in
+/// flight alongside another and in-flight bytes stay bounded. Errors from a
 /// prefetched fetch surface when its chunk is reached.
 pub(super) fn drive_prefetched<T: Send>(
     chunks: &[Range<usize>],
@@ -51,7 +52,10 @@ pub(super) fn drive_prefetched<T: Send>(
                 None => fetch(chunk.clone())?,
             };
             if let Some(next) = chunks.get(index + 1) {
-                if prefetchable(next) {
+                // An over-budget current chunk is fully buffered here (it was
+                // fetched synchronously), so starting the next fetch would
+                // double-buffer it with the next chunk.
+                if prefetchable(chunk) && prefetchable(next) {
                     let next = next.clone();
                     // catch_unwind keeps a panicking fetch from reaching the
                     // scope's automatic join, which would clobber an error
@@ -742,6 +746,35 @@ mod tests {
             in_process.store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         })
+        .unwrap();
+    }
+
+    #[test]
+    fn drive_prefetched_holds_the_next_fetch_while_a_guarded_chunk_processes() {
+        let chunks = vec![0..1usize, 1..2, 2..3];
+        let in_guarded_process = std::sync::atomic::AtomicBool::new(false);
+        let fetch = |chunk: Range<usize>| {
+            if chunk.start == 2 {
+                assert!(
+                    !in_guarded_process.load(std::sync::atomic::Ordering::SeqCst),
+                    "nothing may be prefetched while a guarded chunk processes"
+                );
+            }
+            Ok(chunk.start)
+        };
+        drive_prefetched(
+            &chunks,
+            &|chunk| chunk.start != 1,
+            &fetch,
+            &mut |chunk, _| {
+                if chunk.start == 1 {
+                    in_guarded_process.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    in_guarded_process.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        )
         .unwrap();
     }
 
