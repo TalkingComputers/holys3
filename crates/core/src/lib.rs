@@ -4,6 +4,7 @@
 mod codec;
 mod grams;
 mod grep;
+mod progress;
 mod store;
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;
@@ -24,6 +25,7 @@ pub use grep::{
     bounded_match_len, can_search_as_document, grep_bytes, grep_bytes_fast, grep_doc,
     has_line_match, has_line_match_fast, LineEvent, LineKind, MatchOptions, SubMatch,
 };
+pub use progress::{ProgressEvent, ProgressSender};
 pub use store::{
     content_version, scan_matching_docs, BlobStore, Corpus, DocAddress, DocFetcher, IndexAddress,
     LocalBlobStore, SourceObject, StaleSource,

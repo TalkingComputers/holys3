@@ -25,7 +25,7 @@ use crate::{candidates_with, INDEX_FORMAT};
 use anyhow::{Context, Result};
 use cache::{cached_blob, cached_file, map_file};
 use compact::{maybe_compact, merge_segments};
-use holys3_core::{BlobStore, Corpus, DocAddress, IndexAddress, Strategy};
+use holys3_core::{BlobStore, Corpus, DocAddress, IndexAddress, ProgressSender, Strategy};
 use holys3_query::Query;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -167,11 +167,10 @@ fn pack_blob(hash: &str) -> String {
 }
 
 fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
-    let list: SegmentList = postcard::from_bytes(bytes)
-        .context("segments.bin unreadable; run `holys3 index` to rebuild")?;
+    let list: SegmentList = postcard::from_bytes(bytes).context("segments.bin unreadable")?;
     anyhow::ensure!(
         list.format == INDEX_FORMAT,
-        "index format {} is not the current {INDEX_FORMAT}; run `holys3 index` to rebuild",
+        "index format {} is not the current {INDEX_FORMAT}",
         list.format
     );
     list.source.validate()?;
@@ -289,10 +288,11 @@ pub struct UpdateReport {
     pub up_to_date: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct UpdateOptions {
     pub rebuild: bool,
     pub purge_deleted: bool,
+    pub progress: Option<ProgressSender>,
 }
 
 #[derive(Debug)]
@@ -325,6 +325,7 @@ pub fn update_index(
     let UpdateOptions {
         rebuild,
         purge_deleted,
+        ref progress,
     } = options;
     source.validate()?;
     let mut listing_keys = std::collections::HashSet::with_capacity(listing.len());
@@ -458,6 +459,12 @@ pub fn update_index(
     }
     let added = to_add.len();
     let removed = newly_dead.len();
+    if let Some(progress) = progress {
+        progress.emit(holys3_core::ProgressEvent::DiffComputed {
+            to_add: added as u64,
+            to_remove: removed as u64,
+        });
+    }
 
     let mut metas = existing;
     let mut changed_dead = vec![false; metas.len()];
@@ -504,7 +511,14 @@ pub fn update_index(
 
     // Build the new segment(s) over the changes, capped.
     for shard in to_add.chunks(SEGMENT_DOC_CAP) {
-        for meta in write_bounded_segments(store, strategy, shard, SEGMENT_DOC_CAP, make_corpus)? {
+        for meta in write_bounded_segments(
+            store,
+            strategy,
+            shard,
+            SEGMENT_DOC_CAP,
+            make_corpus,
+            progress.as_ref(),
+        )? {
             // newborns are GC candidates too: a segment born and compacted away
             // in the SAME run would otherwise be in neither before nor after
             replaced.push(meta.clone());
@@ -683,8 +697,9 @@ fn build_segment_files(
     strategy: Strategy,
     docs: &[(String, String, u64)],
     document_cap: usize,
+    progress: Option<&ProgressSender>,
 ) -> Result<crate::BuiltIndexFiles> {
-    let mut built = crate::build_index_files(corpus, strategy, Some(document_cap))?;
+    let mut built = crate::build_index_files(corpus, strategy, Some(document_cap), progress)?;
     anyhow::ensure!(
         built.tables.sources.len() == docs.len(),
         "corpus source count differs from its listing"
@@ -706,11 +721,12 @@ fn write_bounded_segments(
     docs: &[(String, String, u64)],
     doc_cap: usize,
     make_corpus: &CorpusFactory<'_>,
+    progress: Option<&ProgressSender>,
 ) -> Result<Vec<SegmentMeta>> {
     anyhow::ensure!(doc_cap > 0, "segment document cap must be greater than 0");
     anyhow::ensure!(!docs.is_empty(), "refusing to build an empty segment shard");
     let corpus = make_corpus(docs)?;
-    match build_segment_files(corpus.as_ref(), strategy, docs, doc_cap) {
+    match build_segment_files(corpus.as_ref(), strategy, docs, doc_cap, progress) {
         Ok(built) => {
             let meta = put_segment_files(
                 store,
@@ -730,14 +746,21 @@ fn write_bounded_segments(
         docs[0].0
     );
     let split = docs.len() / 2;
-    let mut segments =
-        write_bounded_segments(store, strategy, &docs[..split], doc_cap, make_corpus)?;
+    let mut segments = write_bounded_segments(
+        store,
+        strategy,
+        &docs[..split],
+        doc_cap,
+        make_corpus,
+        progress,
+    )?;
     segments.extend(write_bounded_segments(
         store,
         strategy,
         &docs[split..],
         doc_cap,
         make_corpus,
+        progress,
     )?);
     Ok(segments)
 }
@@ -852,7 +875,8 @@ impl SegmentedReader {
             .get_versioned("segments.bin")
             .context("reading segments.bin")?
             .context("no index found — run `holys3 index` first")?;
-        let list = parse_segment_list(&bytes)?;
+        let list = parse_segment_list(&bytes)
+            .context("index is not usable as-is; run `holys3 index` to rebuild")?;
         if let Some(source) = source {
             anyhow::ensure!(
                 list.source.can_search(source),
@@ -1250,6 +1274,30 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_root_advises_reindex_only_on_the_search_path() {
+        let parse_error = match parse_segment_list(b"garbage") {
+            Ok(_) => panic!("garbage must not parse"),
+            Err(error) => error,
+        };
+        assert!(
+            !format!("{parse_error:#}").contains("run `holys3 index`"),
+            "index-path notes embed this message next to 'rebuilding from scratch', so remediation advice would contradict: {parse_error:#}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = holys3_core::LocalBlobStore::new(dir.path());
+        store.put("segments.bin", b"garbage").unwrap();
+        let open_error = match SegmentedReader::inspect(Box::new(store), dir.path()) {
+            Ok(_) => panic!("corrupt root must not open"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{open_error:#}").contains("run `holys3 index` to rebuild"),
+            "{open_error:#}"
+        );
+    }
+
+    #[test]
     fn segment_list_rejects_unsafe_and_inconsistent_metadata() {
         parse_segment_list(&encoded(vec![segment()])).unwrap();
 
@@ -1544,7 +1592,7 @@ mod tests {
             )))
         };
         let segments =
-            write_bounded_segments(&store, Strategy::Trigram, &docs, 2, &factory).unwrap();
+            write_bounded_segments(&store, Strategy::Trigram, &docs, 2, &factory, None).unwrap();
         assert_eq!(
             segments
                 .iter()
@@ -1572,7 +1620,7 @@ mod tests {
                 vec![body.clone()],
             )))
         };
-        let error = write_bounded_segments(&store, Strategy::Trigram, &docs, 2, &factory)
+        let error = write_bounded_segments(&store, Strategy::Trigram, &docs, 2, &factory, None)
             .err()
             .expect("one source exceeds the cap");
         assert!(error.to_string().contains("segment cap of 2"), "{error:#}");

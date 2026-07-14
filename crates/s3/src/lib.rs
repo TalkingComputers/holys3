@@ -72,6 +72,7 @@ pub struct S3BlobStore {
     client: S3Client,
     bucket: String,
     root: String,
+    progress: Option<holys3_core::ProgressSender>,
 }
 
 impl S3BlobStore {
@@ -84,7 +85,12 @@ impl S3BlobStore {
             client,
             bucket,
             root: root.trim_matches('/').to_owned(),
+            progress: None,
         }
+    }
+
+    pub fn set_progress(&mut self, progress: holys3_core::ProgressSender) {
+        self.progress = Some(progress);
     }
 
     fn build_key(&self, name: &str) -> String {
@@ -107,12 +113,21 @@ impl S3BlobStore {
 
 impl BlobStore for S3BlobStore {
     fn put(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
-        self.client.put(&self.bucket, &self.build_key(name), bytes)
+        self.client.put_with_progress(
+            &self.bucket,
+            &self.build_key(name),
+            bytes,
+            self.progress.as_ref(),
+        )
     }
 
     fn put_file(&self, name: &str, path: &std::path::Path) -> anyhow::Result<()> {
-        self.client
-            .put_file(&self.bucket, &self.build_key(name), path)
+        self.client.put_file_with_progress(
+            &self.bucket,
+            &self.build_key(name),
+            path,
+            self.progress.as_ref(),
+        )
     }
 
     fn get(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
