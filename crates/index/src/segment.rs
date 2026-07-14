@@ -1125,15 +1125,18 @@ fn posting_ranges(
 /// Sparse dictionaries at or above this size open remotely: only the block
 /// index downloads, and queries fetch just the blocks their grams need.
 /// `HOLYS3_SPARSE_REMOTE_MIN` overrides the byte threshold (testing and
-/// forced-mode verification).
-fn sparse_remote_terms_min() -> u64 {
-    static MIN: OnceLock<u64> = OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("HOLYS3_SPARSE_REMOTE_MIN")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(64 * 1024 * 1024)
-    })
+/// forced-mode verification); a malformed value fails loudly.
+fn sparse_remote_terms_min() -> Result<u64> {
+    parse_remote_terms_min(std::env::var("HOLYS3_SPARSE_REMOTE_MIN").ok().as_deref())
+}
+
+fn parse_remote_terms_min(configured: Option<&str>) -> Result<u64> {
+    match configured {
+        None => Ok(64 * 1024 * 1024),
+        Some(value) => value
+            .parse()
+            .with_context(|| format!("HOLYS3_SPARSE_REMOTE_MIN is not a byte count: {value:?}")),
+    }
 }
 
 fn load_segment(
@@ -1144,7 +1147,7 @@ fn load_segment(
 ) -> Result<Segment> {
     if strategy == Strategy::Sparse
         && !meta.terms_tail_hash.is_empty()
-        && meta.terms_fst_len >= sparse_remote_terms_min()
+        && meta.terms_fst_len >= sparse_remote_terms_min()?
     {
         let index = crate::remote_terms::open_remote_index(
             store,
@@ -1327,6 +1330,17 @@ mod tests {
             segments,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn remote_terms_threshold_rejects_malformed_configuration() {
+        assert_eq!(parse_remote_terms_min(None).unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_remote_terms_min(Some("1")).unwrap(), 1);
+        let error = parse_remote_terms_min(Some("64MB")).unwrap_err();
+        assert!(
+            error.to_string().contains("HOLYS3_SPARSE_REMOTE_MIN"),
+            "{error:#}"
+        );
     }
 
     #[test]
