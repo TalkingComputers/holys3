@@ -31,6 +31,53 @@ const BUILD_FETCH_CHUNK: usize = 1280;
 const BUILD_FETCH_BYTES: u64 = 64 * 1024 * 1024;
 const SPARSE_RUN_BYTES: usize = 16 * 1024 * 1024;
 
+/// Drives chunk processing with one chunk of prefetch: while `process` works
+/// on chunk N, chunk N+1's `fetch` runs on a scoped thread — but only when
+/// `prefetchable` allows both chunks, so an over-budget chunk is never in
+/// flight alongside another and in-flight bytes stay bounded. Errors from a
+/// prefetched fetch surface when its chunk is reached.
+pub(super) fn drive_prefetched<T: Send>(
+    chunks: &[Range<usize>],
+    prefetchable: &(dyn Fn(&Range<usize>) -> bool + Sync),
+    fetch: &(dyn Fn(Range<usize>) -> Result<T> + Sync),
+    process: &mut dyn FnMut(Range<usize>, T) -> Result<()>,
+) -> Result<()> {
+    std::thread::scope(|scope| {
+        let mut pending: Option<std::thread::ScopedJoinHandle<'_, Result<T>>> = None;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let fetched = match pending.take() {
+                Some(handle) => handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("prefetch thread panicked"))??,
+                None => fetch(chunk.clone())?,
+            };
+            if let Some(next) = chunks.get(index + 1) {
+                // An over-budget current chunk is fully buffered here (it was
+                // fetched synchronously), so starting the next fetch would
+                // double-buffer it with the next chunk.
+                if prefetchable(chunk) && prefetchable(next) {
+                    let next = next.clone();
+                    // catch_unwind keeps a panicking fetch from reaching the
+                    // scope's automatic join, which would clobber an error
+                    // returned by `process` with a scope-level re-panic.
+                    pending = Some(scope.spawn(move || {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fetch(next)))
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("prefetch thread panicked")))
+                    }));
+                }
+            }
+            process(chunk.clone(), fetched)?;
+        }
+        Ok(())
+    })
+}
+
+fn chunk_encoded_bytes(sources: &[SourceObject], chunk: &Range<usize>) -> u64 {
+    sources[chunk.clone()].iter().fold(0u64, |total, source| {
+        total.saturating_add(source.encoded_size)
+    })
+}
+
 /// Greedy chunk boundaries over `docs()` positions respecting both caps; a
 /// single over-budget doc still forms its own chunk.
 pub(super) fn build_chunks(sources: &[SourceObject]) -> impl Iterator<Item = Range<usize>> + '_ {
@@ -440,9 +487,12 @@ pub(crate) fn build_index_files(
     let mut pack_builder = PackBuilder::production()?;
     let mut failed = 0usize;
     let mut runs = Vec::new();
-    for chunk in build_chunks(sources) {
+    let chunks: Vec<Range<usize>> = build_chunks(sources).collect();
+    let fetch = |chunk: Range<usize>| corpus.fetch_bodies(chunk);
+    let prefetchable =
+        |chunk: &Range<usize>| chunk_encoded_bytes(sources, chunk) <= BUILD_FETCH_BYTES;
+    drive_prefetched(&chunks, &prefetchable, &fetch, &mut |chunk, fetched| {
         let chunk_start = chunk.start;
-        let fetched = corpus.fetch_bodies(chunk.clone())?;
         let mut bodies = (0..chunk.len()).map(|_| None).collect::<Vec<_>>();
         for (idx, bytes) in fetched {
             let position = idx
@@ -578,7 +628,8 @@ pub(crate) fn build_index_files(
                 None,
             )?);
         }
-    }
+        Ok(())
+    })?;
     if failed > 0 {
         eprintln!(
             "warning: {} objects vanished or could not be decompressed and were excluded",
@@ -600,6 +651,133 @@ pub(crate) fn build_index_files(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn drive_prefetched_returns_process_error_even_when_prefetch_panics() {
+        let chunks = vec![0..1usize, 1..2];
+        let (process_failed, prefetch_gate) = std::sync::mpsc::channel();
+        let prefetch_gate = std::sync::Mutex::new(prefetch_gate);
+        let fetch = move |chunk: Range<usize>| {
+            if chunk.start == 1 {
+                let () = prefetch_gate
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("process error signal");
+                panic!("prefetch blew up");
+            }
+            Ok(chunk.start)
+        };
+        let error = drive_prefetched(&chunks, &|_| true, &fetch, &mut |_, _| {
+            process_failed.send(()).unwrap();
+            anyhow::bail!("process failed first")
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("process failed first"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn drive_prefetched_starts_next_fetch_during_processing() {
+        let chunks = vec![0..2usize, 2..4, 4..6];
+        let (fetch_started, started) = std::sync::mpsc::channel();
+        let fetch = move |chunk: Range<usize>| {
+            fetch_started.send(chunk.start).unwrap();
+            Ok(chunk.start)
+        };
+        let mut seen = Vec::new();
+        drive_prefetched(&chunks, &|_| true, &fetch, &mut |chunk, fetched: usize| {
+            assert_eq!(chunk.start, fetched);
+            if chunk.start == 0 {
+                let own = started
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("own fetch signal");
+                assert_eq!(own, 0);
+            }
+            if chunk.start < 4 {
+                let next = started
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("next chunk's fetch must start while this chunk processes");
+                assert_eq!(next, chunk.start + 2);
+            }
+            seen.push(chunk.start);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, [0, 2, 4]);
+    }
+
+    #[test]
+    fn drive_prefetched_surfaces_prefetch_errors_in_chunk_order() {
+        let chunks = vec![0..1usize, 1..2, 2..3];
+        let fetch = |chunk: Range<usize>| {
+            if chunk.start == 1 {
+                anyhow::bail!("fetch of chunk 1 failed");
+            }
+            Ok(chunk.start)
+        };
+        let mut processed = Vec::new();
+        let error = drive_prefetched(&chunks, &|_| true, &fetch, &mut |chunk, _| {
+            processed.push(chunk.start);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("chunk 1 failed"), "{error:#}");
+        assert_eq!(processed, [0]);
+    }
+
+    #[test]
+    fn drive_prefetched_respects_the_prefetch_guard() {
+        let chunks = vec![0..1usize, 1..2];
+        let in_process = std::sync::atomic::AtomicBool::new(false);
+        let fetch = |chunk: Range<usize>| {
+            if chunk.start == 1 {
+                assert!(
+                    !in_process.load(std::sync::atomic::Ordering::SeqCst),
+                    "guarded chunk must not be prefetched during processing"
+                );
+            }
+            Ok(chunk.start)
+        };
+        drive_prefetched(&chunks, &|chunk| chunk.start == 0, &fetch, &mut |_, _| {
+            in_process.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            in_process.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn drive_prefetched_holds_the_next_fetch_while_a_guarded_chunk_processes() {
+        let chunks = vec![0..1usize, 1..2, 2..3];
+        let in_guarded_process = std::sync::atomic::AtomicBool::new(false);
+        let fetch = |chunk: Range<usize>| {
+            if chunk.start == 2 {
+                assert!(
+                    !in_guarded_process.load(std::sync::atomic::Ordering::SeqCst),
+                    "nothing may be prefetched while a guarded chunk processes"
+                );
+            }
+            Ok(chunk.start)
+        };
+        drive_prefetched(
+            &chunks,
+            &|chunk| chunk.start != 1,
+            &fetch,
+            &mut |chunk, _| {
+                if chunk.start == 1 {
+                    in_guarded_process.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    in_guarded_process.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
     use super::*;
 
     #[test]
