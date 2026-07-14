@@ -9,10 +9,6 @@ use holys3_core::{hash_ngram, BlobStore};
 use holys3_query::Query;
 use sha2::{Digest, Sha256};
 
-/// Generous first guess for the index+footer tail; a second exact fetch
-/// covers tables whose block index outgrows it.
-const TAIL_GUESS_BYTES: u64 = 16 * 1024 * 1024;
-
 pub(crate) fn open_remote_index(
     store: &dyn BlobStore,
     blob: &str,
@@ -23,13 +19,11 @@ pub(crate) fn open_remote_index(
         terms_len > FOOTER_BYTES as u64,
         "sparse term table is too short for its footer"
     );
-    let guess = TAIL_GUESS_BYTES.min(terms_len);
-    let mut tail = store.get_range(blob, terms_len - guess, guess)?;
+    let footer = store.get_range(blob, terms_len - FOOTER_BYTES as u64, FOOTER_BYTES as u64)?;
     anyhow::ensure!(
-        tail.len() >= FOOTER_BYTES,
-        "sparse term table tail response is too short"
+        footer.len() == FOOTER_BYTES,
+        "sparse term table footer response is too short"
     );
-    let footer = &tail[tail.len() - FOOTER_BYTES..];
     let index_offset = u64::from_le_bytes(
         footer[16..24]
             .try_into()
@@ -40,12 +34,11 @@ pub(crate) fn open_remote_index(
         "sparse table index offset is out of bounds"
     );
     let tail_len = terms_len - index_offset;
-    if tail_len > tail.len() as u64 {
-        tail = store.get_range(blob, index_offset, tail_len)?;
-    } else {
-        let skip = tail.len() - usize::try_from(tail_len)?;
-        tail.drain(..skip);
-    }
+    let tail = store.get_range(blob, index_offset, tail_len)?;
+    anyhow::ensure!(
+        tail.len() as u64 == tail_len,
+        "sparse term table tail response is truncated"
+    );
     let actual = hex(&<[u8; 32]>::from(Sha256::digest(&tail)));
     anyhow::ensure!(
         actual == expected_tail_hash,
@@ -132,6 +125,7 @@ mod tests {
         inner: LocalBlobStore,
         get_ranges_calls: AtomicUsize,
         get_range_calls: AtomicUsize,
+        max_get_range_len: AtomicUsize,
     }
 
     impl BlobStore for CountingStore {
@@ -149,6 +143,8 @@ mod tests {
 
         fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
             self.get_range_calls.fetch_add(1, Ordering::Relaxed);
+            self.max_get_range_len
+                .fetch_max(usize::try_from(len).unwrap(), Ordering::Relaxed);
             self.inner.get_range(name, start, len)
         }
 
@@ -202,6 +198,7 @@ mod tests {
             inner: LocalBlobStore::new(dir.path()),
             get_ranges_calls: AtomicUsize::new(0),
             get_range_calls: AtomicUsize::new(0),
+            max_get_range_len: AtomicUsize::new(0),
         };
         store.put("terms.fst", &bytes).unwrap();
         (dir, store, bytes.len() as u64, tail_hash, pairs)
@@ -214,6 +211,11 @@ mod tests {
         assert_eq!(index.entry_count, pairs.len() as u64);
         assert!(store.get_range_calls.load(Ordering::Relaxed) <= 2);
         assert_eq!(store.get_ranges_calls.load(Ordering::Relaxed), 0);
+        let index_bytes = index.blocks.len() * (8 + 8 + 32) + FOOTER_BYTES;
+        assert!(
+            store.max_get_range_len.load(Ordering::Relaxed) <= index_bytes,
+            "open must never fetch more than the index tail"
+        );
         let wrong = hex(&[0u8; 32]);
         let error = open_remote_index(&store, "terms.fst", len, &wrong).unwrap_err();
         assert!(error.to_string().contains("tail"), "{error:#}");
