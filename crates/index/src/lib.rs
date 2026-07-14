@@ -7,6 +7,7 @@ mod format;
 mod pack;
 mod search;
 mod segment;
+mod sparse_table;
 mod terms;
 
 pub use search::{
