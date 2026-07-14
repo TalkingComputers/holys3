@@ -3,7 +3,7 @@
 //! query fetches exactly the blocks its grams bisect into, in one ranged
 //! read, verified against the per-block hashes from that trusted index.
 
-use crate::sparse_table::{lookup_in_block, SparseTableIndex, FOOTER_BYTES};
+use crate::sparse_table::{hex, lookup_in_block, SparseTableIndex, FOOTER_BYTES};
 use anyhow::{Context, Result};
 use holys3_core::{hash_ngram, BlobStore};
 use holys3_query::Query;
@@ -48,10 +48,6 @@ pub(crate) fn open_remote_index(
         "sparse term table tail hash mismatch: index is not trustworthy"
     );
     SparseTableIndex::parse(terms_len, &tail)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Resolve every gram the query can ask about in one ranged read of the
@@ -205,10 +201,6 @@ mod tests {
         };
         store.put("terms.fst", &bytes).unwrap();
         (dir, store, bytes.len() as u64, tail_hash, pairs)
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     #[test]

@@ -8,6 +8,10 @@ use sha2::Digest;
 use std::io::Write;
 
 pub(crate) const SPARSE_TABLE_MAGIC: &[u8; 8] = b"H3SPARSE";
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 pub(crate) const ENTRY_BYTES: usize = 16;
 pub(crate) const BLOCK_ENTRIES: usize = 8192;
 pub(crate) const BLOCK_BYTES: usize = ENTRY_BYTES * BLOCK_ENTRIES;
@@ -283,12 +287,7 @@ pub(crate) fn tail_hash_of(path: &std::path::Path) -> Result<Option<String>> {
         }
         hasher.update(&chunk[..read]);
     }
-    Ok(Some(
-        <[u8; 32]>::from(hasher.finalize())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-    ))
+    Ok(Some(hex(&<[u8; 32]>::from(hasher.finalize()))))
 }
 
 #[cfg(test)]
