@@ -171,6 +171,11 @@ pub(crate) enum TermMap {
         index: crate::sparse_table::SparseTableIndex,
         bytes: memmap2::Mmap,
     },
+    /// Large sparse dictionary accessed by ranged reads: only the block
+    /// index is resident; lookups are resolved per query by the reader.
+    SparseRemote {
+        index: crate::sparse_table::SparseTableIndex,
+    },
     Trigram(Vec<fst::Map<Bytes>>),
 }
 
@@ -229,6 +234,9 @@ impl TermMap {
                     .ok()
                     .flatten()
             }
+            Self::SparseRemote { .. } => {
+                unreachable!("remote sparse lookups are resolved by the reader per query")
+            }
             Self::Trigram(maps) if gram.len() == 3 => maps[usize::from(gram[0])].get(&gram[1..]),
             Self::Trigram(_) => None,
         }
@@ -237,7 +245,9 @@ impl TermMap {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Single(map) => map.len(),
-            Self::Sparse { index, .. } => usize::try_from(index.entry_count).expect("fits usize"),
+            Self::Sparse { index, .. } | Self::SparseRemote { index } => {
+                usize::try_from(index.entry_count).expect("fits usize")
+            }
             Self::Trigram(maps) => maps.iter().map(fst::Map::len).sum(),
         }
     }
@@ -249,6 +259,9 @@ impl TermMap {
                 while let Some((gram, value)) = stream.next() {
                     visit(gram, value)?;
                 }
+            }
+            Self::SparseRemote { .. } => {
+                anyhow::bail!("remote sparse dictionaries do not support iteration")
             }
             Self::Sparse { index, bytes } => {
                 for block in &index.blocks {

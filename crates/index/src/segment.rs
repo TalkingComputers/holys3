@@ -53,6 +53,9 @@ pub(crate) struct SegmentMeta {
     pub doc_count: u32,
     pub terms_fst_len: u64,
     pub terms_fst_hash: String,
+    /// SHA-256 of the sparse table's index+footer tail; empty for trigram.
+    /// Lets remote readers trust a ranged fetch of just the block index.
+    pub terms_tail_hash: String,
     pub postings_len: u64,
     pub postings_hash: String,
     pub docs_len: u64,
@@ -185,6 +188,10 @@ fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
                 && is_sha256(&segment.postings_hash)
                 && is_sha256(&segment.docs_hash),
             "segment blob hash is not a SHA-256 hash"
+        );
+        anyhow::ensure!(
+            segment.terms_tail_hash.is_empty() || is_sha256(&segment.terms_tail_hash),
+            "segment term tail hash is invalid"
         );
         anyhow::ensure!(
             segment_ids.insert(segment.seg_id.as_str()),
@@ -816,11 +823,13 @@ fn put_segment_files(
     store.put_file(&segment_blob(&seg_id, "terms.fst"), fst.path())?;
     store.put_file(&segment_blob(&seg_id, "postings.bin"), postings.path())?;
     store.put(&segment_blob(&seg_id, "docs.bin"), &docs_bytes)?;
+    let terms_tail_hash = crate::sparse_table::tail_hash_of(fst.path())?.unwrap_or_default();
     let meta = SegmentMeta {
         seg_id,
         doc_count: u32::try_from(tables.documents.len())?,
         terms_fst_len: fst.len(),
         terms_fst_hash,
+        terms_tail_hash,
         postings_len: postings.len(),
         postings_hash,
         docs_len: docs_bytes.len() as u64,
@@ -996,8 +1005,23 @@ impl SegmentedReader {
                 }
             }
             let postings_name = segment_blob(&segment.meta.seg_id, "postings.bin");
+            let remote_values = match &segment.map {
+                TermMap::SparseRemote { index } => {
+                    Some(crate::remote_terms::fetch_query_gram_values(
+                        self.store.as_ref(),
+                        &segment_blob(&segment.meta.seg_id, "terms.fst"),
+                        index,
+                        q,
+                    )?)
+                }
+                _ => None,
+            };
+            let lookup = |gram: &[u8]| match &remote_values {
+                Some(values) => values.get(&holys3_core::hash_ngram(gram)).copied(),
+                None => segment.map.get(gram),
+            };
             let ids = self.classify_index_result(candidates_with(
-                |gram| segment.map.get(gram),
+                lookup,
                 segment.meta.doc_count,
                 q,
                 |needed| {
@@ -1098,12 +1122,43 @@ fn posting_ranges(
         .collect()
 }
 
+/// Sparse dictionaries at or above this size open remotely: only the block
+/// index downloads, and queries fetch just the blocks their grams need.
+/// `HOLYS3_SPARSE_REMOTE_MIN` overrides the byte threshold (testing and
+/// forced-mode verification).
+fn sparse_remote_terms_min() -> u64 {
+    static MIN: OnceLock<u64> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("HOLYS3_SPARSE_REMOTE_MIN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(64 * 1024 * 1024)
+    })
+}
+
 fn load_segment(
     store: &dyn BlobStore,
     cache_dir: &Path,
     meta: &SegmentMeta,
     strategy: Strategy,
 ) -> Result<Segment> {
+    if strategy == Strategy::Sparse
+        && !meta.terms_tail_hash.is_empty()
+        && meta.terms_fst_len >= sparse_remote_terms_min()
+    {
+        let index = crate::remote_terms::open_remote_index(
+            store,
+            &segment_blob(&meta.seg_id, "terms.fst"),
+            meta.terms_fst_len,
+            &meta.terms_tail_hash,
+        )?;
+        return Ok(Segment {
+            map: TermMap::SparseRemote { index },
+            dead: load_dead(store, cache_dir, meta)?,
+            tables: OnceLock::new(),
+            meta: meta.clone(),
+        });
+    }
     let path = cached_file(
         store,
         cache_dir,
@@ -1248,6 +1303,7 @@ mod tests {
             doc_count: 1,
             terms_fst_len: 1,
             terms_fst_hash: "b".repeat(64),
+            terms_tail_hash: String::new(),
             postings_len: 1,
             postings_hash: "c".repeat(64),
             docs_len: 1,

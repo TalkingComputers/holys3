@@ -5,6 +5,7 @@ mod build;
 mod eval;
 mod format;
 mod pack;
+mod remote_terms;
 mod search;
 mod segment;
 mod sparse_table;

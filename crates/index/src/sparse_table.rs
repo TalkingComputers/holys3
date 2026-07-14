@@ -12,7 +12,7 @@ pub(crate) const ENTRY_BYTES: usize = 16;
 pub(crate) const BLOCK_ENTRIES: usize = 8192;
 pub(crate) const BLOCK_BYTES: usize = ENTRY_BYTES * BLOCK_ENTRIES;
 const INDEX_ENTRY_BYTES: usize = 8 + 8 + 32;
-const FOOTER_BYTES: usize = 8 + 8 + 8 + 8;
+pub(crate) const FOOTER_BYTES: usize = 8 + 8 + 8 + 8;
 
 /// Writes a sparse term table from ascending unique (hash, value) inserts.
 pub(crate) struct SparseTableWriter<W: Write> {
@@ -93,11 +93,13 @@ impl<W: Write> SparseTableWriter<W> {
 
 /// Parsed index + footer of a sparse term table; entry blocks are accessed
 /// separately (mmap slice or verified ranged read).
+#[derive(Debug)]
 pub(crate) struct SparseTableIndex {
     pub(crate) entry_count: u64,
     pub(crate) blocks: Vec<SparseBlockRef>,
 }
 
+#[derive(Debug)]
 pub(crate) struct SparseBlockRef {
     pub(crate) first_hash: u64,
     pub(crate) offset: u64,
@@ -238,6 +240,55 @@ pub(crate) fn lookup_in_block(block: &[u8], hash: u64) -> Result<Option<u64>> {
         }
     }
     Ok(None)
+}
+
+/// SHA-256 of a finished table file's index+footer tail, or None when the
+/// file is not a sparse table (trigram dictionaries keep an empty hash).
+pub(crate) fn tail_hash_of(path: &std::path::Path) -> Result<Option<String>> {
+    use sha2::Sha256;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut magic = [0u8; SPARSE_TABLE_MAGIC.len()];
+    if len < (SPARSE_TABLE_MAGIC.len() + FOOTER_BYTES) as u64 {
+        return Ok(None);
+    }
+    file.read_exact(&mut magic)?;
+    if &magic != SPARSE_TABLE_MAGIC {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::End(-(FOOTER_BYTES as i64)))?;
+    let mut footer = [0u8; FOOTER_BYTES];
+    file.read_exact(&mut footer)?;
+    anyhow::ensure!(
+        &footer[24..32] == SPARSE_TABLE_MAGIC,
+        "sparse table footer magic mismatch"
+    );
+    let index_offset = u64::from_le_bytes(
+        footer[16..24]
+            .try_into()
+            .context("sparse table footer is malformed")?,
+    );
+    anyhow::ensure!(
+        index_offset < len,
+        "sparse table index offset is out of bounds"
+    );
+    file.seek(SeekFrom::Start(index_offset))?;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    Ok(Some(
+        <[u8; 32]>::from(hasher.finalize())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
