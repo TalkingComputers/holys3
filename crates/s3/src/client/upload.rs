@@ -8,6 +8,7 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_types::byte_stream::Length;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
+use holys3_core::{ProgressEvent, ProgressSender};
 use std::path::{Path, PathBuf};
 
 const FILE_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
@@ -42,28 +43,75 @@ impl PartSource {
 
 impl S3Client {
     pub fn put(&self, bucket: &str, key: &str, body: &[u8]) -> Result<()> {
-        self.0.rt.block_on(self.put_async(bucket, key, body))
+        self.put_with_progress(bucket, key, body, None)
     }
 
-    pub fn put_file(&self, bucket: &str, key: &str, path: &Path) -> Result<()> {
-        let len = std::fs::metadata(path)?.len();
-        if len <= MULTIPART_PART_SIZE as u64 {
-            return self.put(bucket, key, &std::fs::read(path)?);
+    pub fn put_with_progress(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        progress: Option<&ProgressSender>,
+    ) -> Result<()> {
+        if let Some(progress) = progress {
+            progress.emit(ProgressEvent::UploadStarted {
+                bytes: body.len() as u64,
+            });
         }
         self.0
             .rt
-            .block_on(self.put_file_multipart(bucket, key, path, len))
+            .block_on(self.put_async(bucket, key, body, progress))
     }
 
-    pub(super) async fn put_async(&self, bucket: &str, key: &str, body: &[u8]) -> Result<()> {
-        if body.len() > MULTIPART_PART_SIZE {
-            return self.put_multipart(bucket, key, body).await;
+    pub fn put_file(&self, bucket: &str, key: &str, path: &Path) -> Result<()> {
+        self.put_file_with_progress(bucket, key, path, None)
+    }
+
+    pub fn put_file_with_progress(
+        &self,
+        bucket: &str,
+        key: &str,
+        path: &Path,
+        progress: Option<&ProgressSender>,
+    ) -> Result<()> {
+        let len = std::fs::metadata(path)?.len();
+        if let Some(progress) = progress {
+            progress.emit(ProgressEvent::UploadStarted { bytes: len });
         }
-        self.put_bytes(bucket, key, Bytes::copy_from_slice(body))
+        if len <= MULTIPART_PART_SIZE as u64 {
+            return self.0.rt.block_on(self.put_async(
+                bucket,
+                key,
+                &std::fs::read(path)?,
+                progress,
+            ));
+        }
+        self.0
+            .rt
+            .block_on(self.put_file_multipart(bucket, key, path, len, progress))
+    }
+
+    pub(super) async fn put_async(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        progress: Option<&ProgressSender>,
+    ) -> Result<()> {
+        if body.len() > MULTIPART_PART_SIZE {
+            return self.put_multipart(bucket, key, body, progress).await;
+        }
+        self.put_bytes(bucket, key, Bytes::copy_from_slice(body), progress)
             .await
     }
 
-    async fn put_bytes(&self, bucket: &str, key: &str, body: Bytes) -> Result<()> {
+    async fn put_bytes(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Bytes,
+        progress: Option<&ProgressSender>,
+    ) -> Result<()> {
         let label = format!("PUT s3://{bucket}/{key}");
         let body_len = body.len();
         self.run_resilient(&label, None, || {
@@ -84,14 +132,25 @@ impl S3Client {
         })
         .await?
         .with_context(|| format!("{label}: bucket not found"))?;
+        if let Some(progress) = progress {
+            progress.emit(ProgressEvent::UploadedChunk {
+                bytes: body_len as u64,
+            });
+        }
         Ok(())
     }
 
-    async fn put_multipart(&self, bucket: &str, key: &str, body: &[u8]) -> Result<()> {
+    async fn put_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        progress: Option<&ProgressSender>,
+    ) -> Result<()> {
         let part_size = multipart_part_size(u64::try_from(body.len())?)?;
         let upload_id = self.start_multipart(bucket, key).await?;
         let parts = self
-            .upload_parts(bucket, key, &upload_id, body, part_size)
+            .upload_parts(bucket, key, &upload_id, body, part_size, progress)
             .await;
         let parts = match parts {
             Ok(parts) => parts,
@@ -109,11 +168,12 @@ impl S3Client {
         key: &str,
         path: &Path,
         len: u64,
+        progress: Option<&ProgressSender>,
     ) -> Result<()> {
         let part_size = multipart_part_size(len)?;
         let upload_id = self.start_multipart(bucket, key).await?;
         let parts = self
-            .upload_file_parts(bucket, key, &upload_id, path, len, part_size)
+            .upload_file_parts(bucket, key, &upload_id, path, len, part_size, progress)
             .await;
         let parts = match parts {
             Ok(parts) => parts,
@@ -192,18 +252,26 @@ impl S3Client {
         upload_id: &str,
         body: &[u8],
         part_size: usize,
+        progress: Option<&ProgressSender>,
     ) -> Result<Vec<CompletedPart>> {
         let mut uploads = stream::iter(body.chunks(part_size).enumerate().map(
             |(index, chunk)| async move {
                 let number = i32::try_from(index + 1)?;
-                self.upload_part(
-                    bucket,
-                    key,
-                    upload_id,
-                    number,
-                    PartSource::Bytes(Bytes::copy_from_slice(chunk)),
-                )
-                .await
+                let part = self
+                    .upload_part(
+                        bucket,
+                        key,
+                        upload_id,
+                        number,
+                        PartSource::Bytes(Bytes::copy_from_slice(chunk)),
+                    )
+                    .await?;
+                if let Some(progress) = progress {
+                    progress.emit(ProgressEvent::UploadedChunk {
+                        bytes: chunk.len() as u64,
+                    });
+                }
+                anyhow::Ok(part)
             },
         ))
         .buffer_unordered(multipart_concurrency(part_size));
@@ -215,6 +283,7 @@ impl S3Client {
         Ok(parts)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn upload_file_parts(
         &self,
         bucket: &str,
@@ -223,6 +292,7 @@ impl S3Client {
         path: &Path,
         len: u64,
         part_size: usize,
+        progress: Option<&ProgressSender>,
     ) -> Result<Vec<CompletedPart>> {
         let part_len = part_size as u64;
         let part_count = len.div_ceil(part_len);
@@ -231,18 +301,23 @@ impl S3Client {
             async move {
                 let start = part_index * part_len;
                 let read_len = (len - start).min(part_len);
-                self.upload_part(
-                    bucket,
-                    key,
-                    upload_id,
-                    i32::try_from(part_index + 1)?,
-                    PartSource::File {
-                        path,
-                        start,
-                        len: read_len,
-                    },
-                )
-                .await
+                let part = self
+                    .upload_part(
+                        bucket,
+                        key,
+                        upload_id,
+                        i32::try_from(part_index + 1)?,
+                        PartSource::File {
+                            path,
+                            start,
+                            len: read_len,
+                        },
+                    )
+                    .await?;
+                if let Some(progress) = progress {
+                    progress.emit(ProgressEvent::UploadedChunk { bytes: read_len });
+                }
+                anyhow::Ok(part)
             }
         }))
         .buffer_unordered(multipart_concurrency(part_size));

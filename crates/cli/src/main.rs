@@ -3,6 +3,7 @@ mod index;
 mod json;
 mod patterns;
 mod printer;
+mod progress;
 mod scope;
 
 #[global_allocator]
@@ -251,11 +252,19 @@ struct IndexStorage {
 
 impl IndexStorage {
     fn store(&self) -> Box<dyn BlobStore> {
-        Box::new(S3BlobStore::at(
-            self.client.clone(),
-            self.bucket.clone(),
-            self.root.clone(),
-        ))
+        self.store_with_progress(None)
+    }
+
+    fn store_with_progress(
+        &self,
+        progress: Option<holys3_core::ProgressSender>,
+    ) -> Box<dyn BlobStore> {
+        let mut store =
+            S3BlobStore::at(self.client.clone(), self.bucket.clone(), self.root.clone());
+        if let Some(progress) = progress {
+            store.set_progress(progress);
+        }
+        Box::new(store)
     }
 
     fn cache(&self) -> &Path {
@@ -421,10 +430,14 @@ fn build_source_identity(source: &S3Source) -> SourceIdentity {
     }
 }
 
-fn list_user_objects(src: &S3Source, index: &IndexStorage) -> Result<Vec<ObjectMeta>> {
+fn list_user_objects(
+    src: &S3Source,
+    index: &IndexStorage,
+    progress: Option<&holys3_core::ProgressSender>,
+) -> Result<Vec<ObjectMeta>> {
     Ok(src
         .client
-        .list(&src.bucket, &list_prefix(&src.prefix))?
+        .list_with_progress(&src.bucket, &list_prefix(&src.prefix), progress)?
         .into_iter()
         .filter(|object| {
             !is_index_key(&src.prefix, &object.key) && !index.contains_source_key(src, &object.key)
@@ -438,14 +451,45 @@ fn build_s3(
     strategy: Strategy,
     rebuild: bool,
     purge_deleted: bool,
+    show_progress: bool,
+) -> Result<index::IndexResult> {
+    let (progress, bar) = if show_progress {
+        let (sender, receiver) = holys3_core::ProgressSender::channel();
+        let target = format!("s3://{}/{}", src.bucket, src.prefix);
+        (
+            Some(sender),
+            Some(progress::IndexProgressBar::spawn(receiver, target)),
+        )
+    } else {
+        (None, None)
+    };
+    let result = build_s3_inner(src, index, strategy, rebuild, purge_deleted, progress);
+    if let Some(bar) = bar {
+        bar.finish();
+    }
+    result
+}
+
+fn build_s3_inner(
+    src: &S3Source,
+    index: &IndexStorage,
+    strategy: Strategy,
+    rebuild: bool,
+    purge_deleted: bool,
+    progress: Option<holys3_core::ProgressSender>,
 ) -> Result<index::IndexResult> {
     // Real sizes ride the listing so the build bounds its fetch chunks by
     // bytes, not just doc count — a bucket of huge objects must not OOM.
-    let listing = list_user_objects(src, index)?
+    let listing = list_user_objects(src, index, progress.as_ref())?
         .into_iter()
         .map(|object| (object.key, object.etag, object.size))
         .collect::<Vec<_>>();
-    let store = index.store();
+    if let Some(progress) = &progress {
+        progress.emit(holys3_core::ProgressEvent::ListingComplete {
+            objects: listing.len() as u64,
+        });
+    }
+    let store = index.store_with_progress(progress.clone());
     let source = SourceIdentity::S3 {
         endpoint: src.endpoint.clone(),
         bucket: src.bucket.clone(),
@@ -462,6 +506,7 @@ fn build_s3(
         UpdateOptions {
             rebuild,
             purge_deleted,
+            progress,
         },
         &|shard| {
             Ok(Box::new(S3Corpus::new(
@@ -691,8 +736,16 @@ fn run() -> Result<bool> {
                     return Err(error);
                 }
             };
+            let show_progress = !json && std::io::stderr().is_terminal();
             index::run_index(config, |cycle_rebuild| {
-                build_s3(&source, &storage, strategy, cycle_rebuild, purge_deleted)
+                build_s3(
+                    &source,
+                    &storage,
+                    strategy,
+                    cycle_rebuild,
+                    purge_deleted,
+                    show_progress,
+                )
             })?;
             Ok(true)
         }

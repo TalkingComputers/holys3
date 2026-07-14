@@ -79,6 +79,102 @@ fn reindex(bucket: &Bucket, store_dir: &Path, cache_dir: &Path, strategy: Strate
     Ok(())
 }
 
+#[test]
+fn update_index_reports_progress_events() -> Result<()> {
+    use holys3_core::{ProgressEvent, ProgressSender};
+    let mut bucket = Bucket::default();
+    bucket.put("a.log", b"alpha needle line\n");
+    bucket.put("b.log", b"beta line two\n");
+    bucket.put("c.log", b"gamma line three\n");
+    let total_body_bytes: u64 = bucket.objects.values().map(|body| body.len() as u64).sum();
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let (progress, receiver) = ProgressSender::channel();
+    let store = LocalBlobStore::with_progress(store_dir.path(), progress.clone());
+    let listing = bucket.listing();
+    let report = update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Strategy::Trigram,
+        &listing,
+        UpdateOptions {
+            progress: Some(progress),
+            ..Default::default()
+        },
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    assert_eq!(report.added, 3);
+    drop(store);
+    let events: Vec<ProgressEvent> = receiver.iter().collect();
+
+    let diffs: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event, ProgressEvent::DiffComputed { .. }))
+        .collect();
+    assert_eq!(
+        diffs,
+        [&ProgressEvent::DiffComputed {
+            to_add: 3,
+            to_remove: 0
+        }]
+    );
+
+    let ingested: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProgressEvent::SourceIngested { decoded_bytes } => Some(*decoded_bytes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ingested.len(), 3, "{events:?}");
+    assert_eq!(ingested.iter().sum::<u64>(), total_body_bytes);
+
+    let started: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProgressEvent::UploadStarted { bytes } => Some(*bytes),
+            _ => None,
+        })
+        .collect();
+    let chunks: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProgressEvent::UploadedChunk { bytes } => Some(*bytes),
+            _ => None,
+        })
+        .collect();
+    assert!(started.len() >= 4, "{events:?}");
+    assert_eq!(started.iter().sum::<u64>(), chunks.iter().sum::<u64>());
+    Ok(())
+}
+
+#[test]
+fn progress_receiver_drop_does_not_affect_indexing() -> Result<()> {
+    use holys3_core::ProgressSender;
+    let mut bucket = Bucket::default();
+    bucket.put("a.log", b"alpha needle line\n");
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let (progress, receiver) = ProgressSender::channel();
+    drop(receiver);
+    let store = LocalBlobStore::with_progress(store_dir.path(), progress.clone());
+    let report = update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Strategy::Trigram,
+        &bucket.listing(),
+        UpdateOptions {
+            progress: Some(progress),
+            ..Default::default()
+        },
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    assert_eq!(report.added, 1);
+    Ok(())
+}
+
 struct RangeCountingStore {
     inner: LocalBlobStore,
     pack_reads: std::cell::Cell<usize>,
@@ -873,7 +969,7 @@ fn rebuild_flag_reingests_from_scratch() -> Result<()> {
         &listing,
         UpdateOptions {
             rebuild: true,
-            purge_deleted: false,
+            ..Default::default()
         },
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
@@ -948,7 +1044,7 @@ fn unreferenced_segment_blobs_are_garbage_collected() -> Result<()> {
         &listing,
         UpdateOptions {
             rebuild: true,
-            purge_deleted: false,
+            ..Default::default()
         },
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
@@ -1397,8 +1493,8 @@ fn tombstones_bound_update_work_and_purge_physically() -> Result<()> {
         Strategy::Trigram,
         &bucket.listing(),
         UpdateOptions {
-            rebuild: false,
             purge_deleted: true,
+            ..Default::default()
         },
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
@@ -1488,8 +1584,8 @@ fn repack_coalesces_pack_reads_across_sources() -> Result<()> {
         Strategy::Trigram,
         &bucket.listing(),
         UpdateOptions {
-            rebuild: false,
             purge_deleted: true,
+            ..Default::default()
         },
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
