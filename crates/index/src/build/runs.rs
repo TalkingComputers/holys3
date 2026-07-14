@@ -105,8 +105,7 @@ pub(crate) fn collect_file_trigrams(file: &mut File, start: u64, len: u64) -> Re
 
 struct SparseRunWriter {
     id: DocId,
-    entries: rapidhash::RapidHashSet<Vec<u8>>,
-    bytes: usize,
+    entries: rapidhash::RapidHashSet<u64>,
     run_bytes: usize,
     runs: Vec<TempPath>,
 }
@@ -117,8 +116,6 @@ struct SparseFileReader {
     len: usize,
     chunk_start: usize,
     chunk: Vec<u8>,
-    left: Vec<u8>,
-    right: Vec<u8>,
 }
 
 impl SparseFileReader {
@@ -141,8 +138,6 @@ impl SparseFileReader {
             len: usize::try_from(len)?,
             chunk_start: 0,
             chunk: Vec::new(),
-            left: vec![0; 64 * 1024],
-            right: vec![0; 64 * 1024],
         })
     }
 
@@ -195,60 +190,6 @@ impl SparseFileReader {
         self.file.read_exact(bytes)?;
         Ok(())
     }
-
-    fn has_equal_bytes(&mut self, left: &Range<usize>, right: &Range<usize>) -> Result<bool> {
-        anyhow::ensure!(
-            left.end <= self.len && right.end <= self.len,
-            "sparse gram range is out of bounds"
-        );
-        if left.len() != right.len() {
-            return Ok(false);
-        }
-        if left == right {
-            return Ok(true);
-        }
-        let chunk_end = self
-            .chunk_start
-            .checked_add(self.chunk.len())
-            .context("sparse file chunk range overflows")?;
-        if left.start >= self.chunk_start
-            && right.start >= self.chunk_start
-            && left.end <= chunk_end
-            && right.end <= chunk_end
-        {
-            let left = left.start - self.chunk_start..left.end - self.chunk_start;
-            let right = right.start - self.chunk_start..right.end - self.chunk_start;
-            return Ok(self.chunk[left] == self.chunk[right]);
-        }
-        if left.len() <= 64 {
-            for at in 0..left.len() {
-                if self.read_byte(left.start + at)? != self.read_byte(right.start + at)? {
-                    return Ok(false);
-                }
-            }
-            return Ok(true);
-        }
-        let mut at = 0usize;
-        while at < left.len() {
-            let len = (left.len() - at).min(self.left.len());
-            let left_offset = self.file_offset(left.start + at)?;
-            let right_offset = self.file_offset(right.start + at)?;
-            self.file.seek(SeekFrom::Start(left_offset))?;
-            self.file.read_exact(&mut self.left[..len])?;
-            self.file.seek(SeekFrom::Start(right_offset))?;
-            self.file.read_exact(&mut self.right[..len])?;
-            if self.left[..len] != self.right[..len] {
-                return Ok(false);
-            }
-            at += len;
-        }
-        Ok(true)
-    }
-}
-
-struct RecentSparseGram {
-    range: Range<usize>,
-    inline: Option<u64>,
 }
 
 fn mark_short_gram(bitmap: &mut [u64], gram: usize) -> bool {
@@ -265,24 +206,22 @@ impl SparseRunWriter {
         Ok(Self {
             id: DocId::try_from(idx)?,
             entries: rapidhash::RapidHashSet::default(),
-            bytes: 0,
             run_bytes,
             runs: Vec::new(),
         })
     }
 
     fn add(&mut self, text: &[u8]) -> Result<()> {
-        let mut recent: [Option<&[u8]>; 2] = [None, None];
+        let mut recent = [None, None];
         let mut recent_index = 0usize;
         for gram in iterate_sparse_grams(text) {
-            if recent.iter().flatten().any(|previous| *previous == gram) {
+            let hash = holys3_core::hash_ngram(gram);
+            if recent.contains(&Some(hash)) {
                 continue;
             }
-            recent[recent_index] = Some(gram);
+            recent[recent_index] = Some(hash);
             recent_index = (recent_index + 1) % recent.len();
-            if !self.entries.contains(gram) {
-                self.add_entry(gram.to_vec())?;
-            }
+            self.add_hash(hash)?;
         }
         Ok(())
     }
@@ -296,22 +235,20 @@ impl SparseRunWriter {
     }
 
     fn add_reader(&mut self, text: &mut SparseFileReader) -> Result<()> {
-        let mut recent: [Option<RecentSparseGram>; 2] = [None, None];
+        let mut recent = [None, None];
         let mut recent_index = 0usize;
         let mut ranges = start_sparse_gram_ranges(text.byte_len());
         let mut pairs = [0u64; (1 << 16) / 64];
         let mut trigrams =
             (text.byte_len() >= SPARSE_TRIGRAM_BITMAP_MIN).then(|| vec![0u64; (1 << 24) / 64]);
         let mut inline = [0u8; 8];
+        let mut scratch = Vec::new();
         while let Some(range) = ranges.next_with(|index| text.read_byte(index))? {
             let is_inline = range.len() <= inline.len();
-            let inline_value = if is_inline {
+            if is_inline {
                 inline.fill(0);
                 text.read_bytes(&range, &mut inline[..range.len()])?;
-                Some(u64::from_le_bytes(inline))
-            } else {
-                None
-            };
+            }
             let seen = match range.len() {
                 2 => mark_short_gram(
                     &mut pairs,
@@ -330,53 +267,26 @@ impl SparseRunWriter {
             if seen {
                 continue;
             }
-            let mut duplicate = false;
-            if range.len() > 3 || range.len() == 3 && trigrams.is_none() {
-                for previous in recent.iter().flatten() {
-                    if previous.range.len() != range.len() {
-                        continue;
-                    }
-                    let equal = match previous.inline {
-                        Some(previous) if is_inline => Some(previous) == inline_value,
-                        _ => text.has_equal_bytes(&previous.range, &range)?,
-                    };
-                    if equal {
-                        duplicate = true;
-                        break;
-                    }
-                }
-                if !duplicate {
-                    recent[recent_index] = Some(RecentSparseGram {
-                        range: range.clone(),
-                        inline: inline_value,
-                    });
-                    recent_index = (recent_index + 1) % recent.len();
-                }
-            }
-            if duplicate {
+            let hash = if is_inline {
+                holys3_core::hash_ngram(&inline[..range.len()])
+            } else {
+                scratch.resize(range.len(), 0);
+                text.read_bytes(&range, &mut scratch)?;
+                holys3_core::hash_ngram(&scratch)
+            };
+            if recent.contains(&Some(hash)) {
                 continue;
             }
-            let gram = if is_inline {
-                inline[..range.len()].to_vec()
-            } else {
-                let mut gram = vec![0u8; range.len()];
-                text.read_bytes(&range, &mut gram)?;
-                gram
-            };
-            self.add_entry(gram)?;
+            recent[recent_index] = Some(hash);
+            recent_index = (recent_index + 1) % recent.len();
+            self.add_hash(hash)?;
         }
         Ok(())
     }
 
-    fn add_entry(&mut self, gram: Vec<u8>) -> Result<()> {
-        let entry_bytes = size_of::<Vec<u8>>()
-            .saturating_add(size_of::<usize>())
-            .saturating_add(gram.len());
-        if self.entries.insert(gram) {
-            self.bytes = self.bytes.saturating_add(entry_bytes);
-            if self.bytes >= self.run_bytes {
-                self.flush()?;
-            }
+    fn add_hash(&mut self, hash: u64) -> Result<()> {
+        if self.entries.insert(hash) && self.entries.len() * size_of::<u64>() >= self.run_bytes {
+            self.flush()?;
         }
         Ok(())
     }
@@ -387,7 +297,6 @@ impl SparseRunWriter {
         }
         self.runs.push(write_sparse_run(&self.entries, self.id)?);
         self.entries.clear();
-        self.bytes = 0;
         Ok(())
     }
 
@@ -587,14 +496,13 @@ pub(crate) fn write_trigram_run_merge(grammed: Vec<(usize, Vec<u32>)>) -> Result
     Ok(file.into_temp_path())
 }
 
-fn write_sparse_run(entries: &rapidhash::RapidHashSet<Vec<u8>>, id: DocId) -> Result<TempPath> {
-    let mut ordered = entries.iter().collect::<Vec<_>>();
-    ordered.sort_unstable();
+fn write_sparse_run(entries: &rapidhash::RapidHashSet<u64>, id: DocId) -> Result<TempPath> {
+    let mut ordered = entries.iter().copied().collect::<Vec<_>>();
+    radsort::sort(&mut ordered);
     let mut file = tempfile::NamedTempFile::new()?;
     let mut writer = BufWriter::new(file.as_file_mut());
-    for gram in ordered {
-        writer.write_all(&u32::try_from(gram.len())?.to_be_bytes())?;
-        writer.write_all(gram)?;
+    for hash in ordered {
+        writer.write_all(&hash.to_be_bytes())?;
         writer.write_all(&id.to_be_bytes())?;
     }
     writer.flush()?;
@@ -644,19 +552,14 @@ impl PostingRun {
                 )))
             }
             Strategy::Sparse => {
-                let mut length = [0u8; 4];
-                if !read_exact_or_eof(&mut self.reader, &mut length)? {
+                let mut record = [0u8; 12];
+                if !read_exact_or_eof(&mut self.reader, &mut record)? {
                     return Ok(None);
                 }
-                let mut gram = vec![0; usize::try_from(u32::from_be_bytes(length))?];
-                self.reader
-                    .read_exact(&mut gram)
-                    .context("truncated temporary posting run")?;
-                let mut id = [0u8; 4];
-                self.reader
-                    .read_exact(&mut id)
-                    .context("truncated temporary posting run")?;
-                Ok(Some((gram, DocId::from_be_bytes(id))))
+                Ok(Some((
+                    record[..8].to_vec(),
+                    DocId::from_be_bytes(record[8..].try_into()?),
+                )))
             }
         }
     }
@@ -687,7 +590,10 @@ pub(crate) fn write_posting_record(
             writer.write_all(gram)?;
         }
         Strategy::Sparse => {
-            writer.write_all(&u32::try_from(gram.len())?.to_be_bytes())?;
+            anyhow::ensure!(
+                gram.len() == 8,
+                "temporary sparse key must be an 8-byte hash"
+            );
             writer.write_all(gram)?;
         }
     }
@@ -858,6 +764,29 @@ pub(crate) fn merge_posting_runs(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_runs_carry_fixed_width_hashed_keys() {
+        use holys3_core::hash_ngram;
+        let mut writer = SparseRunWriter::new(7, 1 << 20).unwrap();
+        let text = b"the quick brown fox jumps over the lazy dog";
+        writer.add(text).unwrap();
+        let runs = writer.finish().unwrap();
+        assert_eq!(runs.len(), 1);
+        let mut expected: Vec<u64> = iterate_sparse_grams(text).map(hash_ngram).collect();
+        expected.sort_unstable();
+        expected.dedup();
+        let bytes = std::fs::read(&runs[0]).unwrap();
+        assert_eq!(
+            bytes.len(),
+            expected.len() * 12,
+            "records must be fixed 12 bytes: hash u64 BE + doc id u32 BE"
+        );
+        for (record, hash) in bytes.chunks_exact(12).zip(&expected) {
+            assert_eq!(u64::from_be_bytes(record[..8].try_into().unwrap()), *hash);
+            assert_eq!(u32::from_be_bytes(record[8..].try_into().unwrap()), 7);
+        }
+    }
+
     use super::*;
 
     #[test]

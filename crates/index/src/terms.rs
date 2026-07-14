@@ -109,6 +109,7 @@ impl<W: Write> TrigramBuilder<W> {
 
 enum TermBuilderInner<W: Write> {
     Single(fst::MapBuilder<W>),
+    Sparse(crate::sparse_table::SparseTableWriter<W>),
     Trigram(TrigramBuilder<W>),
 }
 
@@ -126,8 +127,13 @@ impl<W: Write> TermBuilder<W> {
             (Strategy::Trigram, true) => Ok(Self {
                 inner: TermBuilderInner::Trigram(TrigramBuilder::new(writer)?),
             }),
-            (Strategy::Trigram | Strategy::Sparse, false) => Ok(Self {
+            (Strategy::Trigram, false) => Ok(Self {
                 inner: TermBuilderInner::Single(fst::MapBuilder::new(writer)?),
+            }),
+            (Strategy::Sparse, false) => Ok(Self {
+                inner: TermBuilderInner::Sparse(crate::sparse_table::SparseTableWriter::new(
+                    writer,
+                )?),
             }),
             (Strategy::Sparse, true) => unreachable!(),
         }
@@ -136,6 +142,13 @@ impl<W: Write> TermBuilder<W> {
     pub(crate) fn insert(&mut self, gram: &[u8], value: u64) -> Result<()> {
         match &mut self.inner {
             TermBuilderInner::Single(builder) => builder.insert(gram, value)?,
+            TermBuilderInner::Sparse(builder) => {
+                let hash = u64::from_be_bytes(
+                    gram.try_into()
+                        .context("sparse term key must be an 8-byte hash")?,
+                );
+                builder.insert(hash, value)?;
+            }
             TermBuilderInner::Trigram(builder) => builder.insert(gram, value)?,
         }
         Ok(())
@@ -144,6 +157,7 @@ impl<W: Write> TermBuilder<W> {
     pub(crate) fn finish(self) -> Result<W> {
         match self.inner {
             TermBuilderInner::Single(builder) => Ok(builder.into_inner()?),
+            TermBuilderInner::Sparse(builder) => builder.finish(),
             TermBuilderInner::Trigram(builder) => builder.finish(),
         }
     }
@@ -151,6 +165,17 @@ impl<W: Write> TermBuilder<W> {
 
 pub(crate) enum TermMap {
     Single(fst::Map<memmap2::Mmap>),
+    /// Sparse dictionaries key by `hash_ngram` of the gram, not gram bytes:
+    /// a sorted block table bisected in place, never an FST.
+    Sparse {
+        index: crate::sparse_table::SparseTableIndex,
+        bytes: memmap2::Mmap,
+    },
+    /// Large sparse dictionary accessed by ranged reads: only the block
+    /// index is resident; lookups are resolved per query by the reader.
+    SparseRemote {
+        index: crate::sparse_table::SparseTableIndex,
+    },
     Trigram(Vec<fst::Map<Bytes>>),
 }
 
@@ -160,7 +185,16 @@ impl TermMap {
             && bytes.len() >= TRIGRAM_MAGIC.len()
             && &bytes[..TRIGRAM_MAGIC.len()] == TRIGRAM_MAGIC;
         if !is_sharded {
-            return Ok(Self::Single(fst::Map::new(bytes)?));
+            return Ok(match strategy {
+                Strategy::Sparse => Self::Sparse {
+                    index: crate::sparse_table::SparseTableIndex::parse(
+                        bytes.len() as u64,
+                        &bytes,
+                    )?,
+                    bytes,
+                },
+                Strategy::Trigram => Self::Single(fst::Map::new(bytes)?),
+            });
         }
         anyhow::ensure!(
             bytes.len() >= TRIGRAM_MAGIC.len() + TRIGRAM_FOOTER_LEN,
@@ -190,6 +224,19 @@ impl TermMap {
     pub(crate) fn get(&self, gram: &[u8]) -> Option<u64> {
         match self {
             Self::Single(map) => map.get(gram),
+            Self::Sparse { index, bytes } => {
+                let hash = holys3_core::hash_ngram(gram);
+                let block = index.block_for(hash)?;
+                let block = &index.blocks[block];
+                let start = usize::try_from(block.offset).ok()?;
+                let end = start.checked_add(usize::try_from(block.len).ok()?)?;
+                crate::sparse_table::lookup_in_block(bytes.get(start..end)?, hash)
+                    .ok()
+                    .flatten()
+            }
+            Self::SparseRemote { .. } => {
+                unreachable!("remote sparse lookups are resolved by the reader per query")
+            }
             Self::Trigram(maps) if gram.len() == 3 => maps[usize::from(gram[0])].get(&gram[1..]),
             Self::Trigram(_) => None,
         }
@@ -198,6 +245,9 @@ impl TermMap {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Single(map) => map.len(),
+            Self::Sparse { index, .. } | Self::SparseRemote { index } => {
+                usize::try_from(index.entry_count).expect("fits usize")
+            }
             Self::Trigram(maps) => maps.iter().map(fst::Map::len).sum(),
         }
     }
@@ -208,6 +258,25 @@ impl TermMap {
                 let mut stream = map.stream();
                 while let Some((gram, value)) = stream.next() {
                     visit(gram, value)?;
+                }
+            }
+            Self::SparseRemote { .. } => {
+                anyhow::bail!("remote sparse dictionaries do not support iteration")
+            }
+            Self::Sparse { index, bytes } => {
+                for block in &index.blocks {
+                    let start = usize::try_from(block.offset)?;
+                    let end = start
+                        .checked_add(usize::try_from(block.len)?)
+                        .context("sparse table block range overflows")?;
+                    let raw = bytes
+                        .get(start..end)
+                        .context("sparse table block is out of bounds")?;
+                    for entry in raw.chunks_exact(crate::sparse_table::ENTRY_BYTES) {
+                        let key: [u8; 8] = entry[..8].try_into().expect("eight bytes");
+                        let value = u64::from_be_bytes(entry[8..].try_into().expect("eight bytes"));
+                        visit(&key, value)?;
+                    }
                 }
             }
             Self::Trigram(maps) => {
@@ -224,5 +293,49 @@ impl TermMap {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Compaction round-trips dictionaries through visit() -> insert():
+    // whatever key bytes visit emits must be accepted, in order, by a fresh
+    // builder and resolve to the same values afterwards.
+    #[test]
+    fn sparse_visit_round_trips_through_a_new_builder() {
+        let grams: Vec<&[u8]> = vec![b"whale", b"ahab", b"pequod", b"ishmael", b"harpoon"];
+        let mut entries: Vec<(u64, u64)> = grams
+            .iter()
+            .enumerate()
+            .map(|(value, gram)| (holys3_core::hash_ngram(gram), value as u64))
+            .collect();
+        entries.sort_unstable();
+        let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
+        for (hash, value) in &entries {
+            builder.insert(&hash.to_be_bytes(), *value).unwrap();
+        }
+        let bytes = builder.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terms.fst");
+        std::fs::write(&path, &bytes).unwrap();
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&path).unwrap()) }
+            .unwrap();
+        let map = TermMap::open(mmap, Strategy::Sparse).unwrap();
+
+        let mut rebuilt = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
+        map.visit(|key, value| rebuilt.insert(key, value))
+            .expect("visit output must feed a new builder in order");
+        let rebuilt_bytes = rebuilt.finish().unwrap();
+        assert_eq!(bytes, rebuilt_bytes, "round trip must be byte-identical");
+
+        for gram in grams {
+            assert!(
+                map.get(gram).is_some(),
+                "gram {gram:?} must resolve after the round trip"
+            );
+        }
     }
 }

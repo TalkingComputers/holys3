@@ -5,8 +5,10 @@ mod build;
 mod eval;
 mod format;
 mod pack;
+mod remote_terms;
 mod search;
 mod segment;
+mod sparse_table;
 mod terms;
 
 pub use search::{
@@ -53,7 +55,7 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 11;
+const INDEX_FORMAT: u32 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -870,12 +872,25 @@ mod tests {
         )
         .unwrap();
         assert!(runs.len() > 1);
-        let (fst, postings) = merge_posting_runs(runs, Strategy::Sparse, 1).unwrap();
-        let map = fst::Map::new(std::fs::read(fst.path()).unwrap()).unwrap();
+        let (terms, postings) = merge_posting_runs(runs, Strategy::Sparse, 1).unwrap();
+        let table = std::fs::read(terms.path()).unwrap();
+        let index = sparse_table::SparseTableIndex::parse(table.len() as u64, &table).unwrap();
+        let lookup = |hash: u64| -> Option<u64> {
+            let block = &index.blocks[index.block_for(hash)?];
+            let start = usize::try_from(block.offset).unwrap();
+            let end = start + usize::try_from(block.len).unwrap();
+            sparse_table::lookup_in_block(&table[start..end], hash).unwrap()
+        };
         let postings = std::fs::read(postings.path()).unwrap();
-        assert_eq!(map.len(), expected.len());
+        let mut expected_hashes: Vec<u64> = expected
+            .iter()
+            .map(|gram| holys3_core::hash_ngram(gram))
+            .collect();
+        expected_hashes.sort_unstable();
+        expected_hashes.dedup();
+        assert_eq!(index.entry_count, expected_hashes.len() as u64);
         for gram in expected {
-            let packed = map.get(&gram).expect("indexed sparse gram");
+            let packed = lookup(holys3_core::hash_ngram(&gram)).expect("indexed sparse gram");
             let (offset, count) = eval::unpack_posting(packed);
             let start = usize::try_from(offset).unwrap();
             let end = start + usize::try_from(posting_block_len(count, 1)).unwrap();

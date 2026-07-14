@@ -687,6 +687,37 @@ fn lifecycle_add_modify_delete_readd() -> Result<()> {
 }
 
 #[test]
+fn sparse_compaction_round_trips_hashed_dictionaries() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+
+    // 20 index runs force repeated merges of sparse segments, which rebuild
+    // dictionaries via TermMap::visit -> TermBuilder::insert — the exact path
+    // where key byte order between table entries and inserts must agree.
+    for i in 0..20 {
+        bucket.put(
+            &format!("prose/doc{i:02}"),
+            format!("it was the best of times, chapter {i}, and the worst of clocks").as_bytes(),
+        );
+        reindex(
+            &bucket,
+            store_dir.path(),
+            cache_dir.path(),
+            Strategy::Sparse,
+        )?;
+    }
+    assert_matches_oracle(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        &["best of times", "chapter 1", "worst", ".*", "zebra"],
+        "sparse-after-compactions",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn compaction_bounds_segment_count_and_preserves_results() -> Result<()> {
     let store_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
