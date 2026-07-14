@@ -2,7 +2,6 @@
 //! 16-byte (hash, value) entries in 128 KiB blocks, a per-block first-hash
 //! index, and per-block SHA-256 so blocks can be fetched and verified by
 //! ranged reads without downloading the whole dictionary.
-#![allow(dead_code)] // consumed when TermBuilder/TermMap wire in the sparse strategy
 
 use anyhow::{Context, Result};
 use sha2::Digest;

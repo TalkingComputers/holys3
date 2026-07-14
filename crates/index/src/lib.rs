@@ -871,8 +871,15 @@ mod tests {
         )
         .unwrap();
         assert!(runs.len() > 1);
-        let (fst, postings) = merge_posting_runs(runs, Strategy::Sparse, 1).unwrap();
-        let map = fst::Map::new(std::fs::read(fst.path()).unwrap()).unwrap();
+        let (terms, postings) = merge_posting_runs(runs, Strategy::Sparse, 1).unwrap();
+        let table = std::fs::read(terms.path()).unwrap();
+        let index = sparse_table::SparseTableIndex::parse(table.len() as u64, &table).unwrap();
+        let lookup = |hash: u64| -> Option<u64> {
+            let block = &index.blocks[index.block_for(hash)?];
+            let start = usize::try_from(block.offset).unwrap();
+            let end = start + usize::try_from(block.len).unwrap();
+            sparse_table::lookup_in_block(&table[start..end], hash).unwrap()
+        };
         let postings = std::fs::read(postings.path()).unwrap();
         let mut expected_hashes: Vec<u64> = expected
             .iter()
@@ -880,11 +887,9 @@ mod tests {
             .collect();
         expected_hashes.sort_unstable();
         expected_hashes.dedup();
-        assert_eq!(map.len(), expected_hashes.len());
+        assert_eq!(index.entry_count, expected_hashes.len() as u64);
         for gram in expected {
-            let packed = map
-                .get(holys3_core::hash_ngram(&gram).to_be_bytes())
-                .expect("indexed sparse gram");
+            let packed = lookup(holys3_core::hash_ngram(&gram)).expect("indexed sparse gram");
             let (offset, count) = eval::unpack_posting(packed);
             let start = usize::try_from(offset).unwrap();
             let end = start + usize::try_from(posting_block_len(count, 1)).unwrap();
