@@ -14,6 +14,7 @@ const TICK: Duration = Duration::from_millis(100);
 #[derive(Default)]
 pub(crate) struct ProgressState {
     listed: u64,
+    listing_complete: bool,
     diff: Option<(u64, u64)>,
     ingested: u64,
     decoded_bytes: u64,
@@ -26,6 +27,10 @@ impl ProgressState {
     pub(crate) fn apply(&mut self, event: ProgressEvent) {
         match event {
             ProgressEvent::Listed { objects } => self.listed = objects,
+            ProgressEvent::ListingComplete { objects } => {
+                self.listed = objects;
+                self.listing_complete = true;
+            }
             ProgressEvent::DiffComputed { to_add, to_remove } => {
                 self.diff = Some((to_add, to_remove));
             }
@@ -42,7 +47,12 @@ impl ProgressState {
         let spinner = SPINNER_FRAMES[(self.tick as usize) % SPINNER_FRAMES.len()];
         match self.diff {
             None => format!(
-                "{spinner} listing {target} · {} objects",
+                "{spinner} {} {target} · {} objects",
+                if self.listing_complete {
+                    "diffing"
+                } else {
+                    "listing"
+                },
                 thousands(self.listed)
             ),
             Some((to_add, _)) if self.ingested < to_add => format!(
@@ -143,6 +153,18 @@ mod tests {
         assert_eq!(
             state.render_line("s3://b/logs"),
             "⠋ listing s3://b/logs · 1,204 objects"
+        );
+    }
+
+    #[test]
+    fn renders_diffing_phase_with_filtered_count_after_listing_completes() {
+        let state = folded(&[
+            ProgressEvent::Listed { objects: 1221 },
+            ProgressEvent::ListingComplete { objects: 1204 },
+        ]);
+        assert_eq!(
+            state.render_line("s3://b/logs"),
+            "⠋ diffing s3://b/logs · 1,204 objects"
         );
     }
 

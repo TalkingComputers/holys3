@@ -7,6 +7,7 @@ use std::sync::mpsc::{Receiver, Sender};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressEvent {
     Listed { objects: u64 },
+    ListingComplete { objects: u64 },
     DiffComputed { to_add: u64, to_remove: u64 },
     SourceIngested { decoded_bytes: u64 },
     UploadStarted { bytes: u64 },

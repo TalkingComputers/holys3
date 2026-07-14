@@ -481,6 +481,11 @@ fn build_s3_inner(
         .into_iter()
         .map(|object| (object.key, object.etag, object.size))
         .collect::<Vec<_>>();
+    if let Some(progress) = &progress {
+        progress.emit(holys3_core::ProgressEvent::ListingComplete {
+            objects: listing.len() as u64,
+        });
+    }
     let store = index.store_with_progress(progress.clone());
     let source = SourceIdentity::S3 {
         endpoint: src.endpoint.clone(),
