@@ -253,7 +253,9 @@ fn write_token(bytes: &mut [u8], offset: usize, token: &[u8]) {
 /// Zipf-sampled words hard-wrapped at `PROSE_LINE_WIDTH`, mimicking Gutenberg
 /// prose: common trigrams appear in every document while any specific word
 /// sequence stays rare. Planted needles land on their own line (the phrase)
-/// or in the word stream (the rare word) at deterministic offsets.
+/// or in the word stream (the rare word) at deterministic offsets. Documents
+/// end on a word boundary, so they run up to one word past `size`; the
+/// manifest records actual byte counts.
 fn prose_object_bytes(
     rng: &mut DeterministicRng,
     zipf: &ZipfSampler,
@@ -375,6 +377,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(by_name["planted_phrase"], PROSE_PHRASE);
         assert_eq!(by_name["rare_word"], PROSE_RARE_WORD);
+        assert!(PROSE_WORDS.contains(&by_name["common_word"]));
         let unplanted = by_name["unplanted_phrase"];
         assert_ne!(unplanted, PROSE_PHRASE);
         for word in unplanted.split(' ') {

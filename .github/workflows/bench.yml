@@ -342,6 +342,8 @@ jobs:
               gate(sparse, name, "prune_ratio", 0.0, 0.03)
           gate(trigram, "rare_word", "prune_ratio", 0.0, 0.01)
           gate(sparse, "rare_word", "prune_ratio", 0.0, 0.01)
+          gate(trigram, "common_word", "prune_ratio", 0.9, 1.0)
+          gate(sparse, "common_word", "prune_ratio", 0.9, 1.0)
           for name, scenario in sparse.items():
               if scenario["hits"] != trigram[name]["hits"]:
                   failures.append(f"{name} hits diverge between strategies")
