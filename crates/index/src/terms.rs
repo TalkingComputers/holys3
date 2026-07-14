@@ -151,6 +151,8 @@ impl<W: Write> TermBuilder<W> {
 
 pub(crate) enum TermMap {
     Single(fst::Map<memmap2::Mmap>),
+    /// Sparse dictionaries key by `hash_ngram` of the gram, not gram bytes.
+    Sparse(fst::Map<memmap2::Mmap>),
     Trigram(Vec<fst::Map<Bytes>>),
 }
 
@@ -160,7 +162,10 @@ impl TermMap {
             && bytes.len() >= TRIGRAM_MAGIC.len()
             && &bytes[..TRIGRAM_MAGIC.len()] == TRIGRAM_MAGIC;
         if !is_sharded {
-            return Ok(Self::Single(fst::Map::new(bytes)?));
+            return Ok(match strategy {
+                Strategy::Sparse => Self::Sparse(fst::Map::new(bytes)?),
+                Strategy::Trigram => Self::Single(fst::Map::new(bytes)?),
+            });
         }
         anyhow::ensure!(
             bytes.len() >= TRIGRAM_MAGIC.len() + TRIGRAM_FOOTER_LEN,
@@ -190,6 +195,7 @@ impl TermMap {
     pub(crate) fn get(&self, gram: &[u8]) -> Option<u64> {
         match self {
             Self::Single(map) => map.get(gram),
+            Self::Sparse(map) => map.get(holys3_core::hash_ngram(gram).to_be_bytes()),
             Self::Trigram(maps) if gram.len() == 3 => maps[usize::from(gram[0])].get(&gram[1..]),
             Self::Trigram(_) => None,
         }
@@ -197,14 +203,14 @@ impl TermMap {
 
     pub(crate) fn len(&self) -> usize {
         match self {
-            Self::Single(map) => map.len(),
+            Self::Single(map) | Self::Sparse(map) => map.len(),
             Self::Trigram(maps) => maps.iter().map(fst::Map::len).sum(),
         }
     }
 
     pub(crate) fn visit(&self, mut visit: impl FnMut(&[u8], u64) -> Result<()>) -> Result<()> {
         match self {
-            Self::Single(map) => {
+            Self::Single(map) | Self::Sparse(map) => {
                 let mut stream = map.stream();
                 while let Some((gram, value)) = stream.next() {
                     visit(gram, value)?;
