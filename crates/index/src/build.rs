@@ -362,6 +362,7 @@ enum SourceBuild {
         encoding: SourceEncoding,
         documents: Vec<BuiltDocument>,
         spool: Option<tempfile::NamedTempFile>,
+        expanded_bytes: u64,
     },
     Failed,
 }
@@ -390,6 +391,7 @@ fn build_source(
             encoding: summary.encoding,
             documents: sink.documents,
             spool: sink.spool,
+            expanded_bytes: summary.expanded_bytes,
         }),
         Err(err) if err.is::<DocumentCapExceeded>() => Err(err),
         Err(err) => {
@@ -424,6 +426,7 @@ pub(crate) fn build_index_files(
     corpus: &dyn Corpus,
     strategy: Strategy,
     document_cap: Option<usize>,
+    progress: Option<&holys3_core::ProgressSender>,
 ) -> Result<BuiltIndexFiles> {
     if let Some(document_cap) = document_cap {
         anyhow::ensure!(document_cap > 0, "segment document cap must be positive");
@@ -499,21 +502,28 @@ pub(crate) fn build_index_files(
             };
             let source_id = u32::try_from(tables.sources.len())?;
             let first_doc = u32::try_from(tables.documents.len())?;
-            let (encoding, retry, source_failed, mut documents, mut spool) = match outcome {
-                Some(SourceBuild::Decoded {
-                    encoding,
-                    documents,
-                    spool,
-                }) => (encoding, false, false, documents, spool),
-                Some(SourceBuild::Failed) => {
-                    failed += 1;
-                    (SourceEncoding::Raw, false, true, Vec::new(), None)
-                }
-                None => {
-                    failed += 1;
-                    (SourceEncoding::Raw, true, true, Vec::new(), None)
-                }
-            };
+            let (encoding, retry, source_failed, mut documents, mut spool, expanded_bytes) =
+                match outcome {
+                    Some(SourceBuild::Decoded {
+                        encoding,
+                        documents,
+                        spool,
+                        expanded_bytes,
+                    }) => (encoding, false, false, documents, spool, expanded_bytes),
+                    Some(SourceBuild::Failed) => {
+                        failed += 1;
+                        (SourceEncoding::Raw, false, true, Vec::new(), None, 0)
+                    }
+                    None => {
+                        failed += 1;
+                        (SourceEncoding::Raw, true, true, Vec::new(), None, 0)
+                    }
+                };
+            if let Some(progress) = progress {
+                progress.emit(holys3_core::ProgressEvent::SourceIngested {
+                    decoded_bytes: expanded_bytes,
+                });
+            }
             documents
                 .sort_unstable_by(|left, right| left.meta.display_key.cmp(&right.meta.display_key));
             let next_document_count = tables

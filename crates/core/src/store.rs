@@ -148,11 +148,25 @@ pub fn content_version(bytes: &[u8]) -> String {
 
 pub struct LocalBlobStore {
     root: PathBuf,
+    progress: Option<crate::ProgressSender>,
 }
 
 impl LocalBlobStore {
     pub fn new(root: impl Into<PathBuf>) -> LocalBlobStore {
-        LocalBlobStore { root: root.into() }
+        LocalBlobStore {
+            root: root.into(),
+            progress: None,
+        }
+    }
+
+    pub fn with_progress(
+        root: impl Into<PathBuf>,
+        progress: crate::ProgressSender,
+    ) -> LocalBlobStore {
+        LocalBlobStore {
+            root: root.into(),
+            progress: Some(progress),
+        }
     }
 }
 
@@ -213,7 +227,17 @@ impl BlobStore for LocalBlobStore {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        if let Some(progress) = &self.progress {
+            progress.emit(crate::ProgressEvent::UploadStarted {
+                bytes: bytes.len() as u64,
+            });
+        }
         write_atomic(&path, bytes)?;
+        if let Some(progress) = &self.progress {
+            progress.emit(crate::ProgressEvent::UploadedChunk {
+                bytes: bytes.len() as u64,
+            });
+        }
         Ok(())
     }
 
@@ -224,10 +248,18 @@ impl BlobStore for LocalBlobStore {
             .ok_or_else(|| anyhow::anyhow!("blob path has no parent: {}", path.display()))?;
         std::fs::create_dir_all(parent)?;
         let mut input = std::fs::File::open(source)?;
+        if let Some(progress) = &self.progress {
+            progress.emit(crate::ProgressEvent::UploadStarted {
+                bytes: input.metadata()?.len(),
+            });
+        }
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        std::io::copy(&mut input, &mut temp)?;
+        let copied = std::io::copy(&mut input, &mut temp)?;
         temp.as_file().sync_all()?;
         temp.persist(path).map_err(|err| err.error)?;
+        if let Some(progress) = &self.progress {
+            progress.emit(crate::ProgressEvent::UploadedChunk { bytes: copied });
+        }
         Ok(())
     }
 

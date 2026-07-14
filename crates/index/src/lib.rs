@@ -626,7 +626,7 @@ mod tests {
             vec!["a.txt".into(), "b.txt".into()],
             vec![b"alpha".to_vec(), b"beta".to_vec()],
         );
-        let built = build_index_files(&corpus, Strategy::Trigram, None).unwrap();
+        let built = build_index_files(&corpus, Strategy::Trigram, None, None).unwrap();
 
         assert_eq!(built.packs.len(), 1);
         assert_eq!(built.tables.blocks.len(), 1);
@@ -747,7 +747,7 @@ mod tests {
                 encoded_size: 8,
             }],
         };
-        let error = build_index_files(&corpus, Strategy::Trigram, None)
+        let error = build_index_files(&corpus, Strategy::Trigram, None, None)
             .err()
             .expect("out-of-range fetch result should fail");
         assert!(
@@ -764,7 +764,7 @@ mod tests {
             vec!["a.log".to_owned(), "b.log".to_owned()],
             vec![b"alpha needle".to_vec(), b"beta needle".to_vec()],
         );
-        let built = build_index_files(&corpus, Strategy::Trigram, None).unwrap();
+        let built = build_index_files(&corpus, Strategy::Trigram, None, None).unwrap();
         assert_eq!(
             built.fst.len(),
             std::fs::metadata(built.fst.path()).unwrap().len()

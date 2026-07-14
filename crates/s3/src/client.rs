@@ -503,6 +503,15 @@ impl S3Client {
     }
 
     pub fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        self.list_with_progress(bucket, prefix, None)
+    }
+
+    pub fn list_with_progress(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        progress: Option<&holys3_core::ProgressSender>,
+    ) -> Result<Vec<ObjectMeta>> {
         self.0.rt.block_on(async {
             let mut objects = Vec::new();
             let mut token: Option<String> = None;
@@ -553,6 +562,11 @@ impl S3Client {
                             .context("ListObjectsV2 object has negative Size")?;
                     objects.push(ObjectMeta { key, etag, size });
                 }
+                if let Some(progress) = progress {
+                    progress.emit(holys3_core::ProgressEvent::Listed {
+                        objects: objects.len() as u64,
+                    });
+                }
                 let truncated = output
                     .is_truncated()
                     .context("ListObjectsV2 response missing IsTruncated")?;
@@ -584,7 +598,7 @@ impl S3Client {
         self.0.rt.block_on(async {
             let mut puts = stream::iter(objects.iter().map(|(key, body)| {
                 let client = self;
-                async move { client.put_async(bucket, key, body).await }
+                async move { client.put_async(bucket, key, body, None).await }
             }))
             .buffer_unordered(self.0.cfg.cap);
             while let Some(result) = puts.next().await {
