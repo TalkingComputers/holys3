@@ -51,7 +51,7 @@ impl std::error::Error for StaleSource {}
 
 /// A fully enumerable source used to build an index.
 /// Implemented by the local benchmark/test adapter and the S3 product adapter.
-pub trait Corpus {
+pub trait Corpus: Sync {
     /// All sources; a source's id is its position in this slice.
     fn sources(&self) -> &[SourceObject];
     /// Fetch the full bytes of one source by position.
