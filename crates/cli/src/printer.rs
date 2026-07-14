@@ -100,6 +100,25 @@ pub(crate) struct RenderConfig {
     pub(crate) line_numbers: bool,
     pub(crate) column: bool,
     pub(crate) context_active: bool,
+    /// `-a/--text`: print matches from binary documents instead of the
+    /// rg-style suppression notice.
+    pub(crate) text: bool,
+}
+
+/// Absolute byte offset of the first NUL in any output line, rg's binary
+/// heuristic: content with NULs is suppressed unless -a/--text is set.
+fn binary_nul_offset(events: &[holys3_core::LineEvent]) -> Option<u64> {
+    events.iter().find_map(|event| {
+        event
+            .text
+            .iter()
+            .position(|&byte| byte == 0)
+            .map(|position| event.offset + position as u64)
+    })
+}
+
+fn binary_notice(offset: u64) -> String {
+    format!("binary file matches (found \"\\0\" byte around offset {offset})")
 }
 
 pub(crate) struct StandardSink {
@@ -139,6 +158,17 @@ impl MatchSink for StandardSink {
                     wtr.write_all(b"\n")?;
                 } else if config.context_active && printed_any_doc {
                     wtr.write_all(b"--\n")?;
+                }
+                if !config.text {
+                    if let Some(offset) = binary_nul_offset(doc.events) {
+                        if !config.heading {
+                            write_colored(wtr, &path_spec(), key.as_bytes())?;
+                            wtr.write_all(b": ")?;
+                        }
+                        wtr.write_all(binary_notice(offset).as_bytes())?;
+                        wtr.write_all(b"\n")?;
+                        return wtr.flush();
+                    }
                 }
                 let mut prev_line: Option<u64> = None;
                 for event in doc.events {
@@ -266,5 +296,45 @@ impl MatchSink for QuietSink {
         } else {
             SinkFlow::Continue
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use holys3_core::LineEvent;
+
+    fn event(line: u64, offset: u64, text: &[u8]) -> LineEvent {
+        LineEvent {
+            line,
+            kind: LineKind::Match,
+            offset,
+            text: bytes::Bytes::copy_from_slice(text),
+            submatches: vec![SubMatch { start: 0, end: 1 }],
+        }
+    }
+
+    #[test]
+    fn binary_nul_offset_reports_first_nul_across_events() {
+        let events = [
+            event(3, 100, b"clean line\n"),
+            event(9, 400, b"ab\x00cd\x00\n"),
+            event(12, 900, b"\x00\n"),
+        ];
+        assert_eq!(binary_nul_offset(&events), Some(402));
+    }
+
+    #[test]
+    fn binary_nul_offset_is_none_for_text_lines() {
+        let events = [event(1, 0, b"hello world\n")];
+        assert_eq!(binary_nul_offset(&events), None);
+    }
+
+    #[test]
+    fn binary_notice_matches_rg_wording() {
+        assert_eq!(
+            binary_notice(402),
+            "binary file matches (found \"\\0\" byte around offset 402)"
+        );
     }
 }
