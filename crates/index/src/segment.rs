@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-mod cache;
+pub(crate) mod cache;
 mod compact;
 
 /// Per-segment doc cap: keeps every per-gram posting list far below the
@@ -1012,6 +1012,8 @@ impl SegmentedReader {
                         &segment_blob(&segment.meta.seg_id, "terms.fst"),
                         index,
                         q,
+                        &self.cache_dir,
+                        &segment.meta.seg_id,
                     ),
                 )?),
                 _ => None,

@@ -45,6 +45,9 @@ impl BlobStore for CountingStore {
     }
 
     fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> Result<Vec<bytes::Bytes>> {
+        if name.ends_with("terms.fst") {
+            self.terms_get_ranges.fetch_add(1, Ordering::Relaxed);
+        }
         self.inner.get_ranges(name, ranges)
     }
 
@@ -139,6 +142,11 @@ fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
         "second remote open must serve the index tail from the local cache"
     );
     assert_eq!(search(&warm, "quick brown fox")?, remote_hits);
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        0,
+        "a repeated query must serve its gram blocks from the local cache"
+    );
     assert_eq!(search(&warm, "needle-7 appears")?.len(), 1);
 
     let seg_dir = std::fs::read_dir(cache_dir.path())?
@@ -147,9 +155,21 @@ fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
         .expect("segment cache directory exists");
     let tail_path = seg_dir.path().join("terms.tail");
     assert!(tail_path.exists(), "index tail is cached on disk");
-    let mut corrupted = std::fs::read(&tail_path)?;
-    corrupted[0] ^= 0xff;
-    std::fs::write(&tail_path, &corrupted)?;
+    let block_paths: Vec<std::path::PathBuf> = std::fs::read_dir(seg_dir.path())?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("terms-block-"))
+        })
+        .collect();
+    assert!(!block_paths.is_empty(), "gram blocks are cached on disk");
+    for path in [&tail_path, &block_paths[0]] {
+        let mut corrupted = std::fs::read(path)?;
+        corrupted[0] ^= 0xff;
+        std::fs::write(path, &corrupted)?;
+    }
 
     counter.store(0, Ordering::Relaxed);
     let healed = open()?;
@@ -157,7 +177,12 @@ fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
         counter.load(Ordering::Relaxed) > 0,
         "corrupted cached tail must be refetched, not trusted"
     );
+    counter.store(0, Ordering::Relaxed);
     assert_eq!(search(&healed, "quick brown fox")?, remote_hits);
+    assert!(
+        counter.load(Ordering::Relaxed) > 0,
+        "corrupted cached block must be refetched, not trusted"
+    );
 
     std::env::set_var("HOLYS3_SPARSE_REMOTE_MIN", u64::MAX.to_string());
     let cached_mode = open()?;

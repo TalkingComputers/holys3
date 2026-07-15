@@ -56,13 +56,17 @@ pub(crate) fn parse_index_tail(
     SparseTableIndex::parse(terms_len, tail)
 }
 
-/// Resolve every gram the query can ask about in one ranged read of the
-/// blocks they bisect into. Absent grams are simply absent from the map.
+/// Resolve every gram the query can ask about through the per-segment block
+/// cache, fetching all missing blocks in one ranged read. Every block —
+/// cached or fetched — is verified against the per-block hash from the
+/// trusted index before use. Absent grams are simply absent from the map.
 pub(crate) fn fetch_query_gram_values(
     store: &dyn BlobStore,
     blob: &str,
     index: &SparseTableIndex,
     q: &Query,
+    cache_dir: &std::path::Path,
+    seg_id: &str,
 ) -> Result<rapidhash::RapidHashMap<u64, u64>> {
     let mut hashes = Vec::new();
     collect_gram_hashes(q, &mut hashes);
@@ -77,25 +81,44 @@ pub(crate) fn fetch_query_gram_values(
     if needed_blocks.is_empty() {
         return Ok(values);
     }
-    let ranges: Vec<(u64, u64)> = needed_blocks
-        .iter()
-        .map(|block| (index.blocks[*block].offset, index.blocks[*block].len))
-        .collect();
-    let fetched = store.get_ranges(blob, &ranges)?;
-    anyhow::ensure!(
-        fetched.len() == ranges.len(),
-        "get_ranges returned {} blocks for {} requests",
-        fetched.len(),
-        ranges.len()
-    );
-    let mut blocks = rapidhash::RapidHashMap::default();
-    for (block_id, raw) in needed_blocks.iter().zip(fetched) {
-        let block = &index.blocks[*block_id];
+    let block_path = |block_id: usize| {
+        cache_dir.join(seg_id).join(format!(
+            "terms-block-{:016x}",
+            index.blocks[block_id].offset
+        ))
+    };
+    let mut blocks: rapidhash::RapidHashMap<usize, Vec<u8>> = rapidhash::RapidHashMap::default();
+    let mut missing = Vec::new();
+    for block_id in needed_blocks {
+        let expected = hex(&index.blocks[block_id].hash);
+        match crate::segment::cache::read_verified(&block_path(block_id), &expected) {
+            Some(bytes) => {
+                blocks.insert(block_id, bytes);
+            }
+            None => missing.push(block_id),
+        }
+    }
+    if !missing.is_empty() {
+        let ranges: Vec<(u64, u64)> = missing
+            .iter()
+            .map(|block| (index.blocks[*block].offset, index.blocks[*block].len))
+            .collect();
+        let fetched = store.get_ranges(blob, &ranges)?;
         anyhow::ensure!(
-            <[u8; 32]>::from(Sha256::digest(&raw)) == block.hash,
-            "sparse term table block hash mismatch"
+            fetched.len() == ranges.len(),
+            "get_ranges returned {} blocks for {} requests",
+            fetched.len(),
+            ranges.len()
         );
-        blocks.insert(*block_id, raw);
+        for (block_id, raw) in missing.into_iter().zip(fetched) {
+            let block = &index.blocks[block_id];
+            anyhow::ensure!(
+                <[u8; 32]>::from(Sha256::digest(&raw)) == block.hash,
+                "sparse term table block hash mismatch"
+            );
+            crate::segment::cache::write_back(cache_dir, &block_path(block_id), &raw).ok();
+            blocks.insert(block_id, raw.to_vec());
+        }
     }
     for hash in hashes {
         let Some(block_id) = index.block_for(hash) else {
@@ -251,7 +274,9 @@ mod tests {
         // hashes we recompute for expectations.
         let grams: Vec<Vec<u8>> = vec![b"hamlet".to_vec(), b"ophelia".to_vec(), b"yorick".to_vec()];
         let q = Query::And(grams.iter().cloned().map(Query::Gram).collect());
-        let values = fetch_query_gram_values(&store, "terms.fst", &index, &q).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let values =
+            fetch_query_gram_values(&store, "terms.fst", &index, &q, cache.path(), "seg").unwrap();
         assert_eq!(store.get_ranges_calls.load(Ordering::Relaxed), 1);
         for gram in &grams {
             let hash = hash_ngram(gram);
@@ -288,7 +313,8 @@ mod tests {
         bytes[64] ^= 0xff;
         store.put("terms.fst", &bytes).unwrap();
         let q = Query::Gram(b"anything".to_vec());
-        let error = fetch_query_gram_values(&store, "terms.fst", &index, &q);
+        let cache = tempfile::tempdir().unwrap();
+        let error = fetch_query_gram_values(&store, "terms.fst", &index, &q, cache.path(), "seg");
         if let Err(error) = error {
             assert!(error.to_string().contains("hash"), "{error:#}");
         } else {

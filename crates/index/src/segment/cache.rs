@@ -29,7 +29,7 @@ pub(super) fn cached_blob(
 /// Read-through cache for small immutable segment artifacts: a disk hit is
 /// trusted only if its SHA-256 matches, anything else is refetched through
 /// `fetch`, verified, and written back atomically.
-pub(super) fn cached_bytes(
+pub(crate) fn cached_bytes(
     cache_dir: &Path,
     seg_id: &str,
     name: &str,
@@ -37,32 +37,41 @@ pub(super) fn cached_bytes(
     fetch: &dyn Fn() -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
     let cache_path = cache_dir.join(seg_id).join(name);
-    if let Ok(bytes) = std::fs::read(&cache_path) {
-        set_cache_path_mode(&cache_path).ok();
-        if sha256_hex(&[&bytes]) == expected_hash {
-            return Ok(bytes);
-        }
-        std::fs::remove_file(&cache_path).ok();
+    if let Some(bytes) = read_verified(&cache_path, expected_hash) {
+        return Ok(bytes);
     }
     let bytes = fetch()?;
     anyhow::ensure!(
         sha256_hex(&[&bytes]) == expected_hash,
         "segment blob {name} of {seg_id} failed its SHA-256 check"
     );
-    let cache = || -> std::io::Result<()> {
-        if let Some(parent) = cache_path.parent() {
-            std::fs::create_dir_all(parent)?;
-            set_cache_dir_mode(cache_dir)?;
-            set_cache_dir_mode(parent)?;
-        }
-        let tmp = cache_path.with_file_name(format!("{name}.tmp.{}", std::process::id()));
-        let mut file = std::fs::File::create(&tmp)?;
-        set_cache_file_mode(&file)?;
-        file.write_all(&bytes)?;
-        std::fs::rename(&tmp, &cache_path)
-    };
-    cache().ok();
+    write_back(cache_dir, &cache_path, &bytes).ok();
     Ok(bytes)
+}
+
+/// Read a cache file and trust it only if its SHA-256 matches; a mismatch
+/// deletes the file so the caller refetches.
+pub(crate) fn read_verified(cache_path: &Path, expected_hash: &str) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(cache_path).ok()?;
+    set_cache_path_mode(cache_path).ok();
+    if sha256_hex(&[&bytes]) == expected_hash {
+        return Some(bytes);
+    }
+    std::fs::remove_file(cache_path).ok();
+    None
+}
+
+/// Atomically publish verified bytes into the cache.
+pub(crate) fn write_back(cache_dir: &Path, cache_path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = cache_path.parent().context("cache path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    set_cache_dir_mode(cache_dir)?;
+    set_cache_dir_mode(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    set_cache_file_mode(temp.as_file())?;
+    temp.write_all(bytes)?;
+    temp.persist(cache_path)?;
+    Ok(())
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
