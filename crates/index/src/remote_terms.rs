@@ -9,12 +9,13 @@ use holys3_core::{hash_ngram, BlobStore};
 use holys3_query::Query;
 use sha2::{Digest, Sha256};
 
-pub(crate) fn open_remote_index(
+/// Two ranged reads: the fixed-size footer locates the block index, then the
+/// index tail comes down at its exact size.
+pub(crate) fn fetch_index_tail(
     store: &dyn BlobStore,
     blob: &str,
     terms_len: u64,
-    expected_tail_hash: &str,
-) -> Result<SparseTableIndex> {
+) -> Result<Vec<u8>> {
     anyhow::ensure!(
         terms_len > FOOTER_BYTES as u64,
         "sparse term table is too short for its footer"
@@ -39,12 +40,20 @@ pub(crate) fn open_remote_index(
         tail.len() as u64 == tail_len,
         "sparse term table tail response is truncated"
     );
-    let actual = hex(&<[u8; 32]>::from(Sha256::digest(&tail)));
+    Ok(tail)
+}
+
+pub(crate) fn parse_index_tail(
+    terms_len: u64,
+    tail: &[u8],
+    expected_tail_hash: &str,
+) -> Result<SparseTableIndex> {
+    let actual = hex(&<[u8; 32]>::from(Sha256::digest(tail)));
     anyhow::ensure!(
         actual == expected_tail_hash,
         "sparse term table tail hash mismatch: index is not trustworthy"
     );
-    SparseTableIndex::parse(terms_len, &tail)
+    SparseTableIndex::parse(terms_len, tail)
 }
 
 /// Resolve every gram the query can ask about in one ranged read of the
@@ -164,6 +173,16 @@ mod tests {
         fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
             self.inner.put_if(name, bytes, expected)
         }
+    }
+
+    fn open_remote_index(
+        store: &dyn BlobStore,
+        blob: &str,
+        terms_len: u64,
+        expected_tail_hash: &str,
+    ) -> Result<SparseTableIndex> {
+        let tail = fetch_index_tail(store, blob, terms_len)?;
+        parse_index_tail(terms_len, &tail, expected_tail_hash)
     }
 
     fn fixture(
