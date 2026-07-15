@@ -138,8 +138,14 @@ jobs:
                   raise SystemExit("Criterion produced no PR-base comparisons")
               rows.extend(["", "| benchmark vs PR base | median delta | 95% CI | limit |", "|---|---:|---:|---:|"])
               for name, lower, point, upper in sorted(changes):
-                  rows.append(f"| {name} | {point:+.1%} | {lower:+.1%} to {upper:+.1%} | +{regression_limit:.0%} |")
-                  failed = failed or lower > regression_limit
+                  # packed_sort benches are gated on their same-run paired
+                  # ratio above: their absolute deltas flap on noisy runners
+                  # (issue #32, six documented instances) while the ratio
+                  # stays sane, so they are reported here but not gated.
+                  paired = name.startswith("packed_sort_")
+                  limit_label = "paired" if paired else f"+{regression_limit:.0%}"
+                  rows.append(f"| {name} | {point:+.1%} | {lower:+.1%} to {upper:+.1%} | {limit_label} |")
+                  failed = failed or (not paired and lower > regression_limit)
           Path("bench-micro.md").write_text("\n".join(rows) + "\n")
           if failed:
               sys.exit(1)
