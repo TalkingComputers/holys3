@@ -13,22 +13,38 @@ pub(super) fn cached_blob(
     expected_len: u64,
     expected_hash: &str,
 ) -> Result<Vec<u8>> {
-    let cache_path = cache_dir.join(seg_id).join(name);
-    if let Ok(bytes) = std::fs::read(&cache_path) {
-        set_cache_path_mode(&cache_path).ok();
-        if bytes.len() as u64 == expected_len && sha256_hex(&[&bytes]) == expected_hash {
-            return Ok(bytes);
-        }
-        std::fs::remove_file(&cache_path).ok();
-    }
-    let bytes = store
-        .get(&segment_blob(seg_id, name))?
-        .with_context(|| format!("segment blob {name} of {seg_id} missing from the store"))?;
+    let bytes = cached_bytes(cache_dir, seg_id, name, expected_hash, &|| {
+        store
+            .get(&segment_blob(seg_id, name))?
+            .with_context(|| format!("segment blob {name} of {seg_id} missing from the store"))
+    })?;
     anyhow::ensure!(
         bytes.len() as u64 == expected_len,
         "segment blob {name} of {seg_id} is {} bytes, expected {expected_len}",
         bytes.len()
     );
+    Ok(bytes)
+}
+
+/// Read-through cache for small immutable segment artifacts: a disk hit is
+/// trusted only if its SHA-256 matches, anything else is refetched through
+/// `fetch`, verified, and written back atomically.
+pub(super) fn cached_bytes(
+    cache_dir: &Path,
+    seg_id: &str,
+    name: &str,
+    expected_hash: &str,
+    fetch: &dyn Fn() -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let cache_path = cache_dir.join(seg_id).join(name);
+    if let Ok(bytes) = std::fs::read(&cache_path) {
+        set_cache_path_mode(&cache_path).ok();
+        if sha256_hex(&[&bytes]) == expected_hash {
+            return Ok(bytes);
+        }
+        std::fs::remove_file(&cache_path).ok();
+    }
+    let bytes = fetch()?;
     anyhow::ensure!(
         sha256_hex(&[&bytes]) == expected_hash,
         "segment blob {name} of {seg_id} failed its SHA-256 check"

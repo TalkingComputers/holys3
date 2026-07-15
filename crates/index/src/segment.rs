@@ -23,7 +23,7 @@ use crate::pack::{PackFile, PackMeta};
 use crate::terms::TermMap;
 use crate::{candidates_with, INDEX_FORMAT};
 use anyhow::{Context, Result};
-use cache::{cached_blob, cached_file, map_file};
+use cache::{cached_blob, cached_bytes, cached_file, map_file};
 use compact::{maybe_compact, merge_segments};
 use holys3_core::{BlobStore, Corpus, DocAddress, IndexAddress, ProgressSender, Strategy};
 use holys3_query::Query;
@@ -1149,10 +1149,22 @@ fn load_segment(
         && !meta.terms_tail_hash.is_empty()
         && meta.terms_fst_len >= sparse_remote_terms_min()?
     {
-        let index = crate::remote_terms::open_remote_index(
-            store,
-            &segment_blob(&meta.seg_id, "terms.fst"),
+        let tail = cached_bytes(
+            cache_dir,
+            &meta.seg_id,
+            "terms.tail",
+            &meta.terms_tail_hash,
+            &|| {
+                crate::remote_terms::fetch_index_tail(
+                    store,
+                    &segment_blob(&meta.seg_id, "terms.fst"),
+                    meta.terms_fst_len,
+                )
+            },
+        )?;
+        let index = crate::remote_terms::parse_index_tail(
             meta.terms_fst_len,
+            &tail,
             &meta.terms_tail_hash,
         )?;
         return Ok(Segment {
