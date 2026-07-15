@@ -87,13 +87,14 @@ pub(crate) fn fetch_query_gram_values(
             index.blocks[block_id].offset
         ))
     };
-    let mut blocks: rapidhash::RapidHashMap<usize, Vec<u8>> = rapidhash::RapidHashMap::default();
+    let mut blocks: rapidhash::RapidHashMap<usize, bytes::Bytes> =
+        rapidhash::RapidHashMap::default();
     let mut missing = Vec::new();
     for block_id in needed_blocks {
         let expected = hex(&index.blocks[block_id].hash);
         match crate::segment::cache::read_verified(&block_path(block_id), &expected) {
             Some(bytes) => {
-                blocks.insert(block_id, bytes);
+                blocks.insert(block_id, bytes::Bytes::from(bytes));
             }
             None => missing.push(block_id),
         }
@@ -117,7 +118,7 @@ pub(crate) fn fetch_query_gram_values(
                 "sparse term table block hash mismatch"
             );
             crate::segment::cache::write_back(cache_dir, &block_path(block_id), &raw).ok();
-            blocks.insert(block_id, raw.to_vec());
+            blocks.insert(block_id, raw);
         }
     }
     for hash in hashes {

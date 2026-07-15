@@ -49,15 +49,15 @@ pub(crate) fn cached_bytes(
     Ok(bytes)
 }
 
-/// Read a cache file and trust it only if its SHA-256 matches; a mismatch
-/// deletes the file so the caller refetches.
+/// Read a cache file and trust it only if its SHA-256 matches. A mismatch is
+/// simply a miss: the caller refetches and `write_back` atomically replaces
+/// the file, so unlinking here could only race a concurrent repair.
 pub(crate) fn read_verified(cache_path: &Path, expected_hash: &str) -> Option<Vec<u8>> {
     let bytes = std::fs::read(cache_path).ok()?;
     set_cache_path_mode(cache_path).ok();
     if sha256_hex(&[&bytes]) == expected_hash {
         return Some(bytes);
     }
-    std::fs::remove_file(cache_path).ok();
     None
 }
 
