@@ -1852,7 +1852,7 @@ fn failed_streamed_merge_leaves_no_segment_blobs() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Sparse,
+        Some(Strategy::Sparse),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -1905,7 +1905,9 @@ fn segments_with_no_grams_round_trip_empty_postings() -> Result<()> {
     )?;
     assert_eq!(search_collect(&reader, "anything")?.0.len(), 0);
     assert_eq!(reader.total_docs(), 2);
-||||||| parent of 87b4db7 (feat: pick the index strategy automatically from sampled content)
+    Ok(())
+}
+
 #[test]
 fn auto_strategy_picks_by_content_and_respects_existing_roots() -> Result<()> {
     let prose_line = b"It is a truth universally acknowledged that a single man in \
