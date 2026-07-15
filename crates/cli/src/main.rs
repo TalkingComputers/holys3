@@ -54,8 +54,9 @@ enum Cmd {
         target: String,
         #[command(flatten)]
         index: IndexArgs,
-        #[arg(long, value_enum, default_value = "trigram")]
-        strategy: StrategyArg,
+        /// Index strategy; picked automatically from sampled content when omitted.
+        #[arg(long, value_enum)]
+        strategy: Option<StrategyArg>,
         /// Ignore any existing index and re-ingest everything.
         #[arg(long)]
         rebuild: bool,
@@ -448,7 +449,7 @@ fn list_user_objects(
 fn build_s3(
     src: &S3Source,
     index: &IndexStorage,
-    strategy: Strategy,
+    strategy: Option<Strategy>,
     rebuild: bool,
     purge_deleted: bool,
     show_progress: bool,
@@ -473,7 +474,7 @@ fn build_s3(
 fn build_s3_inner(
     src: &S3Source,
     index: &IndexStorage,
-    strategy: Strategy,
+    strategy: Option<Strategy>,
     rebuild: bool,
     purge_deleted: bool,
     progress: Option<holys3_core::ProgressSender>,
@@ -717,7 +718,7 @@ fn run() -> Result<bool> {
             connect,
         }) => {
             let interval = interval.map(Duration::from_secs);
-            let strategy = strategy.into();
+            let strategy = strategy.map(Into::into);
             let config = index::IndexConfig {
                 target: &target,
                 interval,

@@ -32,7 +32,7 @@ fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
         &store,
         cache_dir.path(),
         &source,
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions::default(),
         &|shard| {

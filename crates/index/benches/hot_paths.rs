@@ -147,7 +147,7 @@ fn bench_index_reader(c: &mut Criterion) {
         &store,
         cache_dir.path(),
         &source_identity(),
-        Strategy::Sparse,
+        Some(Strategy::Sparse),
         &listing,
         UpdateOptions::default(),
         &|shard| {
@@ -213,7 +213,7 @@ fn bench_index_build(c: &mut Criterion) {
                         &LocalBlobStore::new(store_dir.path()),
                         cache_dir.path(),
                         &source_identity(),
-                        strategy,
+                        Some(strategy),
                         &listing,
                         UpdateOptions::default(),
                         &|shard| {

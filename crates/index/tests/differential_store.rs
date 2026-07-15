@@ -41,7 +41,7 @@ fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()> {
                 &store,
                 cache_dir.path(),
                 &source,
-                strategy,
+                Some(strategy),
                 &listing,
                 UpdateOptions::default(),
                 &|shard| {

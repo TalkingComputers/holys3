@@ -194,7 +194,7 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
             &store,
             &dir_cache_dir(),
             &dir_source_identity()?,
-            Strategy::Trigram,
+            Some(Strategy::Trigram),
             &listing,
             UpdateOptions::default(),
             &|shard| Ok(Box::new(LocalCorpus::from_listing(shard))),

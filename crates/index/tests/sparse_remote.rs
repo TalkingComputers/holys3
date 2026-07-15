@@ -113,7 +113,7 @@ fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Sparse,
+        Some(Strategy::Sparse),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(corpus_for(shard))),

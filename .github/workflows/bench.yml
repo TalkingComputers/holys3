@@ -202,7 +202,7 @@ jobs:
           MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
           source_index_keys=$(docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ls --recursive --json local/holys3-bench/xbench/.holys3 | wc -l)
-          target/release/holys3 index s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild
+          target/release/holys3 index s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild --strategy trigram
           target/release/holys3 -l longliteralbenchmarktoken s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-independent-index-hits.txt
           test "$(wc -l < bench-independent-index-hits.txt)" -eq 334
           if target/release/holys3 -q longliteralbenchmarktoken s3://holys3-bench/xbench/missing --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64; then exit 1; else test "$?" -eq 1; fi
@@ -220,7 +220,7 @@ jobs:
           truncate -s 536870912 bench-large.log
           printf RANGE_NEEDLE | dd of=bench-large.log bs=1 seek=268435456 conv=notrunc status=none
           docker run --rm --network host -e MC_HOST_local -v "$PWD/bench-large.log:/bench-large.log:ro" "$MC_IMAGE" cp /bench-large.log local/holys3-bench/range/large.log
-          /usr/bin/time -v -o bench-s3-trigram-index.txt target/release/holys3 index s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64
+          /usr/bin/time -v -o bench-s3-trigram-index.txt target/release/holys3 index s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --strategy trigram
           /usr/bin/time -v -o bench-s3-trigram-search.txt target/release/holys3 -l RANGE_NEEDLE s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-s3-trigram-hits.txt
           test "$(wc -l < bench-s3-trigram-hits.txt)" -eq 1
           /usr/bin/time -v -o bench-s3-sparse-index.txt target/release/holys3 index s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse --rebuild
@@ -249,7 +249,7 @@ jobs:
           printf ENTROPY_NEEDLE | dd of=bench-entropy.log bs=1 seek=33554432 conv=notrunc status=none
           gzip -1 -c bench-entropy.log > bench-entropy.log.gz
           docker run --rm --network host -e MC_HOST_local -v "$PWD/bench-entropy.log.gz:/bench-entropy.log.gz:ro" "$MC_IMAGE" cp /bench-entropy.log.gz local/holys3-bench/entropy/large.log.gz
-          /usr/bin/time -v -o bench-entropy-index.txt target/release/holys3 index s3://holys3-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild
+          /usr/bin/time -v -o bench-entropy-index.txt target/release/holys3 index s3://holys3-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild --strategy trigram
           /usr/bin/time -v -o bench-entropy-search.txt target/release/holys3 -l ENTROPY_NEEDLE s3://holys3-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-entropy-hits.txt
           test "$(wc -l < bench-entropy-hits.txt)" -eq 1
           python3 <<'PY'
@@ -384,7 +384,7 @@ jobs:
           printf needle | dd of=/tmp/holys3-large-data/large.log bs=1 seek=67108864 conv=notrunc status=none
           gzip -c /tmp/holys3-large-data/large.log > /tmp/holys3-large-data/large.log.gz
           docker run --rm --network host -e MC_HOST_local -v /tmp/holys3-large-data:/data:ro "$MC_IMAGE" cp --recursive /data/ local/holys3-scale/large/
-          /usr/bin/time -v -o bench-scale-large.txt target/release/holys3 index s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64
+          /usr/bin/time -v -o bench-scale-large.txt target/release/holys3 index s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy trigram
           hits=$(target/release/holys3 -l needle s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 | wc -l)
           test "$hits" -eq 2
           /usr/bin/time -v -o bench-scale-sparse.txt target/release/holys3 index s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
@@ -401,7 +401,7 @@ jobs:
           printf EXPANSION_NEEDLE | dd of=/tmp/holys3-expansion-data/expanded.log bs=1 seek=268435456 conv=notrunc status=none
           gzip /tmp/holys3-expansion-data/expanded.log
           docker run --rm --network host -e MC_HOST_local -v /tmp/holys3-expansion-data:/data:ro "$MC_IMAGE" cp --recursive /data/ local/holys3-scale/expansion/
-          /usr/bin/time -v -o bench-expansion-index.txt target/release/holys3 index s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64
+          /usr/bin/time -v -o bench-expansion-index.txt target/release/holys3 index s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy trigram
           /usr/bin/time -v -o bench-expansion-search.txt target/release/holys3 -l EXPANSION_NEEDLE s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-expansion-hits.txt
           test "$(wc -l < bench-expansion-hits.txt)" -eq 1
           /usr/bin/time -v -o bench-expansion-sparse-index.txt target/release/holys3 index s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
