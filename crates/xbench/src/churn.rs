@@ -89,6 +89,10 @@ impl BlobStore for ChurnStore {
     fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
         self.inner.put_if(name, bytes, expected)
     }
+
+    fn put_streaming<'a>(&'a self, name: &str) -> Result<Box<dyn holys3_core::StreamingPut + 'a>> {
+        self.inner.put_streaming(name)
+    }
 }
 
 #[derive(Serialize)]

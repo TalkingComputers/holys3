@@ -458,9 +458,14 @@ impl StreamingUpload {
             self.harvest_one()?;
         }
         let number = self.next_part;
+        anyhow::ensure!(
+            number <= 10_000,
+            "streamed blob exceeds the S3 10,000-part limit ({} MiB parts): raise the part size",
+            STREAM_PART_SIZE / (1024 * 1024)
+        );
         self.next_part = number
             .checked_add(1)
-            .context("multipart upload exceeds the part-count limit")?;
+            .context("multipart upload part number overflows")?;
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = self.key.clone();
@@ -491,18 +496,28 @@ impl StreamingUpload {
     }
 
     pub(crate) fn finish(mut self) -> Result<()> {
+        if self.completed.is_empty() && self.in_flight.is_empty() {
+            // Zero dispatched parts: S3 refuses to complete a partless
+            // multipart, and a plain put is cheaper for small blobs anyway.
+            // An empty postings.bin (a segment whose documents produced no
+            // grams) is valid and must round-trip.
+            let body = self.buffer.split_off(0).freeze();
+            let (client, bucket, key) =
+                (self.client.clone(), self.bucket.clone(), self.key.clone());
+            let progress = self.progress.clone();
+            self.abort_inner();
+            client
+                .0
+                .rt
+                .block_on(client.put_bytes(&bucket, &key, body, progress.as_ref()))?;
+            return Ok(());
+        }
         if !self.buffer.is_empty() {
             let part = self.buffer.split_off(0).freeze();
             self.dispatch(part)?;
         }
         while !self.in_flight.is_empty() {
             self.harvest_one()?;
-        }
-        if self.completed.is_empty() {
-            // S3 cannot complete a multipart upload with zero parts, so an
-            // empty stream falls back to a plain zero-byte PutObject.
-            self.abort_inner();
-            return self.client.put(&self.bucket, &self.key, &[]);
         }
         let mut parts = std::mem::take(&mut self.completed);
         parts.sort_unstable_by_key(|part| part.part_number().unwrap_or_default());
@@ -525,8 +540,10 @@ impl StreamingUpload {
             return;
         }
         self.done = true;
+        // Let in-flight parts settle before aborting: a part that lands
+        // after AbortMultipartUpload would linger as billed storage.
         for handle in self.in_flight.drain(..) {
-            handle.abort();
+            self.client.0.rt.block_on(handle).ok();
         }
         self.client.0.rt.block_on(self.client.abort_multipart(
             &self.bucket,

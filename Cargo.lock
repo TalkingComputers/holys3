@@ -2173,6 +2173,7 @@ dependencies = [
  "criterion",
  "flate2",
  "fst",
+ "getrandom 0.4.3",
  "holys3-core",
  "holys3-query",
  "memmap2",

@@ -29,6 +29,7 @@ blake3.workspace = true
 bytes.workspace = true
 memmap2.workspace = true
 zstd = "0.13.3"
+getrandom = "0.4"
 
 [dev-dependencies]
 holys3-core = { path = "../core", version = "0.6.0", features = ["testutil"] }

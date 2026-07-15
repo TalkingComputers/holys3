@@ -1884,3 +1884,26 @@ fn failed_streamed_merge_leaves_no_segment_blobs() -> Result<()> {
     assert!(store.get("segments.bin")?.is_none(), "no root was swapped");
     Ok(())
 }
+
+#[test]
+fn segments_with_no_grams_round_trip_empty_postings() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("tiny-a", b"a");
+    bucket.put("tiny-b", b"b");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Sparse,
+    )?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    assert_eq!(search_collect(&reader, "anything")?.0.len(), 0);
+    assert_eq!(reader.total_docs(), 2);
+    Ok(())
+}

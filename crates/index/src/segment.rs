@@ -772,17 +772,9 @@ fn write_bounded_segments(
 /// merge runs, so the dictionary and postings stream to their final keys
 /// while the merge produces them.
 fn random_seg_id() -> Result<String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock is before the unix epoch")?
-        .as_nanos();
-    Ok(sha256_hex(&[
-        &nanos.to_le_bytes(),
-        &std::process::id().to_le_bytes(),
-        &COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes(),
-    ]))
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)?;
+    Ok(hex_encode(&bytes))
 }
 
 pub(crate) fn merge_and_put_segment(
@@ -825,16 +817,31 @@ pub(crate) fn merge_and_put_segment(
     for pack in packs {
         store.put_file(&pack_blob(pack.hash()), pack.path())?;
     }
-    let terms_sink = store.put_streaming(&segment_blob(&seg_id, "terms.fst"))?;
-    let postings_sink = store.put_streaming(&segment_blob(&seg_id, "postings.bin"))?;
-    let (fst, postings, terms_tail_hash) = crate::build::merge_posting_runs(
-        runs,
-        strategy,
-        u32::try_from(tables.documents.len())?,
-        terms_sink,
-        postings_sink,
-    )?;
-    store.put(&segment_blob(&seg_id, "docs.bin"), &docs_bytes)?;
+    let publish = || -> Result<(crate::build::MergedBlob, crate::build::MergedBlob, String)> {
+        let terms_sink = store.put_streaming(&segment_blob(&seg_id, "terms.fst"))?;
+        let postings_sink = store.put_streaming(&segment_blob(&seg_id, "postings.bin"))?;
+        let merged = crate::build::merge_posting_runs(
+            runs,
+            strategy,
+            u32::try_from(tables.documents.len())?,
+            terms_sink,
+            postings_sink,
+        )?;
+        store.put(&segment_blob(&seg_id, "docs.bin"), &docs_bytes)?;
+        Ok(merged)
+    };
+    let (fst, postings, terms_tail_hash) = match publish() {
+        Ok(merged) => merged,
+        Err(error) => {
+            // Random-keyed blobs from a failed publish are unreferenced and
+            // invisible to readers; delete them so they don't wait for GC.
+            // Packs stay: they are content-addressed and may be shared.
+            for name in ["terms.fst", "postings.bin", "docs.bin"] {
+                store.delete(&segment_blob(&seg_id, name)).ok();
+            }
+            return Err(error);
+        }
+    };
     let meta = SegmentMeta {
         seg_id,
         doc_count: u32::try_from(tables.documents.len())?,
