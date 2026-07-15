@@ -1928,7 +1928,7 @@ the rightful property of some one or other of their daughters\n";
         let cache_dir = tempfile::tempdir()?;
         let mut bucket = Bucket::default();
         for index in 0..8 {
-            bucket.put(&format!("doc-{index}"), &body.repeat(4));
+            bucket.put(&format!("doc-{index}"), body);
         }
         let listing = bucket.listing();
         update_index(
@@ -1943,15 +1943,27 @@ the rightful property of some one or other of their daughters\n";
         Ok((store_dir, cache_dir, bucket))
     };
 
-    let (prose_store, prose_cache, prose_bucket) = build(prose_line)?;
+    let (prose_store, prose_cache, prose_bucket) = build(&prose_line.repeat(4))?;
     assert_eq!(
         strategy_of(prose_store.path(), prose_cache.path())?,
         Strategy::Sparse
     );
-    let (json_store, json_cache, _) = build(json_line)?;
+    let (json_store, json_cache, _) = build(&json_line.repeat(4))?;
     assert_eq!(
         strategy_of(json_store.path(), json_cache.path())?,
         Strategy::Trigram
+    );
+
+    // Archives classify on the member text the index ingests, not on the
+    // container bytes: prose inside .tar.gz still picks sparse.
+    let archive = encode::gzip(&encode::tar(&[(
+        "book/chapter.txt",
+        prose_line.repeat(4).as_slice(),
+    )]));
+    let (tar_store, tar_cache, _) = build(&archive)?;
+    assert_eq!(
+        strategy_of(tar_store.path(), tar_cache.path())?,
+        Strategy::Sparse
     );
 
     // An incremental auto update follows the recorded strategy and stays

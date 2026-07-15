@@ -1169,7 +1169,33 @@ fn parse_remote_terms_min(configured: Option<&str>) -> Result<u64> {
     }
 }
 
-/// Sample a spread of small listing entries, decode them, and classify the
+/// Collects the decoded logical text of one sampled source — archives
+/// expanded into member text, exactly as indexing ingests them — capped at
+/// the sampling window.
+struct SampleWindow {
+    window: Vec<u8>,
+    cap: usize,
+}
+
+impl holys3_core::DecodeSink for SampleWindow {
+    fn begin(&mut self, _: &holys3_core::LogicalDocumentMeta) -> Result<()> {
+        Ok(())
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        let room = self.cap - self.window.len();
+        self.window
+            .extend_from_slice(&bytes[..bytes.len().min(room)]);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Sample a spread of small listing entries, decode them through the same
+/// source expansion as indexing (archives included), and classify the
 /// decoded text: the sparse strategy wins only when at least two thirds of
 /// the sampled bytes read as prose. Objects too large to decode eagerly are
 /// skipped; an unsampleable listing conservatively picks trigram.
@@ -1196,16 +1222,21 @@ fn detect_strategy(
             let Ok(bytes) = corpus.fetch(idx) else {
                 continue;
             };
-            let Ok(decoded) = holys3_core::decode_body(key, bytes.to_vec()) else {
-                continue;
+            let mut sample = SampleWindow {
+                window: Vec::new(),
+                cap: SAMPLE_WINDOW,
             };
-            let window = &decoded[..decoded.len().min(SAMPLE_WINDOW)];
-            match holys3_core::is_prose_like(window) {
+            if holys3_core::decode_source(key, bytes, holys3_core::DECODE_LIMITS, &mut sample)
+                .is_err()
+            {
+                continue;
+            }
+            match holys3_core::is_prose_like(&sample.window) {
                 Some(true) => {
-                    prose_bytes += window.len() as u64;
-                    classified_bytes += window.len() as u64;
+                    prose_bytes += sample.window.len() as u64;
+                    classified_bytes += sample.window.len() as u64;
                 }
-                Some(false) => classified_bytes += window.len() as u64,
+                Some(false) => classified_bytes += sample.window.len() as u64,
                 None => {}
             }
         }
