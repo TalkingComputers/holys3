@@ -351,6 +351,16 @@ pub fn update_index(
         eprintln!("note: --rebuild requested; re-ingesting everything");
     }
     let (root, root_version) = load_segment_list(store)?;
+    // Reject a source mismatch before strategy detection: auto-selection may
+    // sample the target, and an invalid index/target pairing must fail
+    // without any fetching.
+    if let (RootState::Loaded(list), false) = (&root, rebuild) {
+        anyhow::ensure!(
+            list.source == *source,
+            "index was built for {}, not {source}; use --rebuild to replace it",
+            list.source
+        );
+    }
     let strategy = match strategy {
         Some(strategy) => strategy,
         None => match (&root, rebuild) {
@@ -369,11 +379,6 @@ pub fn update_index(
     } else {
         match root {
             RootState::Loaded(list) => {
-                anyhow::ensure!(
-                    list.source == *source,
-                    "index was built for {}, not {source}; use --rebuild to replace it",
-                    list.source
-                );
                 if list.strategy == strategy {
                     list.segments
                 } else {
