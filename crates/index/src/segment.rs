@@ -771,17 +771,18 @@ fn write_bounded_segments(
 /// trusts is recorded in segments.bin, and a random ID is known before the
 /// merge runs, so the dictionary and postings stream to their final keys
 /// while the merge produces them.
-fn random_seg_id() -> String {
+fn random_seg_id() -> Result<String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    sha256_hex(&[
+        .context("system clock is before the unix epoch")?
+        .as_nanos();
+    Ok(sha256_hex(&[
         &nanos.to_le_bytes(),
         &std::process::id().to_le_bytes(),
         &COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes(),
-    ])
+    ]))
 }
 
 pub(crate) fn merge_and_put_segment(
@@ -820,7 +821,7 @@ pub(crate) fn merge_and_put_segment(
     }
     let docs_bytes = postcard::to_allocvec(tables)?;
     let docs_hash = sha256_hex(&[&docs_bytes]);
-    let seg_id = random_seg_id();
+    let seg_id = random_seg_id()?;
     for pack in packs {
         store.put_file(&pack_blob(pack.hash()), pack.path())?;
     }
