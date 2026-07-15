@@ -51,12 +51,17 @@ jobs:
       - name: Run base Criterion benches
         if: github.event_name == 'pull_request'
         working-directory: benchmark-base
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --save-baseline pull-request-base
-      - name: Keep only the named base results
+      - name: Import base baselines
         if: github.event_name == 'pull_request'
-        run: rm -rf target/criterion/*/new target/criterion/*/change target/criterion/*/report
+        # The base build gets its own target dir so its artifacts can never
+        # satisfy PR compilation units (a shared dir let a stale
+        # holys3-core rlib shadow the PR's when the public API changed);
+        # only the Criterion baselines cross over.
+        run: |
+          mkdir -p target/criterion
+          cp -R benchmark-base/target/criterion/. target/criterion/
+          rm -rf target/criterion/*/new target/criterion/*/change target/criterion/*/report
       - name: Run Criterion benches against PR base
         if: github.event_name == 'pull_request'
         run: cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --baseline-lenient pull-request-base
