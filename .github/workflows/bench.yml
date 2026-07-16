@@ -235,10 +235,13 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          limit_kib = 96 * 1024
+          # Index builds carry streamed-multipart part buffers (#44) and
+          # parallel run writers (#43); searches do not, so they keep the
+          # tighter ceiling.
           for path in Path(".").glob("bench-s3-*.txt"):
               if path.name.endswith("-hits.txt"):
                   continue
+              limit_kib = (144 if "index" in path.name else 96) * 1024
               lines = path.read_text().splitlines()
               field = next(line for line in lines if "Maximum resident set size" in line)
               peak_kib = int(field.rsplit(":", 1)[1])
@@ -261,8 +264,11 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          limit_kib = 112 * 1024
+          # Same split as the large-object gate: index paths stream uploads
+          # (measured 115.2 MiB against the old 112 MiB ceiling), searches
+          # stay tight.
           for name in ("bench-entropy-index.txt", "bench-entropy-search.txt"):
+              limit_kib = (144 if "index" in name else 112) * 1024
               lines = Path(name).read_text().splitlines()
               field = next(line for line in lines if "Maximum resident set size" in line)
               peak_kib = int(field.rsplit(":", 1)[1])
@@ -463,13 +469,13 @@ jobs:
               if peak_kib > limit_kib:
                   raise SystemExit(f"{name}: peak RSS {peak_kib} KiB exceeds {limit_kib} KiB")
 
-          expansion_limit_kib = 96 * 1024
           for name in (
               "bench-expansion-index.txt",
               "bench-expansion-search.txt",
               "bench-expansion-sparse-index.txt",
               "bench-expansion-sparse-search.txt",
           ):
+              expansion_limit_kib = (144 if "index" in name else 96) * 1024
               lines = Path(name).read_text().splitlines()
               field = next(line for line in lines if "Maximum resident set size" in line)
               peak_kib = int(field.rsplit(":", 1)[1])
