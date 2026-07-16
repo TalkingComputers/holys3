@@ -1991,3 +1991,46 @@ the rightful property of some one or other of their daughters\n";
     );
     Ok(())
 }
+
+#[test]
+fn colliding_gram_hashes_keep_results_exact() -> Result<()> {
+    // Brute-forced fixture: these documents emit sparse grams ("tzoib" and
+    // "g gprvy yivs") whose 40-bit hashes collide, so the real build path
+    // must merge their posting lists into one dictionary entry. Verified
+    // through the public API so a hash-function change fails loudly here.
+    let doc_a = "jmbv utzoib puqp gebp";
+    let doc_b = "xwpekcg gprvy yivsfiv sfivsf";
+    let collides = holys3_core::iterate_sparse_grams(doc_a.as_bytes()).any(|gram_a| {
+        holys3_core::iterate_sparse_grams(doc_b.as_bytes()).any(|gram_b| {
+            gram_a != gram_b && holys3_core::hash_ngram(gram_a) == holys3_core::hash_ngram(gram_b)
+        })
+    });
+    assert!(collides, "fixture documents must emit colliding grams");
+
+    let mut bucket = Bucket::default();
+    bucket.put("a.txt", doc_a.as_bytes());
+    bucket.put("b.txt", doc_b.as_bytes());
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Sparse,
+    )?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    // Querying either side of the collision must return exactly its true
+    // matches: a build that kept only one gram's documents in the merged
+    // entry would return nothing for the other.
+    let (matches, stats) = search_collect(&reader, "tzoib")?;
+    assert_eq!(stats.hits, ["a.txt"]);
+    assert_eq!(matches.len(), 1);
+    let (matches, stats) = search_collect(&reader, "g gprvy yivs")?;
+    assert_eq!(stats.hits, ["b.txt"]);
+    assert_eq!(matches.len(), 1);
+    Ok(())
+}

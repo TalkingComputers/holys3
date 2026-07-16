@@ -1,6 +1,14 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+/// Full-width stable hash for cache directory scoping. Deliberately NOT
+/// [`crate::hash_ngram`]: gram hashes are an index-format concern whose
+/// width changes with the format, while cache paths must stay put across
+/// format bumps and keep the full 64 bits against scope collisions.
+pub fn hash_cache_scope(scope: &[u8]) -> u64 {
+    rapidhash::v3::rapidhash_v3(scope)
+}
+
 /// Platform cache root: `$XDG_CACHE_HOME`, else `~/.cache`.
 pub fn cache_home() -> Result<PathBuf> {
     read_cache_home(

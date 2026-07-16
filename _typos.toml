@@ -1,6 +1,10 @@
 [files]
 extend-exclude = ["crates/xbench/runs/*.json"]
 
+[default]
+# brute-forced 40-bit hash-collision fixture (grams are arbitrary bytes)
+extend-ignore-re = ["plo ba"]
+
 [default.extend-words]
 AIMD = "AIMD"
 Aimd = "Aimd"

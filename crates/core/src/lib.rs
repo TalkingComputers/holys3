@@ -13,7 +13,7 @@ pub mod testutil;
 
 pub type DocId = u32;
 
-pub use cache::{cache_home, read_cache_home};
+pub use cache::{cache_home, hash_cache_scope, read_cache_home};
 pub use codec::{
     decode_body, decode_requested, decode_requested_body, decode_source, decode_source_body,
     is_raw_body, is_raw_source, DecodeLimits, DecodeSink, DecodeSummary, DocumentBody,

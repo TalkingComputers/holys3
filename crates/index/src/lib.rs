@@ -55,7 +55,7 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 14;
+const INDEX_FORMAT: u32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
