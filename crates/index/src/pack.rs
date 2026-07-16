@@ -339,10 +339,13 @@ fn visit_blocks(
                     let compressed = bytes
                         .get(cursor..end)
                         .context("pack range ended inside a block")?;
+                    visit_compressed_block(blocks, *block_id, compressed, visit)?;
+                    // Cache only after the block verifies: a corrupt fetch
+                    // must stay a transient failure, never clobber a valid
+                    // on-disk entry.
                     if let Some(cache) = cache {
                         cache.store(pack, block, compressed);
                     }
-                    visit_compressed_block(blocks, *block_id, compressed, visit)?;
                     cursor = end;
                 }
                 anyhow::ensure!(cursor == bytes.len(), "unparsed bytes remain in pack range");
