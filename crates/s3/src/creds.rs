@@ -45,9 +45,23 @@ struct StoredCredentials {
     expires_unix_secs: u64,
 }
 
+/// The config-derived part of the cache key, frozen when the SDK froze its
+/// own view of the same files (provider construction happens within the same
+/// load): profile selection plus both shared config files. The SSO token
+/// cache is deliberately NOT frozen — the SSO provider re-reads it on every
+/// resolution, so the key hashes it live per lookup and a fresh `aws sso
+/// login` moves the key.
+#[derive(Debug)]
+struct KeyBase {
+    dir: PathBuf,
+    sso_cache_dir: PathBuf,
+    frozen: [u8; 32],
+}
+
 #[derive(Debug)]
 pub(crate) struct DiskCachedProvider {
     inner: SharedCredentialsProvider,
+    base: Option<KeyBase>,
     #[cfg(test)]
     path_override: Option<PathBuf>,
 }
@@ -56,6 +70,7 @@ impl DiskCachedProvider {
     pub(crate) fn new(inner: SharedCredentialsProvider) -> Self {
         Self {
             inner,
+            base: key_base(),
             #[cfg(test)]
             path_override: None,
         }
@@ -65,6 +80,7 @@ impl DiskCachedProvider {
     fn with_path(inner: SharedCredentialsProvider, path: PathBuf) -> Self {
         Self {
             inner,
+            base: None,
             path_override: Some(path),
         }
     }
@@ -74,7 +90,21 @@ impl DiskCachedProvider {
         if let Some(path) = &self.path_override {
             return Some(path.clone());
         }
-        cache_path()
+        let base = self.base.as_ref()?;
+        let mut hasher = Sha256::new();
+        hasher.update(base.frozen);
+        for (name, bytes) in sso_token_cache_state(&base.sso_cache_dir)? {
+            hasher.update(&name);
+            hasher.update([0]);
+            hasher.update(&bytes);
+            hasher.update([0]);
+        }
+        let key = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Some(base.dir.join(format!("{key}.json")))
     }
 
     async fn load(&self) -> provider::Result {
@@ -109,7 +139,8 @@ impl ProvideCredentials for DiskCachedProvider {
 }
 
 /// Reads a keyed input file. Absent is a legitimate state (hashed as empty);
-/// any other read error disables caching rather than mis-keying the entry.
+/// any other read error disables caching rather than storing an entry under
+/// the wrong key.
 fn read_keyed_file(path: &Path) -> Option<Vec<u8>> {
     match std::fs::read(path) {
         Ok(bytes) => Some(bytes),
@@ -118,31 +149,58 @@ fn read_keyed_file(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
-/// True when the active profile section configures SSO, directly or via an
-/// `sso_session` reference.
-fn profile_uses_sso(config: &str, profile: &str) -> bool {
+/// The lines of the active profile's section. Config files title profile
+/// sections `[profile name]` (`[default]` for the default profile);
+/// credentials files title them `[name]`.
+fn profile_section<'a>(text: &'a str, profile: &str, prefixed: bool) -> Vec<&'a str> {
+    let mut lines = Vec::new();
     let mut in_profile = false;
-    for line in config.lines() {
+    for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
             let header = line.trim_start_matches('[').trim_end_matches(']').trim();
-            in_profile = header == format!("profile {profile}")
-                || (profile == "default" && header == "default");
-        } else if in_profile
-            && (line.starts_with("sso_session") || line.starts_with("sso_start_url"))
-        {
-            return true;
+            in_profile = header == profile || (prefixed && header == format!("profile {profile}"));
+        } else if in_profile {
+            lines.push(line);
         }
     }
-    false
+    lines
 }
 
-/// The cache key covers every input SSO resolution reads to pick an
-/// identity: the profile selection, both shared config files, and the SSO
-/// token cache. Any change — a config edit, a fresh `aws sso login` — moves
-/// the key, so a stale entry can never serve another identity. Environments
-/// that resolve credentials some other way return `None`: no cache.
-fn cache_path() -> Option<PathBuf> {
+/// True when the active profile resolves through SSO and nothing else: its
+/// config section carries an SSO marker and neither file's section names a
+/// competing credential source. A section mixing `credential_process` or an
+/// assume-role with SSO fields is not keyable and must not cache.
+fn profile_selects_sso(config: &str, credentials: &str, profile: &str) -> bool {
+    let config_section = profile_section(config, profile, true);
+    if !config_section
+        .iter()
+        .any(|line| line.starts_with("sso_session") || line.starts_with("sso_start_url"))
+    {
+        return false;
+    }
+    let credentials_section = profile_section(credentials, profile, false);
+    const COMPETING_SOURCES: [&str; 6] = [
+        "credential_process",
+        "credential_source",
+        "web_identity_token_file",
+        "role_arn",
+        "source_profile",
+        "aws_access_key_id",
+    ];
+    !config_section
+        .iter()
+        .chain(credentials_section.iter())
+        .any(|line| COMPETING_SOURCES.iter().any(|key| line.starts_with(key)))
+}
+
+/// Everything SSO resolution reads to pick an identity, snapshotted while
+/// the SDK holds the same view: the profile selection and both shared config
+/// files. Environments that resolve credentials some other way return
+/// `None`: no cache. `AWS_DEFAULT_PROFILE` is deliberately ignored — the
+/// Rust SDK only honors `AWS_PROFILE`, and the key must select exactly the
+/// profile the SDK resolves.
+fn key_base() -> Option<KeyBase> {
     for var in [
         "AWS_ACCESS_KEY_ID",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
@@ -157,9 +215,7 @@ fn cache_path() -> Option<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;
     let home = Path::new(&home);
-    let profile = std::env::var("AWS_PROFILE")
-        .or_else(|_| std::env::var("AWS_DEFAULT_PROFILE"))
-        .unwrap_or_else(|_| "default".to_owned());
+    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_owned());
     let config_path = std::env::var("AWS_CONFIG_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home.join(".aws/config"));
@@ -167,7 +223,12 @@ fn cache_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| home.join(".aws/credentials"));
     let config = read_keyed_file(&config_path)?;
-    if !profile_uses_sso(&String::from_utf8_lossy(&config), &profile) {
+    let credentials = read_keyed_file(&credentials_path)?;
+    if !profile_selects_sso(
+        &String::from_utf8_lossy(&config),
+        &String::from_utf8_lossy(&credentials),
+        &profile,
+    ) {
         return None;
     }
     let mut hasher = Sha256::new();
@@ -175,24 +236,16 @@ fn cache_path() -> Option<PathBuf> {
     hasher.update([0]);
     hasher.update(&config);
     hasher.update([0]);
-    hasher.update(read_keyed_file(&credentials_path)?);
+    hasher.update(&credentials);
     hasher.update([0]);
-    for (name, bytes) in sso_token_cache_state(&home.join(".aws/sso/cache"))? {
-        hasher.update(&name);
-        hasher.update([0]);
-        hasher.update(&bytes);
-        hasher.update([0]);
-    }
-    let key = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let mut path = holys3_core::cache_home().ok()?;
-    path.push("holys3");
-    path.push("credentials");
-    path.push(format!("{key}.json"));
-    Some(path)
+    let mut dir = holys3_core::cache_home().ok()?;
+    dir.push("holys3");
+    dir.push("credentials");
+    Some(KeyBase {
+        dir,
+        sso_cache_dir: home.join(".aws/sso/cache"),
+        frozen: hasher.finalize().into(),
+    })
 }
 
 /// The SSO token cache contents, sorted by file name. A missing directory is
@@ -217,10 +270,17 @@ fn sso_token_cache_state(dir: &Path) -> Option<Vec<(String, Vec<u8>)>> {
 }
 
 fn read_cached(path: &Path, now: SystemTime) -> Option<Credentials> {
-    if std::fs::metadata(path).ok()?.len() > MAX_ENTRY_BYTES {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_ENTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_ENTRY_BYTES {
         return None;
     }
-    let stored: StoredCredentials = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let stored: StoredCredentials = serde_json::from_slice(&bytes).ok()?;
     let expiry =
         SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(stored.expires_unix_secs))?;
     if expiry <= now.checked_add(EXPIRY_MARGIN)? {
@@ -363,18 +423,49 @@ mod tests {
     }
 
     #[test]
-    fn only_sso_profiles_enable_the_cache() {
+    fn only_pure_sso_profiles_enable_the_cache() {
         let sso = "[default]\nsso_session = corp\nregion = us-east-2\n\n[sso-session corp]\nsso_start_url = https://corp.awsapps.com/start\n";
-        assert!(profile_uses_sso(sso, "default"));
-        assert!(!profile_uses_sso(sso, "other"));
+        assert!(profile_selects_sso(sso, "", "default"));
+        assert!(!profile_selects_sso(sso, "", "other"));
 
         let legacy = "[profile books]\nsso_start_url = https://corp.awsapps.com/start\n";
-        assert!(profile_uses_sso(legacy, "books"));
+        assert!(profile_selects_sso(legacy, "", "books"));
 
         let iam = "[default]\nregion = us-east-2\n\n[profile books]\ncredential_process = /usr/bin/vault-helper\n";
-        assert!(!profile_uses_sso(iam, "default"));
-        assert!(!profile_uses_sso(iam, "books"));
-        assert!(!profile_uses_sso("", "default"));
+        assert!(!profile_selects_sso(iam, "", "default"));
+        assert!(!profile_selects_sso(iam, "", "books"));
+        assert!(!profile_selects_sso("", "", "default"));
+    }
+
+    #[test]
+    fn competing_credential_sources_disable_the_cache() {
+        // SSO fields mixed with another source in the same section: the
+        // chain may not resolve via SSO, so nothing is keyable.
+        let mixed = "[profile books]\nsso_start_url = https://corp.awsapps.com/start\ncredential_process = /usr/bin/vault-helper\n";
+        assert!(!profile_selects_sso(mixed, "", "books"));
+
+        let assumed = "[profile books]\nsso_session = corp\nrole_arn = arn:aws:iam::1:role/x\nsource_profile = base\n";
+        assert!(!profile_selects_sso(assumed, "", "books"));
+
+        // The credentials file wins over the config file for the same
+        // profile name; a competing entry there must also disqualify.
+        let sso = "[profile books]\nsso_session = corp\n";
+        assert!(profile_selects_sso(sso, "", "books"));
+        assert!(!profile_selects_sso(
+            sso,
+            "[books]\naws_access_key_id = AKID\n",
+            "books"
+        ));
+        assert!(!profile_selects_sso(
+            sso,
+            "[books]\ncredential_process = /usr/bin/helper\n",
+            "books"
+        ));
+        assert!(profile_selects_sso(
+            sso,
+            "[other]\naws_access_key_id = AKID\n",
+            "books"
+        ));
     }
 
     #[derive(Debug)]

@@ -38,8 +38,12 @@ mod tests {
         let path = read_cache_home(Err(VarError::NotPresent), Ok("/home/me".to_owned())).unwrap();
         assert_eq!(path, PathBuf::from("/home/me/.cache"));
 
-        let path = read_cache_home(Ok("/cache".to_owned()), Err(VarError::NotPresent)).unwrap();
-        assert_eq!(path, PathBuf::from("/cache"));
+        #[cfg(windows)]
+        let absolute = "C:\\cache";
+        #[cfg(not(windows))]
+        let absolute = "/cache";
+        let path = read_cache_home(Ok(absolute.to_owned()), Err(VarError::NotPresent)).unwrap();
+        assert_eq!(path, PathBuf::from(absolute));
     }
 
     #[test]
