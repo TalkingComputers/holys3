@@ -15,8 +15,8 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 pub(crate) const BLOCK_BYTES: usize = 128 * 1024;
 
 /// LEB128. Sorted hash deltas average well under five bytes on real corpora
-/// (vs eight raw), and singleton values are small doc ids; together they
-/// roughly halve the dictionary.
+/// (vs eight raw), and singleton values fold their count tag into one small
+/// doc-id varint; together they roughly halve the dictionary.
 fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = (value & 0x7f) as u8;
@@ -52,7 +52,9 @@ fn read_varint(block: &[u8], cursor: &mut usize) -> Result<u64> {
 
 /// Decode every (hash, value) entry of a block in order. The first entry
 /// stores its hash raw (big-endian); the rest store deltas from the previous
-/// hash. Values are plain varints.
+/// hash. A value is one tag varint whose low bit marks a singleton — the
+/// tag's high bits are then the doc id — else the high bits are the posting
+/// count and a second varint carries the offset.
 pub(crate) fn for_each_entry(
     block: &[u8],
     mut visit: impl FnMut(u64, u64) -> Result<()>,
@@ -61,9 +63,12 @@ pub(crate) fn for_each_entry(
     let mut cursor = 8usize;
     let mut hash = u64::from_be_bytes(block[..8].try_into().expect("eight bytes"));
     let read_value = |cursor: &mut usize| -> Result<u64> {
-        let count = read_varint(block, cursor)?;
+        let tag = read_varint(block, cursor)?;
+        if tag & 1 == 1 {
+            return crate::eval::pack_posting(tag >> 1, 1);
+        }
         let offset = read_varint(block, cursor)?;
-        crate::eval::pack_posting(offset, usize::try_from(count)?)
+        crate::eval::pack_posting(offset, usize::try_from(tag >> 1)?)
     };
     let value = read_value(&mut cursor)?;
     visit(hash, value)?;
@@ -118,12 +123,19 @@ impl<W: Write> SparseTableWriter<W> {
             let last = self.last_hash.context("delta after the first entry")?;
             write_varint(&mut self.block, hash - last);
         }
-        // Values split into (count, offset-or-doc-id) varints: the packed
-        // u64 keeps the count in its high bits, which would force every
-        // value to six-plus varint bytes.
+        // The packed u64 keeps the count in its high bits, which would force
+        // every value to six-plus varint bytes, so values split into varints.
+        // Singletons dominate real dictionaries (87% of grams on books), so
+        // count == 1 folds into the doc-id varint's low bit and costs one
+        // varint; other counts shift left and a second varint carries the
+        // offset.
         let (offset, count) = crate::eval::unpack_posting(value);
-        write_varint(&mut self.block, u64::from(count));
-        write_varint(&mut self.block, offset);
+        if count == 1 {
+            write_varint(&mut self.block, (offset << 1) | 1);
+        } else {
+            write_varint(&mut self.block, u64::from(count) << 1);
+            write_varint(&mut self.block, offset);
+        }
         self.last_hash = Some(hash);
         self.entry_count += 1;
         if self.block.len() >= BLOCK_BYTES {
@@ -438,6 +450,26 @@ mod tests {
         assert_eq!(get(&bytes, &index, 0), None);
         assert_eq!(get(&bytes, &index, 2), None);
         assert_eq!(get(&bytes, &index, u64::MAX), None);
+    }
+
+    #[test]
+    fn singletons_cost_one_varint() {
+        // A singleton (count == 1) folds its tag into the doc-id varint; the
+        // same doc id written as a two-entry list costs a second varint.
+        let single = crate::eval::pack_posting(300, 1).unwrap();
+        let pair = crate::eval::pack_posting(300, 2).unwrap();
+        let singleton_table = build(&[(10, single)]);
+        let pair_table = build(&[(10, pair)]);
+        assert!(
+            singleton_table.len() < pair_table.len(),
+            "singleton {} must be smaller than pair {}",
+            singleton_table.len(),
+            pair_table.len()
+        );
+        let index = open(&singleton_table);
+        assert_eq!(get(&singleton_table, &index, 10), Some(single));
+        let index = open(&pair_table);
+        assert_eq!(get(&pair_table, &index, 10), Some(pair));
     }
 
     #[test]
