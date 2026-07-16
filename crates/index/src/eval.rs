@@ -63,8 +63,8 @@ pub(crate) fn resolve(
     q: &Query,
     doc_count: u32,
     lookup: &dyn Fn(&[u8]) -> Option<u64>,
-) -> Resolved {
-    match q {
+) -> Result<Resolved> {
+    Ok(match q {
         Query::All => Resolved::All,
         Query::Gram(gram) => match lookup(gram) {
             Some(value) => {
@@ -74,13 +74,16 @@ pub(crate) fn resolve(
                 } else if count == 1 {
                     // Singleton grams inline their doc id in the offset
                     // field: no postings entry exists and none is fetched.
-                    // An id at or past doc_count is a corrupt index; treating
-                    // it as unmatchable keeps the superset contract (the
-                    // whole-file hashes catch real corruption loudly).
-                    match u32::try_from(offset) {
-                        Ok(id) if id < doc_count => Resolved::Doc(id),
-                        _ => Resolved::None,
-                    }
+                    // An out-of-range id is a corrupt dictionary and must
+                    // fail loudly — mapping it to an empty result would be
+                    // a silent false negative.
+                    let id = u32::try_from(offset)
+                        .ok()
+                        .filter(|id| *id < doc_count)
+                        .with_context(|| {
+                            format!("singleton doc id {offset} is outside 0..{doc_count}")
+                        })?;
+                    Resolved::Doc(id)
                 } else {
                     Resolved::Gram { offset, count }
                 }
@@ -90,8 +93,8 @@ pub(crate) fn resolve(
         Query::And(subs) => {
             let mut children = Vec::new();
             for sub in subs {
-                match resolve(sub, doc_count, lookup) {
-                    Resolved::None => return Resolved::None,
+                match resolve(sub, doc_count, lookup)? {
+                    Resolved::None => return Ok(Resolved::None),
                     Resolved::All => {}
                     resolved => children.push(resolved),
                 }
@@ -101,8 +104,8 @@ pub(crate) fn resolve(
         Query::Or(subs) => {
             let mut children = Vec::new();
             for sub in subs {
-                match resolve(sub, doc_count, lookup) {
-                    Resolved::All => return Resolved::All,
+                match resolve(sub, doc_count, lookup)? {
+                    Resolved::All => return Ok(Resolved::All),
                     Resolved::None => {}
                     resolved => children.push(resolved),
                 }
@@ -115,7 +118,7 @@ pub(crate) fn resolve(
                 Resolved::Or(children)
             }
         }
-    }
+    })
 }
 
 fn prune_and(children: Vec<Resolved>) -> Resolved {
@@ -272,6 +275,18 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_singleton_ids_fail_loudly() {
+        // count == 1 tags the offset as a doc id; an out-of-range id must
+        // error, never silently shrink results.
+        let lookup = |_: &[u8]| Some(pack_posting(500, 1).expect("test setup failed"));
+        let error = match resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup) {
+            Err(error) => error,
+            Ok(_) => panic!("out-of-range singleton must error"),
+        };
+        assert!(error.to_string().contains("singleton"), "{error:#}");
+    }
+
+    #[test]
     fn absent_gram_collapses_and_to_none() {
         let q = Query::And(vec![
             Query::Gram(b"abc".to_vec()),
@@ -279,7 +294,8 @@ mod tests {
         ]);
         let resolved = resolve(&q, 100, &|g: &[u8]| {
             (g == b"abc").then(|| pack_posting(0, 2).expect("test setup failed"))
-        });
+        })
+        .expect("resolve");
         assert!(matches!(resolved, Resolved::None));
         let mut needed = BTreeMap::new();
         blocks_needed(&resolved, &mut needed);
@@ -290,7 +306,7 @@ mod tests {
     fn dense_gram_resolves_to_all_without_fetch() {
         // a gram in every doc constrains nothing: All, no block needed
         let lookup = |_: &[u8]| Some(pack_posting(64, 100).expect("test setup failed"));
-        let resolved = resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup);
+        let resolved = resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup).expect("resolve");
         assert!(matches!(resolved, Resolved::All));
         let mut needed = BTreeMap::new();
         blocks_needed(&resolved, &mut needed);
@@ -298,7 +314,7 @@ mod tests {
         // one doc short of dense -> still a real constraint
         let lookup = |_: &[u8]| Some(pack_posting(64, 99).expect("test setup failed"));
         assert!(matches!(
-            resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup),
+            resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup).expect("resolve"),
             Resolved::Gram { count: 99, .. }
         ));
     }
