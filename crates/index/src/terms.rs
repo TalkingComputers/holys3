@@ -386,4 +386,42 @@ mod tests {
             );
         }
     }
+
+    // A block that fails to decode is a corrupt dictionary: get() must
+    // surface the error, not report the gram as absent.
+    #[test]
+    fn corrupt_sparse_blocks_error_instead_of_resolving_absent() {
+        let grams: Vec<&[u8]> = vec![b"whale", b"ahab", b"pequod", b"ishmael", b"harpoon"];
+        let mut entries: Vec<(u64, u64)> = grams
+            .iter()
+            .enumerate()
+            .map(|(value, gram)| (holys3_core::hash_ngram(gram), value as u64))
+            .collect();
+        entries.sort_unstable();
+        let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
+        for (hash, value) in &entries {
+            builder.insert(&hash.to_be_bytes(), *value).unwrap();
+        }
+        let (mut bytes, _) = builder.finish().unwrap();
+
+        let index =
+            crate::sparse_table::SparseTableIndex::parse(bytes.len() as u64, &bytes).unwrap();
+        let block = &index.blocks[0];
+        let start = usize::try_from(block.offset).unwrap() + 8;
+        let end = usize::try_from(block.offset + block.len).unwrap();
+        bytes[start..end].fill(0xFF);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terms.fst");
+        std::fs::write(&path, &bytes).unwrap();
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&path).unwrap()) }
+            .unwrap();
+        let map = TermMap::open(mmap, Strategy::Sparse).unwrap();
+        for gram in grams {
+            assert!(
+                map.get(gram).is_err(),
+                "gram {gram:?} must error on a corrupt block"
+            );
+        }
+    }
 }

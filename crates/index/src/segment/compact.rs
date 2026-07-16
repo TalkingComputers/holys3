@@ -91,61 +91,84 @@ fn write_compaction_run(
     let mut file = tempfile::NamedTempFile::new()?;
     let mut writer = BufWriter::new(file.as_file_mut());
     map.visit(|gram, packed| {
-        let (offset, count) = crate::eval::unpack_posting(packed);
-        anyhow::ensure!(count > 0, "term map contains an empty posting list");
-        anyhow::ensure!(
-            gram.len() == crate::build::key_bytes(strategy),
-            "term map gram width does not match the index strategy"
-        );
-        let mut padded = [0u8; 8];
-        padded[8 - gram.len()..].copy_from_slice(gram);
-        let key = u64::from_be_bytes(padded);
-        if count == 1 {
-            // Singleton grams inline their doc id in the offset field; no
-            // posting block exists to read.
-            let id = u32::try_from(offset).context("singleton doc id overflows u32")?;
-            if let Some(new_id) = remap
-                .get(usize::try_from(id)?)
-                .context("singleton document ID is out of bounds")?
-            {
-                crate::build::write_posting_record(&mut writer, strategy, key, *new_id)?;
-            }
-            return Ok(());
-        }
-        anyhow::ensure!(
-            count <= meta.doc_count,
-            "term map posting count exceeds its segment document count"
-        );
-        let len = crate::posting_block_len(count, meta.doc_count);
-        let end = offset
-            .checked_add(len)
-            .context("term map posting length overflows")?;
-        anyhow::ensure!(
-            end <= meta.postings_len,
-            "term map posting extends beyond postings.bin"
-        );
-        let block = postings
-            .get(usize::try_from(offset)?..usize::try_from(end)?)
-            .context("truncated postings.bin during merge")?;
-        let mut ids = Vec::new();
-        for id in crate::decode_posting_block(block, count, meta.doc_count)? {
-            if let Some(id) = remap
-                .get(usize::try_from(id)?)
-                .context("posting document ID is out of bounds")?
-            {
-                ids.push(*id);
-            }
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        for id in ids {
-            crate::build::write_posting_record(&mut writer, strategy, key, id)?;
-        }
-        Ok(())
+        write_live_entry(
+            &mut writer,
+            strategy,
+            meta.doc_count,
+            meta.postings_len,
+            &postings,
+            remap,
+            gram,
+            packed,
+        )
     })?;
     writer.flush()?;
     drop(writer);
     Ok(file.into_temp_path())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_live_entry(
+    writer: &mut impl Write,
+    strategy: Strategy,
+    doc_count: u32,
+    postings_len: u64,
+    postings: &[u8],
+    remap: &[Option<DocId>],
+    gram: &[u8],
+    packed: u64,
+) -> Result<()> {
+    let (offset, count) = crate::eval::unpack_posting(packed);
+    anyhow::ensure!(count > 0, "term map contains an empty posting list");
+    anyhow::ensure!(
+        gram.len() == crate::build::key_bytes(strategy),
+        "term map gram width does not match the index strategy"
+    );
+    let mut padded = [0u8; 8];
+    padded[8 - gram.len()..].copy_from_slice(gram);
+    let key = u64::from_be_bytes(padded);
+    if count == 1 {
+        // Singleton grams inline their doc id in the offset field; no
+        // posting block exists to read.
+        let id = u32::try_from(offset).context("singleton doc id overflows u32")?;
+        if let Some(new_id) = remap
+            .get(usize::try_from(id)?)
+            .context("singleton document ID is out of bounds")?
+        {
+            crate::build::write_posting_record(writer, strategy, key, *new_id)?;
+        }
+        return Ok(());
+    }
+    anyhow::ensure!(
+        count <= doc_count,
+        "term map posting count exceeds its segment document count"
+    );
+    let len = crate::posting_block_len(count, doc_count);
+    let end = offset
+        .checked_add(len)
+        .context("term map posting length overflows")?;
+    anyhow::ensure!(
+        end <= postings_len,
+        "term map posting extends beyond postings.bin"
+    );
+    let block = postings
+        .get(usize::try_from(offset)?..usize::try_from(end)?)
+        .context("truncated postings.bin during merge")?;
+    let mut ids = Vec::new();
+    for id in crate::decode_posting_block(block, count, doc_count)? {
+        if let Some(id) = remap
+            .get(usize::try_from(id)?)
+            .context("posting document ID is out of bounds")?
+        {
+            ids.push(*id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        crate::build::write_posting_record(writer, strategy, key, id)?;
+    }
+    Ok(())
 }
 
 pub(super) fn merge_segments(
@@ -283,4 +306,62 @@ pub(super) fn merge_segments(
         .map(|((meta, _), remap)| write_compaction_run(store, cache_dir, strategy, meta, remap))
         .collect::<Result<Vec<_>>>()?;
     crate::segment::merge_and_put_segment(store, strategy, runs, &tables, &packed.packs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::pack_posting;
+
+    #[test]
+    fn oversized_grams_error_instead_of_panicking() {
+        // A gram wider than the strategy's key is a corrupt term map; it
+        // must fail the width check, never underflow the key padding.
+        let mut writer = Vec::new();
+        let packed = pack_posting(0, 1).expect("test setup failed");
+        let error = write_live_entry(
+            &mut writer,
+            Strategy::Trigram,
+            4,
+            0,
+            &[],
+            &[Some(0), Some(1), None, Some(2)],
+            b"ninebytes",
+            packed,
+        )
+        .expect_err("oversized gram must error");
+        assert!(error.to_string().contains("gram width"), "{error:#}");
+    }
+
+    #[test]
+    fn singleton_entries_remap_without_touching_postings() {
+        let mut writer = Vec::new();
+        let packed = pack_posting(3, 1).expect("test setup failed");
+        write_live_entry(
+            &mut writer,
+            Strategy::Trigram,
+            4,
+            0,
+            &[],
+            &[Some(0), Some(1), None, Some(2)],
+            b"abc",
+            packed,
+        )
+        .expect("singleton entry");
+        assert!(!writer.is_empty(), "remapped singleton must be written");
+
+        writer.clear();
+        let out_of_bounds = pack_posting(9, 1).expect("test setup failed");
+        assert!(write_live_entry(
+            &mut writer,
+            Strategy::Trigram,
+            4,
+            0,
+            &[],
+            &[Some(0), Some(1), None, Some(2)],
+            b"abc",
+            out_of_bounds,
+        )
+        .is_err());
+    }
 }
