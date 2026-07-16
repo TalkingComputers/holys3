@@ -387,6 +387,47 @@ mod tests {
         }
     }
 
+    // Two grams colliding at the 40-bit key (the fixture pinned in
+    // holys3-core) share one dictionary entry: lookups for either gram see
+    // the merged value — a candidate superset, never a lost document.
+    #[test]
+    fn colliding_grams_share_a_merged_entry() {
+        let a: &[u8] = b"czopbaaa";
+        let b: &[u8] = b"plo ba";
+        let hash = holys3_core::hash_ngram(a);
+        assert_eq!(hash, holys3_core::hash_ngram(b), "fixture must collide");
+
+        // Different docs: the build pipeline groups records by key, so the
+        // collided entry carries a count-2 union list.
+        let union = crate::eval::pack_posting(0, 2).unwrap();
+        let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
+        builder.insert(&hash.to_be_bytes(), union).unwrap();
+        let (bytes, _) = builder.finish().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terms.fst");
+        std::fs::write(&path, &bytes).unwrap();
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&path).unwrap()) }
+            .unwrap();
+        let map = TermMap::open(mmap, Strategy::Sparse).unwrap();
+        assert_eq!(map.get(a).expect("lookup"), Some(union));
+        assert_eq!(
+            map.get(a).expect("lookup"),
+            map.get(b).expect("lookup"),
+            "both grams must resolve to the merged entry"
+        );
+
+        // Same doc: the union dedups to one id and stays an inline singleton.
+        let singleton = crate::eval::pack_posting(7, 1).unwrap();
+        let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
+        builder.insert(&hash.to_be_bytes(), singleton).unwrap();
+        let (bytes, _) = builder.finish().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&path).unwrap()) }
+            .unwrap();
+        let map = TermMap::open(mmap, Strategy::Sparse).unwrap();
+        assert_eq!(map.get(b).expect("lookup"), Some(singleton));
+    }
+
     // A block that fails to decode is a corrupt dictionary: get() must
     // surface the error, not report the gram as absent.
     #[test]

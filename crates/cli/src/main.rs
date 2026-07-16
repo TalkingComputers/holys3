@@ -774,7 +774,7 @@ fn build_cache_dir(endpoint: Option<&str>, bucket: &str, prefix: &str) -> Result
     let scope = format!("{}\0{bucket}\0{prefix}", endpoint.unwrap_or(""));
     path.push(format!(
         "{bucket}-{:016x}",
-        holys3_core::hash_ngram(scope.as_bytes())
+        holys3_core::hash_cache_scope(scope.as_bytes())
     ));
     Ok(path)
 }

@@ -62,11 +62,12 @@ pub fn trigram_grams_bytes(data: &[u8]) -> Vec<Vec<u8>> {
 /// (used as the on-disk + in-memory gram key).
 /// Sparse gram keys are 40-bit hashes. Truncation shrinks the dictionary's
 /// sorted hash deltas (measured on real prose: −22% of the whole dictionary
-/// vs 48 bits), and a collision only merges two grams' postings — a slightly
-/// larger candidate superset that verification filters exactly, and that
-/// `prune_and` deprioritizes like any common gram. Measured on a 126M-gram
-/// corpus: 0.01% of grams collide, adding 0.0003 candidate docs per query
-/// gram on average. Changing this width changes the index format.
+/// vs 48 bits), and a collision only merges the colliding grams' postings —
+/// a slightly larger candidate superset that verification filters exactly,
+/// and that AND queries deprioritize the way they do any common gram.
+/// Measured on a 126M-gram corpus: 0.01% of grams collide, adding 0.0003
+/// candidate docs per query gram on average. Changing this width changes
+/// the index format.
 pub fn hash_ngram(gram: &[u8]) -> u64 {
     rapidhash::v3::rapidhash_v3(gram) & ((1 << 40) - 1)
 }
@@ -257,6 +258,20 @@ mod invariant_grams {
 
 #[cfg(test)]
 mod tests {
+    /// A real 40-bit collision pair (brute-forced against rapidhash v3).
+    /// Pins both the hash function's stability and a fixture other crates'
+    /// collision tests rely on: colliding grams must merge into a candidate
+    /// superset, never lose documents.
+    #[test]
+    fn collision_fixture_still_collides() {
+        assert_eq!(
+            hash_ngram(b"czopbaaa"),
+            hash_ngram(b"plo ba"),
+            "fixture pair must collide at 40 bits"
+        );
+        assert_eq!(hash_ngram(b"czopbaaa"), 0x00bc_761f_b68b);
+    }
+
     use super::*;
 
     #[test]
