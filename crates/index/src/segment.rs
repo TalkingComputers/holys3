@@ -1089,7 +1089,7 @@ impl SegmentedReader {
                 _ => None,
             };
             let lookup = |gram: &[u8]| match &remote_values {
-                Some(values) => values.get(&holys3_core::hash_ngram(gram)).copied(),
+                Some(values) => Ok(values.get(&holys3_core::hash_ngram(gram)).copied()),
                 None => segment.map.get(gram),
             };
             let ids = self.classify_index_result(candidates_with(

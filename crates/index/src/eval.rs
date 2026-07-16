@@ -62,21 +62,20 @@ pub(crate) enum Resolved {
 pub(crate) fn resolve(
     q: &Query,
     doc_count: u32,
-    lookup: &dyn Fn(&[u8]) -> Option<u64>,
+    lookup: &dyn Fn(&[u8]) -> Result<Option<u64>>,
 ) -> Result<Resolved> {
     Ok(match q {
         Query::All => Resolved::All,
-        Query::Gram(gram) => match lookup(gram) {
+        Query::Gram(gram) => match lookup(gram)? {
             Some(value) => {
                 let (offset, count) = unpack_posting(value);
-                if count >= doc_count {
-                    Resolved::All
-                } else if count == 1 {
+                if count == 1 {
                     // Singleton grams inline their doc id in the offset
                     // field: no postings entry exists and none is fetched.
                     // An out-of-range id is a corrupt dictionary and must
                     // fail loudly — mapping it to an empty result would be
-                    // a silent false negative.
+                    // a silent false negative. Checked before the ALL
+                    // shortcut so one-document segments validate too.
                     let id = u32::try_from(offset)
                         .ok()
                         .filter(|id| *id < doc_count)
@@ -84,6 +83,8 @@ pub(crate) fn resolve(
                             format!("singleton doc id {offset} is outside 0..{doc_count}")
                         })?;
                     Resolved::Doc(id)
+                } else if count >= doc_count {
+                    Resolved::All
                 } else {
                     Resolved::Gram { offset, count }
                 }
@@ -278,12 +279,20 @@ mod tests {
     fn corrupt_singleton_ids_fail_loudly() {
         // count == 1 tags the offset as a doc id; an out-of-range id must
         // error, never silently shrink results.
-        let lookup = |_: &[u8]| Some(pack_posting(500, 1).expect("test setup failed"));
+        let lookup = |_: &[u8]| Ok(Some(pack_posting(500, 1).expect("test setup failed")));
         let error = match resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup) {
             Err(error) => error,
             Ok(_) => panic!("out-of-range singleton must error"),
         };
         assert!(error.to_string().contains("singleton"), "{error:#}");
+        // One-document segments must validate too: count == 1 also satisfies
+        // count >= doc_count, and the ALL shortcut must not mask corruption.
+        assert!(resolve(&Query::Gram(b"abc".to_vec()), 1, &lookup).is_err());
+        let valid = |_: &[u8]| Ok(Some(pack_posting(0, 1).expect("test setup failed")));
+        assert!(matches!(
+            resolve(&Query::Gram(b"abc".to_vec()), 1, &valid).expect("resolve"),
+            Resolved::Doc(0)
+        ));
     }
 
     #[test]
@@ -293,7 +302,7 @@ mod tests {
             Query::Gram(b"zzz".to_vec()),
         ]);
         let resolved = resolve(&q, 100, &|g: &[u8]| {
-            (g == b"abc").then(|| pack_posting(0, 2).expect("test setup failed"))
+            Ok((g == b"abc").then(|| pack_posting(0, 2).expect("test setup failed")))
         })
         .expect("resolve");
         assert!(matches!(resolved, Resolved::None));
@@ -305,14 +314,14 @@ mod tests {
     #[test]
     fn dense_gram_resolves_to_all_without_fetch() {
         // a gram in every doc constrains nothing: All, no block needed
-        let lookup = |_: &[u8]| Some(pack_posting(64, 100).expect("test setup failed"));
+        let lookup = |_: &[u8]| Ok(Some(pack_posting(64, 100).expect("test setup failed")));
         let resolved = resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup).expect("resolve");
         assert!(matches!(resolved, Resolved::All));
         let mut needed = BTreeMap::new();
         blocks_needed(&resolved, &mut needed);
         assert!(needed.is_empty());
         // one doc short of dense -> still a real constraint
-        let lookup = |_: &[u8]| Some(pack_posting(64, 99).expect("test setup failed"));
+        let lookup = |_: &[u8]| Ok(Some(pack_posting(64, 99).expect("test setup failed")));
         assert!(matches!(
             resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup).expect("resolve"),
             Resolved::Gram { count: 99, .. }

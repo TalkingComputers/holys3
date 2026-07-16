@@ -97,13 +97,13 @@ fn write_compaction_run(
             gram.len() == crate::build::key_bytes(strategy),
             "term map gram width does not match the index strategy"
         );
+        let mut padded = [0u8; 8];
+        padded[8 - gram.len()..].copy_from_slice(gram);
+        let key = u64::from_be_bytes(padded);
         if count == 1 {
             // Singleton grams inline their doc id in the offset field; no
             // posting block exists to read.
             let id = u32::try_from(offset).context("singleton doc id overflows u32")?;
-            let mut padded = [0u8; 8];
-            padded[8 - gram.len()..].copy_from_slice(gram);
-            let key = u64::from_be_bytes(padded);
             if let Some(new_id) = remap
                 .get(usize::try_from(id)?)
                 .context("singleton document ID is out of bounds")?
@@ -138,9 +138,6 @@ fn write_compaction_run(
         }
         ids.sort_unstable();
         ids.dedup();
-        let mut padded = [0u8; 8];
-        padded[8 - gram.len()..].copy_from_slice(gram);
-        let key = u64::from_be_bytes(padded);
         for id in ids {
             crate::build::write_posting_record(&mut writer, strategy, key, id)?;
         }

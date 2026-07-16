@@ -241,7 +241,7 @@ pub(crate) fn decode_posting_block(bytes: &[u8], count: u32, doc_count: u32) -> 
 /// fetch every needed posting block via `fetch_blocks`, evaluate purely.
 /// Returns local ids in `0..doc_count`.
 pub(crate) fn candidates_with(
-    get: impl Fn(&[u8]) -> Option<u64>,
+    get: impl Fn(&[u8]) -> Result<Option<u64>>,
     doc_count: u32,
     q: &Query,
     fetch_blocks: impl FnOnce(&BTreeMap<u64, u32>) -> Result<BTreeMap<u64, Vec<DocId>>>,

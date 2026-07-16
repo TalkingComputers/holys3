@@ -235,49 +235,60 @@ impl TermMap {
         Ok(Self::Trigram(maps))
     }
 
-    pub(crate) fn get(&self, gram: &[u8]) -> Option<u64> {
+    /// A lookup failure is a corrupt dictionary and must surface as an error:
+    /// mapping it to "gram absent" would silently drop matching documents.
+    pub(crate) fn get(&self, gram: &[u8]) -> Result<Option<u64>> {
         match self {
-            Self::Single(map) => map.get(gram),
+            Self::Single(map) => Ok(map.get(gram)),
             Self::Sparse {
                 index,
                 bytes,
                 decoded,
             } => {
                 let hash = holys3_core::hash_ngram(gram);
-                let block_id = index.block_for(hash)?;
+                let Some(block_id) = index.block_for(hash) else {
+                    return Ok(None);
+                };
                 let entries = {
-                    let mut cache = decoded.lock().ok()?;
+                    let mut cache = decoded
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("sparse block cache lock is poisoned"))?;
                     match cache.get(&block_id) {
                         Some(entries) => entries.clone(),
                         None => {
                             let block = &index.blocks[block_id];
-                            let start = usize::try_from(block.offset).ok()?;
-                            let end = start.checked_add(usize::try_from(block.len).ok()?)?;
+                            let start = usize::try_from(block.offset)?;
+                            let end = start
+                                .checked_add(usize::try_from(block.len)?)
+                                .context("sparse block extent overflows")?;
                             let mut entries = Vec::new();
                             crate::sparse_table::for_each_entry(
-                                bytes.get(start..end)?,
+                                bytes
+                                    .get(start..end)
+                                    .context("sparse block extends beyond the dictionary")?,
                                 |hash, value| {
                                     entries.push((hash, value));
                                     Ok(())
                                 },
-                            )
-                            .ok()?;
+                            )?;
                             let entries = std::sync::Arc::new(entries);
                             cache.insert(block_id, entries.clone());
                             entries
                         }
                     }
                 };
-                let at = entries
+                Ok(entries
                     .binary_search_by_key(&hash, |(entry, _)| *entry)
-                    .ok()?;
-                Some(entries[at].1)
+                    .ok()
+                    .map(|at| entries[at].1))
             }
             Self::SparseRemote { .. } => {
                 unreachable!("remote sparse lookups are resolved by the reader per query")
             }
-            Self::Trigram(maps) if gram.len() == 3 => maps[usize::from(gram[0])].get(&gram[1..]),
-            Self::Trigram(_) => None,
+            Self::Trigram(maps) if gram.len() == 3 => {
+                Ok(maps[usize::from(gram[0])].get(&gram[1..]))
+            }
+            Self::Trigram(_) => Ok(None),
         }
     }
 
@@ -370,7 +381,7 @@ mod tests {
 
         for gram in grams {
             assert!(
-                map.get(gram).is_some(),
+                map.get(gram).expect("lookup").is_some(),
                 "gram {gram:?} must resolve after the round trip"
             );
         }
