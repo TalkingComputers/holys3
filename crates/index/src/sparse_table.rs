@@ -38,6 +38,10 @@ fn read_varint(block: &[u8], cursor: &mut usize) -> Result<u64> {
             .context("sparse table block ended inside a varint")?;
         *cursor += 1;
         anyhow::ensure!(shift < 64, "sparse table varint overflows u64");
+        anyhow::ensure!(
+            shift < 63 || byte & 0x7f <= 1,
+            "sparse table varint overflows u64"
+        );
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Ok(value);

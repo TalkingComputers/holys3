@@ -3,7 +3,9 @@
 //! query fetches exactly the blocks its grams bisect into, in one ranged
 //! read, verified against the per-block hashes from that trusted index.
 
-use crate::sparse_table::{hex, lookup_in_block, SparseTableIndex, FOOTER_BYTES};
+#[cfg(test)]
+use crate::sparse_table::lookup_in_block;
+use crate::sparse_table::{hex, SparseTableIndex, FOOTER_BYTES};
 use anyhow::{Context, Result};
 use holys3_core::{hash_ngram, BlobStore};
 use holys3_query::Query;
@@ -121,15 +123,28 @@ pub(crate) fn fetch_query_gram_values(
             blocks.insert(block_id, raw);
         }
     }
+    // Decode each block exactly once and bisect the decoded entries per
+    // gram; scanning the raw block per gram would repeat the full decode
+    // for every hash that lands in the same block.
+    let mut decoded: rapidhash::RapidHashMap<usize, Vec<(u64, u64)>> =
+        rapidhash::RapidHashMap::default();
+    for (block_id, raw) in &blocks {
+        let mut entries = Vec::new();
+        crate::sparse_table::for_each_entry(raw, |hash, value| {
+            entries.push((hash, value));
+            Ok(())
+        })?;
+        decoded.insert(*block_id, entries);
+    }
     for hash in hashes {
         let Some(block_id) = index.block_for(hash) else {
             continue;
         };
-        let raw = blocks
+        let entries = decoded
             .get(&block_id)
             .context("sparse term table block was not fetched")?;
-        if let Some(value) = lookup_in_block(raw, hash)? {
-            values.insert(hash, value);
+        if let Ok(at) = entries.binary_search_by_key(&hash, |(entry, _)| *entry) {
+            values.insert(hash, entries[at].1);
         }
     }
     Ok(values)

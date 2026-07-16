@@ -74,7 +74,13 @@ pub(crate) fn resolve(
                 } else if count == 1 {
                     // Singleton grams inline their doc id in the offset
                     // field: no postings entry exists and none is fetched.
-                    Resolved::Doc(offset as DocId)
+                    // An id at or past doc_count is a corrupt index; treating
+                    // it as unmatchable keeps the superset contract (the
+                    // whole-file hashes catch real corruption loudly).
+                    match u32::try_from(offset) {
+                        Ok(id) if id < doc_count => Resolved::Doc(id),
+                        _ => Resolved::None,
+                    }
                 } else {
                     Resolved::Gram { offset, count }
                 }
@@ -113,6 +119,23 @@ pub(crate) fn resolve(
 }
 
 fn prune_and(children: Vec<Resolved>) -> Resolved {
+    // Any singleton child already bounds the AND to (at most) its one
+    // document: every gram sibling becomes redundant work, so drop them all
+    // and fetch no postings. Multiple singletons intersect for free.
+    if children
+        .iter()
+        .any(|child| matches!(child, Resolved::Doc(_)))
+    {
+        let mut docs: Vec<Resolved> = children
+            .into_iter()
+            .filter(|child| !matches!(child, Resolved::Gram { .. }))
+            .collect();
+        return if docs.len() == 1 {
+            docs.swap_remove(0)
+        } else {
+            Resolved::And(docs)
+        };
+    }
     let (mut grams, others): (Vec<_>, Vec<_>) = children
         .into_iter()
         .partition(|child| matches!(child, Resolved::Gram { .. }));
