@@ -154,8 +154,17 @@ fn section_keys(text: &str, matches: impl Fn(&str) -> bool) -> Vec<String> {
     for raw in text.lines() {
         let line = raw.trim();
         if line.starts_with('[') {
-            let header = line.trim_start_matches('[').trim_end_matches(']').trim();
-            active = matches(header);
+            // The SDK strips inline comments from headers and tolerates
+            // interior whitespace: `[ profile books ] # prod` names books.
+            let uncommented = line.split(['#', ';']).next().unwrap_or_default();
+            let header = uncommented
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            active = matches(&header);
         } else if active && !raw.starts_with([' ', '\t']) {
             if let Some((key, _)) = line.split_once('=') {
                 keys.push(key.trim().to_lowercase());
@@ -236,6 +245,16 @@ pub(crate) fn key_base() -> Option<KeyBase> {
     ) {
         return None;
     }
+    let token_state = sso_token_cache_state(&home.join(".aws/sso/cache"))?;
+    // A currently-valid login token is required: SSO resolution cannot have
+    // succeeded without one, so whatever the chain returned past this point
+    // (an IMDS fallthrough, say) depends on unkeyable inputs. No cache.
+    if !token_state
+        .iter()
+        .any(|(_, bytes)| holds_unexpired_token(bytes))
+    {
+        return None;
+    }
     let mut hasher = Sha256::new();
     hasher.update(&profile);
     hasher.update([0]);
@@ -243,7 +262,11 @@ pub(crate) fn key_base() -> Option<KeyBase> {
     hasher.update([0]);
     hasher.update(&credentials);
     hasher.update([0]);
-    for (name, bytes) in sso_token_cache_state(&home.join(".aws/sso/cache"))? {
+    for var in ["AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_SSO"] {
+        hasher.update(std::env::var(var).unwrap_or_default());
+        hasher.update([0]);
+    }
+    for (name, bytes) in token_state {
         hasher.update(&name);
         hasher.update([0]);
         hasher.update(&bytes);
@@ -259,6 +282,26 @@ pub(crate) fn key_base() -> Option<KeyBase> {
     path.push("credentials");
     path.push(format!("{key}.json"));
     Some(KeyBase { path, frozen })
+}
+
+/// True when the token file carries an `expiresAt` in the future. Token
+/// cache timestamps are RFC 3339 UTC.
+fn holds_unexpired_token(bytes: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Token {
+        expires_at: String,
+    }
+    let Ok(token) = serde_json::from_slice::<Token>(bytes) else {
+        return false;
+    };
+    let Ok(expires_at) = aws_smithy_types::DateTime::from_str(
+        &token.expires_at,
+        aws_smithy_types::date_time::Format::DateTime,
+    ) else {
+        return false;
+    };
+    SystemTime::try_from(expires_at).is_ok_and(|expiry| expiry > SystemTime::now())
 }
 
 /// The SSO token cache contents, sorted by file name. A missing directory is
@@ -448,6 +491,33 @@ mod tests {
         assert!(!profile_selects_sso(iam, "", "default"));
         assert!(!profile_selects_sso(iam, "", "books"));
         assert!(!profile_selects_sso("", "", "default"));
+    }
+
+    #[test]
+    fn header_comments_and_whitespace_do_not_hide_sections() {
+        // The SDK reads `[ profile books ] # prod` as profile books; the
+        // disqualifier scan must see into it.
+        let commented =
+            "[ profile books ] # prod\nsso_session = corp\nrole_arn = arn:aws:iam::1:role/x\n";
+        assert!(!profile_selects_sso(commented, "", "books"));
+
+        let clean = "[ profile books ]\t; prod\nsso_session = corp\n";
+        assert!(profile_selects_sso(clean, "", "books"));
+    }
+
+    #[test]
+    fn expired_or_malformed_login_tokens_disable_the_cache() {
+        assert!(holds_unexpired_token(
+            br#"{"accessToken": "t", "expiresAt": "2999-01-01T00:00:00Z"}"#
+        ));
+        assert!(!holds_unexpired_token(
+            br#"{"accessToken": "t", "expiresAt": "2020-01-01T00:00:00Z"}"#
+        ));
+        assert!(!holds_unexpired_token(br#"{"accessToken": "t"}"#));
+        assert!(!holds_unexpired_token(
+            br#"{"expiresAt": "not a timestamp"}"#
+        ));
+        assert!(!holds_unexpired_token(b"not json"));
     }
 
     #[test]
