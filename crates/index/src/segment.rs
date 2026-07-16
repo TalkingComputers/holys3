@@ -1609,7 +1609,7 @@ impl holys3_core::DocFetcher for SegmentedReader {
             let pack_cache = crate::pack::PackBlockCache {
                 cache_dir: &self.cache_dir,
                 seg_id: &segment.meta.seg_id,
-                written: &self.range_written,
+                note_written: &|bytes| self.note_range_written(bytes),
             };
             let fetched = crate::pack::fetch_documents(
                 self.store.as_ref(),
@@ -1620,7 +1620,6 @@ impl holys3_core::DocFetcher for SegmentedReader {
                 consume,
             );
             self.classify_index_result(fetched)?;
-            self.sweep_if_due();
         }
         Ok(())
     }
