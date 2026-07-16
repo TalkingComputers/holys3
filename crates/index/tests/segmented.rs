@@ -71,7 +71,7 @@ fn reindex(bucket: &Bucket, store_dir: &Path, cache_dir: &Path, strategy: Strate
         &store,
         cache_dir,
         &test_source(),
-        strategy,
+        Some(strategy),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -96,7 +96,7 @@ fn update_index_reports_progress_events() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions {
             progress: Some(progress),
@@ -163,7 +163,7 @@ fn progress_receiver_drop_does_not_affect_indexing() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &bucket.listing(),
         UpdateOptions {
             progress: Some(progress),
@@ -235,7 +235,7 @@ fn index_source_binding_allows_only_same_backend_subtrees() -> Result<()> {
         &LocalBlobStore::new(store_dir.path()),
         cache_dir.path(),
         &indexed,
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -670,7 +670,7 @@ fn lifecycle_add_modify_delete_readd() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -882,7 +882,7 @@ fn undecodable_objects_marked_failed_and_converge() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -956,7 +956,7 @@ fn object_missing_during_fetch_retries_with_same_etag() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions::default(),
         &build,
@@ -966,7 +966,7 @@ fn object_missing_during_fetch_retries_with_same_etag() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions::default(),
         &build,
@@ -996,7 +996,7 @@ fn rebuild_flag_reingests_from_scratch() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions {
             rebuild: true,
@@ -1071,7 +1071,7 @@ fn unreferenced_segment_blobs_are_garbage_collected() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions {
             rebuild: true,
@@ -1190,7 +1190,7 @@ fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -1283,7 +1283,7 @@ fn interrupted_root_swap_preserves_old_index_and_restart_converges() -> Result<(
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(new_bucket.corpus_over(shard))),
@@ -1343,7 +1343,7 @@ fn same_run_compacted_newborns_are_garbage_collected() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &bucket.listing(),
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -1408,7 +1408,7 @@ fn same_run_compacted_tombstones_are_garbage_collected_once() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &bucket.listing(),
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -1490,7 +1490,7 @@ fn tombstones_bound_update_work_and_purge_physically() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &bucket.listing(),
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -1521,7 +1521,7 @@ fn tombstones_bound_update_work_and_purge_physically() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &bucket.listing(),
         UpdateOptions {
             purge_deleted: true,
@@ -1575,7 +1575,7 @@ fn tombstone_thresholds_repack_by_documents_and_bytes() -> Result<()> {
             &store,
             cache_dir.path(),
             &test_source(),
-            Strategy::Trigram,
+            Some(Strategy::Trigram),
             &bucket.listing(),
             UpdateOptions::default(),
             &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -1612,7 +1612,7 @@ fn repack_coalesces_pack_reads_across_sources() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &bucket.listing(),
         UpdateOptions {
             purge_deleted: true,
@@ -1651,7 +1651,7 @@ fn repack_fetches_all_window_ranges_in_one_call() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &bucket.listing(),
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -1725,7 +1725,7 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
         &flaky,
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -1750,7 +1750,7 @@ fn duplicate_listing_fails_before_fetching() -> Result<()> {
         &LocalBlobStore::new(store_dir.path()),
         cache_dir.path(),
         &test_source(),
-        Strategy::Trigram,
+        Some(Strategy::Trigram),
         &listing,
         UpdateOptions::default(),
         &|_| {
@@ -1852,7 +1852,7 @@ fn failed_streamed_merge_leaves_no_segment_blobs() -> Result<()> {
         &store,
         cache_dir.path(),
         &test_source(),
-        Strategy::Sparse,
+        Some(Strategy::Sparse),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
@@ -1905,5 +1905,84 @@ fn segments_with_no_grams_round_trip_empty_postings() -> Result<()> {
     )?;
     assert_eq!(search_collect(&reader, "anything")?.0.len(), 0);
     assert_eq!(reader.total_docs(), 2);
+    Ok(())
+}
+
+#[test]
+fn auto_strategy_picks_by_content_and_respects_existing_roots() -> Result<()> {
+    let prose_line = b"It is a truth universally acknowledged that a single man in \
+possession of a good fortune must be in want of a wife and this truth is so \
+well fixed in the minds of the surrounding families that he is considered \
+the rightful property of some one or other of their daughters\n";
+    let json_line = br#"{"id":4818103462,"type":"PushEvent","actor":{"id":583231,"login":"octocat"},"repo":{"id":1296269,"name":"octocat/Hello-World"},"payload":{"push_id":1558437314,"size":1}}"#;
+
+    let strategy_of = |store_dir: &Path, cache_dir: &Path| -> Result<Strategy> {
+        let reader = SegmentedReader::open(
+            Box::new(LocalBlobStore::new(store_dir)),
+            cache_dir,
+            &test_source(),
+        )?;
+        Ok(reader.strategy())
+    };
+
+    let build = |body: &[u8]| -> Result<(tempfile::TempDir, tempfile::TempDir, Bucket)> {
+        let store_dir = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+        let mut bucket = Bucket::default();
+        for index in 0..8 {
+            bucket.put(&format!("doc-{index}"), body);
+        }
+        let listing = bucket.listing();
+        update_index(
+            &LocalBlobStore::new(store_dir.path()),
+            cache_dir.path(),
+            &test_source(),
+            None,
+            &listing,
+            UpdateOptions::default(),
+            &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+        )?;
+        Ok((store_dir, cache_dir, bucket))
+    };
+
+    let (prose_store, prose_cache, prose_bucket) = build(&prose_line.repeat(4))?;
+    assert_eq!(
+        strategy_of(prose_store.path(), prose_cache.path())?,
+        Strategy::Sparse
+    );
+    let (json_store, json_cache, _) = build(&json_line.repeat(4))?;
+    assert_eq!(
+        strategy_of(json_store.path(), json_cache.path())?,
+        Strategy::Trigram
+    );
+
+    // Archives classify on the member text the index ingests, not on the
+    // container bytes: prose inside .tar.gz still picks sparse.
+    let archive = encode::gzip(&encode::tar(&[(
+        "book/chapter.txt",
+        prose_line.repeat(4).as_slice(),
+    )]));
+    let (tar_store, tar_cache, _) = build(&archive)?;
+    assert_eq!(
+        strategy_of(tar_store.path(), tar_cache.path())?,
+        Strategy::Sparse
+    );
+
+    // An incremental auto update follows the recorded strategy and stays
+    // up to date instead of re-detecting or rebuilding.
+    let report = update_index(
+        &LocalBlobStore::new(prose_store.path()),
+        prose_cache.path(),
+        &test_source(),
+        None,
+        &prose_bucket.listing(),
+        UpdateOptions::default(),
+        &|_| anyhow::bail!("an unchanged auto update must not fetch"),
+    )?;
+    assert!(report.up_to_date);
+    assert_eq!(
+        strategy_of(prose_store.path(), prose_cache.path())?,
+        Strategy::Sparse
+    );
     Ok(())
 }

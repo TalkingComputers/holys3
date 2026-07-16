@@ -226,7 +226,7 @@ fn upload_dir(strategy: Strategy) -> Result<()> {
         &store,
         &dir_cache_dir(),
         &dir_source_identity()?,
-        strategy,
+        Some(strategy),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(LocalCorpus::from_listing(shard))),
@@ -292,7 +292,7 @@ fn upload_s3(manifest: &SeedManifest, strategy: Strategy) -> Result<()> {
         &store,
         &cache_dir,
         &source,
-        strategy,
+        Some(strategy),
         &listing,
         UpdateOptions::default(),
         &|shard| {

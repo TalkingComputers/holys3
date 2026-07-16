@@ -213,8 +213,10 @@ The root also records the indexed endpoint, bucket, and prefix. A search may
 select a narrower subtree of that source, but a broader or different source
 fails rather than returning an incomplete result. `--rebuild` re-indexes from
 scratch and is required to repurpose an index location. Two gram strategies
-exist (`--strategy trigram`, the default, and `--strategy sparse`); switching
-rebuilds automatically.
+exist: `trigram` for structured content (logs, code, JSON) and `sparse` for
+natural-language prose. A fresh build samples the decoded content and picks
+one automatically; `--strategy` overrides, and switching rebuilds
+automatically.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) covers the crate boundaries, segment
 format, and memory bounds in detail.

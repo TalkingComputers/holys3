@@ -2,6 +2,7 @@
 //! Shared types, gram extraction, storage traits, and scan verification.
 
 mod codec;
+mod detect;
 mod grams;
 mod grep;
 mod progress;
@@ -16,6 +17,7 @@ pub use codec::{
     is_raw_body, is_raw_source, DecodeLimits, DecodeSink, DecodeSummary, DocumentBody,
     DocumentReader, DocumentSpool, LogicalDocumentMeta, SourceEncoding, DECODE_LIMITS,
 };
+pub use detect::is_prose_like;
 pub use grams::{
     grams_index, grams_query, hash_ngram, iterate_sparse_gram_ranges, iterate_sparse_grams,
     pack_trigram_grams, sparse_grams_all_bytes, sparse_grams_covering_bytes,

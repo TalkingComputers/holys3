@@ -681,7 +681,7 @@ mod tests {
             &LocalBlobStore::new(store_dir.path()),
             cache_dir.path(),
             &test_source(),
-            strategy,
+            Some(strategy),
             &listing,
             UpdateOptions::default(),
             &|shard| {
