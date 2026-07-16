@@ -417,13 +417,17 @@ mod tests {
         );
 
         // Same doc: the union dedups to one id and stays an inline singleton.
+        // A separate file: Windows refuses to rewrite a mapped file.
         let singleton = crate::eval::pack_posting(7, 1).unwrap();
         let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
         builder.insert(&hash.to_be_bytes(), singleton).unwrap();
         let (bytes, _) = builder.finish().unwrap();
-        std::fs::write(&path, &bytes).unwrap();
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&path).unwrap()) }
-            .unwrap();
+        let singleton_path = dir.path().join("terms-singleton.fst");
+        std::fs::write(&singleton_path, &bytes).unwrap();
+        let mmap = unsafe {
+            memmap2::MmapOptions::new().map(&std::fs::File::open(&singleton_path).unwrap())
+        }
+        .unwrap();
         let map = TermMap::open(mmap, Strategy::Sparse).unwrap();
         assert_eq!(map.get(b).expect("lookup"), Some(singleton));
     }
