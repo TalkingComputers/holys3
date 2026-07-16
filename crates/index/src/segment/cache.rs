@@ -61,6 +61,34 @@ pub(crate) fn read_verified(cache_path: &Path, expected_hash: &str) -> Option<Ve
     None
 }
 
+/// Read a self-anchored cache file: a 32-byte SHA-256 of the payload
+/// prefixes the payload. Used where the format records no remote per-range
+/// hash yet (postings ranges); integrity holds, and the trust boundary
+/// matches the `.verified` markers `cached_file` already relies on.
+pub(crate) fn read_self_anchored(cache_path: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(cache_path).ok()?;
+    if bytes.len() < 32 {
+        return None;
+    }
+    let (stored, payload) = bytes.split_at(32);
+    if <[u8; 32]>::from(Sha256::digest(payload)) == *stored {
+        return Some(payload.to_vec());
+    }
+    None
+}
+
+/// Atomically publish a self-anchored cache file.
+pub(crate) fn write_self_anchored(
+    cache_dir: &Path,
+    cache_path: &Path,
+    payload: &[u8],
+) -> Result<()> {
+    let mut bytes = Vec::with_capacity(32 + payload.len());
+    bytes.extend_from_slice(&<[u8; 32]>::from(Sha256::digest(payload)));
+    bytes.extend_from_slice(payload);
+    write_back(cache_dir, cache_path, &bytes)
+}
+
 /// Atomically publish verified bytes into the cache.
 pub(crate) fn write_back(cache_dir: &Path, cache_path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = cache_path.parent().context("cache path has no parent")?;

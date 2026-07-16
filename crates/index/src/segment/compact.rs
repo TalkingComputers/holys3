@@ -230,6 +230,7 @@ pub(super) fn merge_segments(
             }
             fetch_documents(
                 store,
+                None,
                 &victims[seg_idx].0.packs,
                 &victim_tables[seg_idx].blocks,
                 &selected,
