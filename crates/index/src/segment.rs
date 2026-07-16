@@ -1150,13 +1150,13 @@ impl SegmentedReader {
                                 // malformed response must stay a transient
                                 // failure, never a poisoned permanent hit.
                                 if miss && self.range_cache() {
-                                    self.note_range_written(bytes.len() as u64);
                                     cache::write_self_anchored(
                                         &self.cache_dir,
                                         &range_path(range_offset, range_len),
                                         &bytes,
                                     )
                                     .ok();
+                                    self.note_range_written(bytes.len() as u64);
                                 }
                                 Ok((offset, decoded))
                             },

@@ -65,8 +65,40 @@ impl BlobStore for CountingStore {
 }
 
 /// Both tests mutate process-global env vars; they share one lock so a
-/// parallel test runner cannot interleave them.
+/// parallel test runner cannot interleave them. A panicking test poisons
+/// the mutex, but the env guard below restores state on unwind, so the
+/// poison carries no meaning and later tests just take the lock.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Restores an env var to its pre-test state on drop, panics included.
+struct EnvGuard {
+    name: &'static str,
+    prior: Option<String>,
+}
+
+impl EnvGuard {
+    fn new(name: &'static str) -> EnvGuard {
+        EnvGuard {
+            name,
+            prior: std::env::var(name).ok(),
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
 
 fn test_source() -> SourceIdentity {
     SourceIdentity::Local {
@@ -84,7 +116,9 @@ fn search(reader: &SegmentedReader, pattern: &str) -> Result<Vec<(String, u64)>>
 
 #[test]
 fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
-    let _env = ENV_LOCK.lock().expect("env lock");
+    let _lock = env_lock();
+    let _remote_min = EnvGuard::new("HOLYS3_SPARSE_REMOTE_MIN");
+    let _cache_max = EnvGuard::new("HOLYS3_CACHE_MAX");
     let objects: BTreeMap<String, Vec<u8>> = (0..50)
         .map(|index| {
             let body = format!(
@@ -198,7 +232,9 @@ fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
 
 #[test]
 fn range_cache_evicts_to_its_cap_and_stays_correct() -> Result<()> {
-    let _env = ENV_LOCK.lock().expect("env lock");
+    let _lock = env_lock();
+    let _remote_min = EnvGuard::new("HOLYS3_SPARSE_REMOTE_MIN");
+    let _cache_max = EnvGuard::new("HOLYS3_CACHE_MAX");
     let objects: BTreeMap<String, Vec<u8>> = (0..30)
         .map(|index| {
             let body = if index % 3 == 0 {
@@ -227,6 +263,7 @@ fn range_cache_evicts_to_its_cap_and_stays_correct() -> Result<()> {
         MemCorpus::new(keys, bodies)
     };
     std::env::remove_var("HOLYS3_SPARSE_REMOTE_MIN");
+    std::env::remove_var("HOLYS3_CACHE_MAX");
     update_index(
         &LocalBlobStore::new(store_dir.path()),
         cache_dir.path(),
@@ -295,6 +332,160 @@ fn range_cache_evicts_to_its_cap_and_stays_correct() -> Result<()> {
         before,
         "disabled cache must not write range files"
     );
-    std::env::remove_var("HOLYS3_CACHE_MAX");
+    Ok(())
+}
+
+struct RangeTallyStore {
+    inner: LocalBlobStore,
+    pack_ranges: Arc<AtomicUsize>,
+    posting_ranges: Arc<AtomicUsize>,
+}
+
+impl RangeTallyStore {
+    fn tally(&self, name: &str, ranges: usize) {
+        if name.starts_with("packs/") {
+            self.pack_ranges.fetch_add(ranges, Ordering::Relaxed);
+        } else if name.ends_with("postings.bin") {
+            self.posting_ranges.fetch_add(ranges, Ordering::Relaxed);
+        }
+    }
+}
+
+impl BlobStore for RangeTallyStore {
+    fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put(name, bytes)
+    }
+
+    fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.put_file(name, path)
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name)
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        self.tally(name, 1);
+        self.inner.get_range(name, start, len)
+    }
+
+    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> Result<Vec<bytes::Bytes>> {
+        self.tally(name, ranges.len());
+        self.inner.get_ranges(name, ranges)
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        self.inner.delete(name)
+    }
+
+    fn get_versioned(&self, name: &str) -> Result<Option<(Vec<u8>, String)>> {
+        self.inner.get_versioned(name)
+    }
+
+    fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
+        self.inner.put_if(name, bytes, expected)
+    }
+}
+
+#[test]
+fn repeat_queries_serve_ranges_from_the_local_cache() -> Result<()> {
+    let _lock = env_lock();
+    let _remote_min = EnvGuard::new("HOLYS3_SPARSE_REMOTE_MIN");
+    let _cache_max = EnvGuard::new("HOLYS3_CACHE_MAX");
+    std::env::remove_var("HOLYS3_SPARSE_REMOTE_MIN");
+    std::env::set_var("HOLYS3_CACHE_MAX", (4u64 << 30).to_string());
+
+    let objects: BTreeMap<String, Vec<u8>> = (0..40)
+        .map(|index| {
+            let body = if index % 3 == 0 {
+                format!(
+                    "filler text about document {index}\nthe needle sits right here in {index}\n"
+                )
+            } else {
+                format!("filler text about document {index}\nnothing interesting in {index}\n")
+            };
+            (format!("doc-{index:02}.log"), body.into_bytes())
+        })
+        .collect();
+    let listing: Vec<(String, String, u64)> = objects
+        .iter()
+        .map(|(key, body)| {
+            (
+                key.clone(),
+                format!("{:016x}", holys3_core::hash_ngram(body)),
+                body.len() as u64,
+            )
+        })
+        .collect();
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let corpus_for = |shard: &[(String, String, u64)]| {
+        let keys: Vec<String> = shard.iter().map(|(key, _, _)| key.clone()).collect();
+        let bodies = keys.iter().map(|key| objects[key].clone()).collect();
+        MemCorpus::new(keys, bodies)
+    };
+    update_index(
+        &LocalBlobStore::new(store_dir.path()),
+        cache_dir.path(),
+        &test_source(),
+        Some(Strategy::Sparse),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(corpus_for(shard))),
+    )?;
+
+    let run = |expect_fetch: bool| -> Result<Vec<(String, u64)>> {
+        let pack_ranges = Arc::new(AtomicUsize::new(0));
+        let posting_ranges = Arc::new(AtomicUsize::new(0));
+        let reader = SegmentedReader::open(
+            Box::new(RangeTallyStore {
+                inner: LocalBlobStore::new(store_dir.path()),
+                pack_ranges: pack_ranges.clone(),
+                posting_ranges: posting_ranges.clone(),
+            }),
+            cache_dir.path(),
+            &test_source(),
+        )?;
+        let hits = search(&reader, "needle sits right")?;
+        let packs = pack_ranges.load(Ordering::Relaxed);
+        let postings = posting_ranges.load(Ordering::Relaxed);
+        if expect_fetch {
+            assert!(packs > 0, "cold run must fetch pack ranges");
+            assert!(postings > 0, "cold run must fetch posting ranges");
+        } else {
+            assert_eq!(packs, 0, "repeat run must not fetch pack ranges");
+            assert_eq!(postings, 0, "repeat run must not fetch posting ranges");
+        }
+        Ok(hits)
+    };
+
+    let cold = run(true)?;
+    assert_eq!(cold.len(), 14);
+    let warm = run(false)?;
+    assert_eq!(cold, warm);
+
+    let seg_dir = std::fs::read_dir(cache_dir.path())?
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.path().is_dir())
+        .expect("segment cache dir exists");
+    let mut corrupted = 0;
+    for entry in std::fs::read_dir(seg_dir.path())?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_string();
+        if name.starts_with("pack-") || name.starts_with("postings-") {
+            let mut bytes = std::fs::read(entry.path())?;
+            if bytes.is_empty() {
+                continue;
+            }
+            bytes[0] ^= 0xff;
+            std::fs::write(entry.path(), &bytes)?;
+            corrupted += 1;
+        }
+    }
+    assert!(corrupted >= 2, "expected cached pack and posting files");
+    let healed = run(true)?;
+    assert_eq!(cold, healed);
+    let warm_again = run(false)?;
+    assert_eq!(cold, warm_again);
     Ok(())
 }
