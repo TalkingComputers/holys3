@@ -192,8 +192,13 @@ fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
         anyhow::ensure!(
             is_sha256(&segment.terms_fst_hash)
                 && is_sha256(&segment.postings_hash)
+                && is_sha256(&segment.postings_tail_hash)
                 && is_sha256(&segment.docs_hash),
             "segment blob hash is not a SHA-256 hash"
+        );
+        anyhow::ensure!(
+            segment.postings_data_len <= segment.postings_len,
+            "postings data region exceeds its blob"
         );
         anyhow::ensure!(
             segment.terms_tail_hash.is_empty() || is_sha256(&segment.terms_tail_hash),
@@ -898,6 +903,7 @@ struct Segment {
     map: TermMap,
     dead: DeadSet,
     tables: OnceLock<SegmentTables>,
+    postings_table: OnceLock<std::sync::Arc<crate::postings_table::PostingsTableIndex>>,
 }
 
 /// Reader over a segmented index: per-segment candidate resolution with the
@@ -1112,69 +1118,92 @@ impl SegmentedReader {
                 q,
                 |needed| {
                     let doc_count = segment.meta.doc_count;
-                    let ranges = posting_ranges(needed, doc_count, segment.meta.postings_len)?;
-                    let range_path = |offset: u64, len: u64| {
+                    let table = self.postings_table(segment)?;
+                    let ranges = posting_ranges(needed, doc_count, table.data_len)?;
+                    // Fetch at verification-block granularity: every block
+                    // checks against the trusted table before any list is
+                    // sliced out. Corruption aborts the query loudly —
+                    // unverified bytes could hide documents.
+                    let mut block_set = std::collections::BTreeSet::new();
+                    for &(offset, len) in &ranges {
+                        block_set.extend(table.blocks_covering(offset, len)?);
+                    }
+                    let block_path = |index: usize| {
                         self.cache_dir
                             .join(&segment.meta.seg_id)
-                            .join(format!("postings-{offset:016x}-{len:x}"))
+                            .join(format!("postings-block-{index:08x}"))
                     };
-                    let mut cached: Vec<Option<bytes::Bytes>> = ranges
-                        .iter()
-                        .map(|&(offset, len)| {
-                            if !self.range_cache() {
-                                return None;
+                    let mut payloads =
+                        std::collections::BTreeMap::<usize, bytes::Bytes>::new();
+                    let mut missing = Vec::new();
+                    for &index in &block_set {
+                        let hit = self.range_cache().then(|| {
+                            cache::read_verified(
+                                &block_path(index),
+                                &crate::sparse_table::hex(table.block_hash(index)),
+                            )
+                        });
+                        match hit.flatten() {
+                            Some(bytes) => {
+                                payloads.insert(index, bytes.into());
                             }
-                            cache::read_self_anchored(&range_path(offset, len))
-                                .map(bytes::Bytes::from)
-                        })
-                        .collect();
-                    let misses: Vec<bool> = cached.iter().map(Option::is_none).collect();
-                    let missing: Vec<(u64, u64)> = ranges
-                        .iter()
-                        .zip(&cached)
-                        .filter(|(_, hit)| hit.is_none())
-                        .map(|(&range, _)| range)
-                        .collect();
+                            None => missing.push(index),
+                        }
+                    }
                     if !missing.is_empty() {
-                        let fetched = self.store.get_ranges(&postings_name, &missing)?;
+                        let block_ranges: Vec<(u64, u64)> =
+                            missing.iter().map(|&index| table.block_range(index)).collect();
+                        let fetched = self.store.get_ranges(&postings_name, &block_ranges)?;
                         anyhow::ensure!(
                             fetched.len() == missing.len(),
                             "get_ranges returned {} blocks for {} ranges",
                             fetched.len(),
                             missing.len()
                         );
-                        let mut fetched = fetched.into_iter();
-                        for slot in cached.iter_mut() {
-                            if slot.is_none() {
-                                *slot =
-                                    Some(fetched.next().context("missing fetched posting range")?);
+                        for (&index, bytes) in missing.iter().zip(fetched) {
+                            table.verify(index, &bytes)?;
+                            if self.range_cache() {
+                                cache::write_back(
+                                    &self.cache_dir,
+                                    &block_path(index),
+                                    &bytes,
+                                )
+                                .ok();
+                                self.note_range_written(bytes.len() as u64);
                             }
+                            payloads.insert(index, bytes);
                         }
                     }
                     needed
                         .iter()
                         .zip(&ranges)
-                        .zip(cached.into_iter().zip(misses))
-                        .map(
-                            |(((&offset, &count), &(range_offset, range_len)), (bytes, miss))| {
-                                let bytes = bytes.context("missing posting range")?;
-                                let decoded =
-                                    crate::decode_posting_block(&bytes, count, doc_count)?;
-                                // Cache only after a successful decode: a
-                                // malformed response must stay a transient
-                                // failure, never a poisoned permanent hit.
-                                if miss && self.range_cache() {
-                                    cache::write_self_anchored(
-                                        &self.cache_dir,
-                                        &range_path(range_offset, range_len),
-                                        &bytes,
-                                    )
-                                    .ok();
-                                    self.note_range_written(bytes.len() as u64);
+                        .map(|((&offset, &count), &(range_offset, range_len))| {
+                            let covering = table.blocks_covering(range_offset, range_len)?;
+                            let single = covering.len() == 1;
+                            let mut assembled = Vec::new();
+                            let mut sliced = None;
+                            for index in covering {
+                                let (block_offset, block_len) = table.block_range(index);
+                                let from = range_offset.max(block_offset);
+                                let to = (range_offset + range_len).min(block_offset + block_len);
+                                let payload = payloads
+                                    .get(&index)
+                                    .context("missing verified postings block")?;
+                                let start = usize::try_from(from - block_offset)?;
+                                let end = usize::try_from(to - block_offset)?;
+                                if single {
+                                    sliced = Some(payload.slice(start..end));
+                                } else {
+                                    assembled.extend_from_slice(&payload[start..end]);
                                 }
-                                Ok((offset, decoded))
-                            },
-                        )
+                            }
+                            let bytes = match sliced {
+                                Some(bytes) => bytes,
+                                None => assembled.into(),
+                            };
+                            let decoded = crate::decode_posting_block(&bytes, count, doc_count)?;
+                            Ok((offset, decoded))
+                        })
                         .collect()
                 },
             ))?;
@@ -1231,7 +1260,7 @@ impl SegmentedReader {
 fn posting_ranges(
     needed: &std::collections::BTreeMap<u64, u32>,
     doc_count: u32,
-    postings_len: u64,
+    postings_data_len: u64,
 ) -> Result<Vec<(u64, u64)>> {
     needed
         .iter()
@@ -1246,8 +1275,8 @@ fn posting_ranges(
                 .checked_add(len)
                 .context("term map posting length overflows")?;
             anyhow::ensure!(
-                end <= postings_len,
-                "term map posting extends beyond postings.bin"
+                end <= postings_data_len,
+                "term map posting extends beyond the postings data region"
             );
             Ok((offset, len))
         })
@@ -1470,6 +1499,57 @@ fn evict_range_cache(cache_dir: &Path, max_bytes: u64) {
     }
 }
 
+impl SegmentedReader {
+    /// The segment's postings verification table, fetched once through the
+    /// read-through tail cache and trusted via `postings_tail_hash`.
+    fn postings_table(
+        &self,
+        segment: &Segment,
+    ) -> Result<std::sync::Arc<crate::postings_table::PostingsTableIndex>> {
+        if let Some(table) = segment.postings_table.get() {
+            return Ok(table.clone());
+        }
+        let meta = &segment.meta;
+        let block_count = meta
+            .postings_data_len
+            .div_ceil(crate::postings_table::VERIFY_BLOCK_BYTES as u64);
+        let tail_len = block_count * 32 + crate::postings_table::FOOTER_BYTES as u64;
+        anyhow::ensure!(
+            meta.postings_data_len
+                .checked_add(tail_len)
+                .is_some_and(|total| total == meta.postings_len),
+            "postings verification table does not fit its blob"
+        );
+        let tail = cached_bytes(
+            &self.cache_dir,
+            &meta.seg_id,
+            "postings.tail",
+            &meta.postings_tail_hash,
+            &|| {
+                let name = segment_blob(&meta.seg_id, "postings.bin");
+                let mut ranges = self
+                    .store
+                    .get_ranges(&name, &[(meta.postings_data_len, tail_len)])?;
+                anyhow::ensure!(ranges.len() == 1, "postings tail fetch returned no range");
+                Ok(ranges.remove(0).to_vec())
+            },
+        )?;
+        let table = crate::postings_table::PostingsTableIndex::parse(meta.postings_len, &tail)?;
+        anyhow::ensure!(
+            table.data_len == meta.postings_data_len,
+            "postings table data length does not match segment metadata"
+        );
+        let _ = segment
+            .postings_table
+            .set(std::sync::Arc::new(table));
+        Ok(segment
+            .postings_table
+            .get()
+            .expect("table was just set")
+            .clone())
+    }
+}
+
 fn load_segment(
     store: &dyn BlobStore,
     cache_dir: &Path,
@@ -1502,6 +1582,7 @@ fn load_segment(
             map: TermMap::SparseRemote { index },
             dead: load_dead(store, cache_dir, meta)?,
             tables: OnceLock::new(),
+            postings_table: OnceLock::new(),
             meta: meta.clone(),
         });
     }
@@ -1522,6 +1603,7 @@ fn load_segment(
         map,
         dead,
         tables: OnceLock::new(),
+        postings_table: OnceLock::new(),
         meta: meta.clone(),
     })
 }
@@ -1658,6 +1740,8 @@ mod tests {
             terms_tail_hash: String::new(),
             postings_len: 1,
             postings_hash: "c".repeat(64),
+            postings_data_len: 0,
+            postings_tail_hash: "e".repeat(64),
             docs_len: 1,
             docs_hash: "d".repeat(64),
             min_key: "a".into(),

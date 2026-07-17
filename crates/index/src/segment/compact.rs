@@ -95,7 +95,7 @@ fn write_compaction_run(
             &mut writer,
             strategy,
             meta.doc_count,
-            meta.postings_len,
+            meta.postings_data_len,
             &postings,
             remap,
             gram,

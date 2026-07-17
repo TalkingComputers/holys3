@@ -56,7 +56,7 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older seagrep must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 16;
+const INDEX_FORMAT: u32 = 17;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -776,7 +776,7 @@ mod tests {
         let doc_count = u32::try_from(built.tables.documents.len()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let store = LocalBlobStore::new(dir.path());
-        let (fst, postings, tail) = merge_posting_runs(
+        let (fst, postings, tail, _postings_tail) = merge_posting_runs(
             built.runs,
             Strategy::Trigram,
             doc_count,
@@ -867,7 +867,7 @@ mod tests {
     ) -> (Vec<u8>, Vec<u8>, String) {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalBlobStore::new(dir.path());
-        let (fst, postings, tail) = merge_posting_runs(
+        let (fst, postings, tail, _postings_tail) = merge_posting_runs(
             runs,
             strategy,
             doc_count,
