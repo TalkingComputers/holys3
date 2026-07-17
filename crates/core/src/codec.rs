@@ -174,6 +174,47 @@ fn decode_body_inner(
     }
 }
 
+/// ripgrep parity: documents beginning with a UTF-8 or UTF-16 byte-order
+/// mark transcode to UTF-8 before indexing and search, through the same
+/// crates ripgrep uses (`encoding_rs_io` configured identically: BOM
+/// sniffing, UTF-8 passthrough, BOM stripping) — a UTF-8 pattern can never
+/// match raw wide bytes, so leaving them untranscoded silently hides
+/// Windows-style text.
+fn transcode_utf16_body(body: DocumentBody) -> AnyhowResult<DocumentBody> {
+    use std::io::Read;
+    match body.bom_prefix()? {
+        Some([0xFF, 0xFE] | [0xFE, 0xFF] | [0xEF, 0xBB]) => {}
+        _ => return Ok(body),
+    }
+    let reader = |source: Box<dyn Read>| {
+        encoding_rs_io::DecodeReaderBytesBuilder::new()
+            .utf8_passthru(true)
+            .strip_bom(true)
+            .bom_override(true)
+            .bom_sniffing(true)
+            .build(source)
+    };
+    match body.storage {
+        DocumentStorage::Bytes(bytes) => {
+            let mut out = Vec::with_capacity(bytes.len());
+            reader(Box::new(std::io::Cursor::new(bytes))).read_to_end(&mut out)?;
+            Ok(DocumentBody::from_bytes(out.into()))
+        }
+        DocumentStorage::File { mut file, .. } => {
+            use std::io::{Seek, SeekFrom, Write};
+            file.seek(SeekFrom::Start(0))?;
+            // anonymous: the OS reclaims it when the body drops
+            let spool = tempfile::tempfile()?;
+            let mut writer = std::io::BufWriter::new(&spool);
+            std::io::copy(&mut reader(Box::new(file)), &mut writer)?;
+            writer.flush()?;
+            drop(writer);
+            let len = spool.metadata()?.len();
+            Ok(DocumentBody::from_file(spool, len))
+        }
+    }
+}
+
 pub fn decode_body(key: &str, bytes: Vec<u8>) -> AnyhowResult<Vec<u8>> {
     Ok(
         decode_body_inner(key, bytes.into(), None, DECODE_MEMORY_LIMIT)?
@@ -409,6 +450,7 @@ impl DecodeState<'_> {
     }
 
     fn emit(&mut self, member_path: Option<String>, body: DocumentBody) -> AnyhowResult<()> {
+        let body = transcode_utf16_body(body)?;
         let len = body.len();
         let expanded_bytes = self
             .expanded_bytes
@@ -743,6 +785,55 @@ pub fn decode_requested_body(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn utf16_bodies_transcode_like_ripgrep() {
+        // LE with BOM
+        let text = "needle line\nsecond needle\n";
+        let mut le = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            le.extend_from_slice(&unit.to_le_bytes());
+        }
+        let body = transcode_utf16_body(DocumentBody::from_bytes(le.into())).unwrap();
+        assert_eq!(body.into_bytes().unwrap(), text.as_bytes());
+
+        // BE with BOM, non-BMP char forces a surrogate pair
+        let text = "emoji \u{1F600} needle\n";
+        let mut be = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            be.extend_from_slice(&unit.to_be_bytes());
+        }
+        let body = transcode_utf16_body(DocumentBody::from_bytes(be.into())).unwrap();
+        assert_eq!(body.into_bytes().unwrap(), text.as_bytes());
+
+        // UTF-8 BOM strips like ripgrep (anchors must see the real start)
+        let mut bom8 = vec![0xEF, 0xBB, 0xBF];
+        bom8.extend_from_slice(b"needle at start\n");
+        let body = transcode_utf16_body(DocumentBody::from_bytes(bom8.into())).unwrap();
+        assert_eq!(body.into_bytes().unwrap(), b"needle at start\n".as_slice());
+
+        // EF BB without BF is not a BOM: passthrough untouched
+        let not_bom = b"\xEF\xBBneedle\n".to_vec();
+        let body = transcode_utf16_body(DocumentBody::from_bytes(not_bom.clone().into())).unwrap();
+        assert_eq!(body.into_bytes().unwrap(), not_bom);
+
+        // no BOM: bytes pass through untouched
+        let raw = b"plain needle\n".to_vec();
+        let body = transcode_utf16_body(DocumentBody::from_bytes(raw.clone().into())).unwrap();
+        assert_eq!(body.into_bytes().unwrap(), raw);
+
+        // spooled file path transcodes identically to the in-memory path
+        let text = "spooled \u{1F680} needle\n".repeat(4000);
+        let mut wide = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            wide.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut spool = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut spool, &wide).unwrap();
+        let len = wide.len() as u64;
+        let body = transcode_utf16_body(DocumentBody::from_file(spool.into_file(), len)).unwrap();
+        assert_eq!(body.into_bytes().unwrap(), text.as_bytes());
+    }
+
     use super::*;
     use crate::{grep_doc, MatchOptions};
 

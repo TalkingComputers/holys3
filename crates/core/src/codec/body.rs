@@ -57,6 +57,26 @@ impl DocumentBody {
         }
     }
 
+    /// The first two bytes, when the body has at least two — used for
+    /// byte-order-mark sniffing without consuming the body.
+    pub(super) fn bom_prefix(&self) -> anyhow::Result<Option<[u8; 2]>> {
+        match &self.storage {
+            DocumentStorage::Bytes(bytes) => Ok(bytes.get(..2).map(|two| [two[0], two[1]])),
+            DocumentStorage::File { file, len } => {
+                if *len < 2 {
+                    return Ok(None);
+                }
+                use std::io::{Read, Seek, SeekFrom};
+                let mut handle = file;
+                let mut two = [0u8; 2];
+                handle.seek(SeekFrom::Start(0))?;
+                handle.read_exact(&mut two)?;
+                handle.seek(SeekFrom::Start(0))?;
+                Ok(Some(two))
+            }
+        }
+    }
+
     pub fn len(&self) -> u64 {
         match &self.storage {
             DocumentStorage::Bytes(bytes) => {
