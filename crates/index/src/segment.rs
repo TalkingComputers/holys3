@@ -58,12 +58,21 @@ pub(crate) struct SegmentMeta {
     pub terms_tail_hash: String,
     pub postings_len: u64,
     pub postings_hash: String,
+    /// Length of postings.bin's data region; the remainder is the per-block
+    /// verification table + footer.
+    pub postings_data_len: u64,
+    /// SHA-256 of the verification table + footer tail — lets readers trust
+    /// a ranged fetch of just the table.
+    pub postings_tail_hash: String,
     pub docs_len: u64,
     pub docs_hash: String,
     pub min_key: String,
     pub max_key: String,
     pub dead_hash: String,
     pub dead_len: u64,
+    /// Sources excluded at build time (undecodable objects). Queries surface
+    /// this so completeness gaps are visible without the build log.
+    pub failed_source_count: u32,
     pub packs: Vec<PackMeta>,
 }
 
@@ -186,8 +195,13 @@ fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
         anyhow::ensure!(
             is_sha256(&segment.terms_fst_hash)
                 && is_sha256(&segment.postings_hash)
+                && is_sha256(&segment.postings_tail_hash)
                 && is_sha256(&segment.docs_hash),
             "segment blob hash is not a SHA-256 hash"
+        );
+        anyhow::ensure!(
+            segment.postings_data_len <= segment.postings_len,
+            "postings data region exceeds its blob"
         );
         anyhow::ensure!(
             segment.terms_tail_hash.is_empty() || is_sha256(&segment.terms_tail_hash),
@@ -493,12 +507,18 @@ pub fn update_index(
 
     let mut metas = existing;
     let mut changed_dead = vec![false; metas.len()];
+    // Exclusion counts stay live: a failed source that is deleted or
+    // re-decoded goes dead here, and its segment's count must drop with it.
+    let mut failed_dead = vec![0u32; metas.len()];
     for group in newly_dead.chunk_by(|a, b| a.0 == b.0) {
         let seg_idx = group[0].0;
         let mut dead = dead_sets[seg_idx].clone();
         for &(_, source_id) in group {
             dead.sources.push(source_id);
             let source = &tables[seg_idx].sources[source_id as usize];
+            if source.failed {
+                failed_dead[seg_idx] += 1;
+            }
             dead.documents
                 .extend(source.first_doc..source.first_doc + source.doc_count);
         }
@@ -512,6 +532,9 @@ pub fn update_index(
     let mut keep = Vec::with_capacity(metas.len());
     let mut repacked = false;
     for (seg_idx, (mut meta, dead)) in metas.drain(..).zip(dead_sets).enumerate() {
+        meta.failed_source_count = meta
+            .failed_source_count
+            .saturating_sub(failed_dead[seg_idx]);
         if dead.sources.len() == tables[seg_idx].sources.len() {
             continue;
         }
@@ -835,7 +858,13 @@ pub(crate) fn merge_and_put_segment(
     for pack in packs {
         store.put_file(&pack_blob(pack.hash()), pack.path())?;
     }
-    let publish = || -> Result<(crate::build::MergedBlob, crate::build::MergedBlob, String)> {
+    type Published = (
+        crate::build::MergedBlob,
+        crate::build::MergedBlob,
+        String,
+        crate::build::PostingsTail,
+    );
+    let publish = || -> Result<Published> {
         let terms_sink = store.put_streaming(&segment_blob(&seg_id, "terms.fst"))?;
         let postings_sink = store.put_streaming(&segment_blob(&seg_id, "postings.bin"))?;
         let merged = crate::build::merge_posting_runs(
@@ -848,7 +877,7 @@ pub(crate) fn merge_and_put_segment(
         store.put(&segment_blob(&seg_id, "docs.bin"), &docs_bytes)?;
         Ok(merged)
     };
-    let (fst, postings, terms_tail_hash) = match publish() {
+    let (fst, postings, terms_tail_hash, postings_tail) = match publish() {
         Ok(merged) => merged,
         Err(error) => {
             // Random-keyed blobs from a failed publish are unreferenced and
@@ -868,12 +897,17 @@ pub(crate) fn merge_and_put_segment(
         terms_tail_hash,
         postings_len: postings.len,
         postings_hash: postings.hash,
+        postings_data_len: postings_tail.data_len,
+        postings_tail_hash: postings_tail.tail_hash,
         docs_len: docs_bytes.len() as u64,
         docs_hash,
         min_key: tables.sources[0].key.clone(),
         max_key: tables.sources[tables.sources.len() - 1].key.clone(),
         dead_hash: String::new(),
         dead_len: 0,
+        failed_source_count: u32::try_from(
+            tables.sources.iter().filter(|source| source.failed).count(),
+        )?,
         packs: pack_metas,
     };
     Ok(meta)
@@ -884,6 +918,7 @@ struct Segment {
     map: TermMap,
     dead: DeadSet,
     tables: OnceLock<SegmentTables>,
+    postings_table: OnceLock<std::sync::Arc<crate::postings_table::PostingsTableIndex>>,
 }
 
 /// Reader over a segmented index: per-segment candidate resolution with the
@@ -1098,69 +1133,88 @@ impl SegmentedReader {
                 q,
                 |needed| {
                     let doc_count = segment.meta.doc_count;
-                    let ranges = posting_ranges(needed, doc_count, segment.meta.postings_len)?;
-                    let range_path = |offset: u64, len: u64| {
+                    let table = self.postings_table(segment)?;
+                    let ranges = posting_ranges(needed, doc_count, table.data_len)?;
+                    // Fetch at verification-block granularity: every block
+                    // checks against the trusted table before any list is
+                    // sliced out. Corruption aborts the query loudly —
+                    // unverified bytes could hide documents.
+                    let mut block_set = std::collections::BTreeSet::new();
+                    for &(offset, len) in &ranges {
+                        block_set.extend(table.blocks_covering(offset, len)?);
+                    }
+                    let block_path = |index: usize| {
                         self.cache_dir
                             .join(&segment.meta.seg_id)
-                            .join(format!("postings-{offset:016x}-{len:x}"))
+                            .join(format!("postings-block-{index:08x}"))
                     };
-                    let mut cached: Vec<Option<bytes::Bytes>> = ranges
-                        .iter()
-                        .map(|&(offset, len)| {
-                            if !self.range_cache() {
-                                return None;
+                    let mut payloads = std::collections::BTreeMap::<usize, bytes::Bytes>::new();
+                    let mut missing = Vec::new();
+                    for &index in &block_set {
+                        let hit = self.range_cache().then(|| {
+                            cache::read_verified(
+                                &block_path(index),
+                                &crate::sparse_table::hex(table.block_hash(index)),
+                            )
+                        });
+                        match hit.flatten() {
+                            Some(bytes) => {
+                                payloads.insert(index, bytes.into());
                             }
-                            cache::read_self_anchored(&range_path(offset, len))
-                                .map(bytes::Bytes::from)
-                        })
-                        .collect();
-                    let misses: Vec<bool> = cached.iter().map(Option::is_none).collect();
-                    let missing: Vec<(u64, u64)> = ranges
-                        .iter()
-                        .zip(&cached)
-                        .filter(|(_, hit)| hit.is_none())
-                        .map(|(&range, _)| range)
-                        .collect();
+                            None => missing.push(index),
+                        }
+                    }
                     if !missing.is_empty() {
-                        let fetched = self.store.get_ranges(&postings_name, &missing)?;
+                        let block_ranges: Vec<(u64, u64)> = missing
+                            .iter()
+                            .map(|&index| table.block_range(index))
+                            .collect();
+                        let fetched = self.store.get_ranges(&postings_name, &block_ranges)?;
                         anyhow::ensure!(
                             fetched.len() == missing.len(),
                             "get_ranges returned {} blocks for {} ranges",
                             fetched.len(),
                             missing.len()
                         );
-                        let mut fetched = fetched.into_iter();
-                        for slot in cached.iter_mut() {
-                            if slot.is_none() {
-                                *slot =
-                                    Some(fetched.next().context("missing fetched posting range")?);
+                        for (&index, bytes) in missing.iter().zip(fetched) {
+                            table.verify(index, &bytes)?;
+                            if self.range_cache() {
+                                cache::write_back(&self.cache_dir, &block_path(index), &bytes).ok();
+                                self.note_range_written(bytes.len() as u64);
                             }
+                            payloads.insert(index, bytes);
                         }
                     }
                     needed
                         .iter()
                         .zip(&ranges)
-                        .zip(cached.into_iter().zip(misses))
-                        .map(
-                            |(((&offset, &count), &(range_offset, range_len)), (bytes, miss))| {
-                                let bytes = bytes.context("missing posting range")?;
-                                let decoded =
-                                    crate::decode_posting_block(&bytes, count, doc_count)?;
-                                // Cache only after a successful decode: a
-                                // malformed response must stay a transient
-                                // failure, never a poisoned permanent hit.
-                                if miss && self.range_cache() {
-                                    cache::write_self_anchored(
-                                        &self.cache_dir,
-                                        &range_path(range_offset, range_len),
-                                        &bytes,
-                                    )
-                                    .ok();
-                                    self.note_range_written(bytes.len() as u64);
+                        .map(|((&offset, &count), &(range_offset, range_len))| {
+                            let covering = table.blocks_covering(range_offset, range_len)?;
+                            let single = covering.len() == 1;
+                            let mut assembled = Vec::new();
+                            let mut sliced = None;
+                            for index in covering {
+                                let (block_offset, block_len) = table.block_range(index);
+                                let from = range_offset.max(block_offset);
+                                let to = (range_offset + range_len).min(block_offset + block_len);
+                                let payload = payloads
+                                    .get(&index)
+                                    .context("missing verified postings block")?;
+                                let start = usize::try_from(from - block_offset)?;
+                                let end = usize::try_from(to - block_offset)?;
+                                if single {
+                                    sliced = Some(payload.slice(start..end));
+                                } else {
+                                    assembled.extend_from_slice(&payload[start..end]);
                                 }
-                                Ok((offset, decoded))
-                            },
-                        )
+                            }
+                            let bytes = match sliced {
+                                Some(bytes) => bytes,
+                                None => assembled.into(),
+                            };
+                            let decoded = crate::decode_posting_block(&bytes, count, doc_count)?;
+                            Ok((offset, decoded))
+                        })
                         .collect()
                 },
             ))?;
@@ -1217,7 +1271,7 @@ impl SegmentedReader {
 fn posting_ranges(
     needed: &std::collections::BTreeMap<u64, u32>,
     doc_count: u32,
-    postings_len: u64,
+    postings_data_len: u64,
 ) -> Result<Vec<(u64, u64)>> {
     needed
         .iter()
@@ -1232,8 +1286,8 @@ fn posting_ranges(
                 .checked_add(len)
                 .context("term map posting length overflows")?;
             anyhow::ensure!(
-                end <= postings_len,
-                "term map posting extends beyond postings.bin"
+                end <= postings_data_len,
+                "term map posting extends beyond the postings data region"
             );
             Ok((offset, len))
         })
@@ -1456,6 +1510,55 @@ fn evict_range_cache(cache_dir: &Path, max_bytes: u64) {
     }
 }
 
+impl SegmentedReader {
+    /// The segment's postings verification table, fetched once through the
+    /// read-through tail cache and trusted via `postings_tail_hash`.
+    fn postings_table(
+        &self,
+        segment: &Segment,
+    ) -> Result<std::sync::Arc<crate::postings_table::PostingsTableIndex>> {
+        if let Some(table) = segment.postings_table.get() {
+            return Ok(table.clone());
+        }
+        let meta = &segment.meta;
+        let block_count = meta
+            .postings_data_len
+            .div_ceil(crate::postings_table::VERIFY_BLOCK_BYTES as u64);
+        let tail_len = block_count * 32 + crate::postings_table::FOOTER_BYTES as u64;
+        anyhow::ensure!(
+            meta.postings_data_len
+                .checked_add(tail_len)
+                .is_some_and(|total| total == meta.postings_len),
+            "postings verification table does not fit its blob"
+        );
+        let tail = cached_bytes(
+            &self.cache_dir,
+            &meta.seg_id,
+            "postings.tail",
+            &meta.postings_tail_hash,
+            &|| {
+                let name = segment_blob(&meta.seg_id, "postings.bin");
+                let mut ranges = self
+                    .store
+                    .get_ranges(&name, &[(meta.postings_data_len, tail_len)])?;
+                anyhow::ensure!(ranges.len() == 1, "postings tail fetch returned no range");
+                Ok(ranges.remove(0).to_vec())
+            },
+        )?;
+        let table = crate::postings_table::PostingsTableIndex::parse(meta.postings_len, &tail)?;
+        anyhow::ensure!(
+            table.data_len == meta.postings_data_len,
+            "postings table data length does not match segment metadata"
+        );
+        let _ = segment.postings_table.set(std::sync::Arc::new(table));
+        Ok(segment
+            .postings_table
+            .get()
+            .expect("table was just set")
+            .clone())
+    }
+}
+
 fn load_segment(
     store: &dyn BlobStore,
     cache_dir: &Path,
@@ -1488,6 +1591,7 @@ fn load_segment(
             map: TermMap::SparseRemote { index },
             dead: load_dead(store, cache_dir, meta)?,
             tables: OnceLock::new(),
+            postings_table: OnceLock::new(),
             meta: meta.clone(),
         });
     }
@@ -1508,6 +1612,7 @@ fn load_segment(
         map,
         dead,
         tables: OnceLock::new(),
+        postings_table: OnceLock::new(),
         meta: meta.clone(),
     })
 }
@@ -1528,6 +1633,13 @@ fn evict_stale_segments(cache_dir: &Path, segments: &[Segment]) {
 }
 
 impl crate::IndexReader for SegmentedReader {
+    fn excluded_objects(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|segment| segment.meta.failed_source_count as usize)
+            .sum()
+    }
+
     fn strategy(&self) -> Strategy {
         self.strategy
     }
@@ -1644,12 +1756,15 @@ mod tests {
             terms_tail_hash: String::new(),
             postings_len: 1,
             postings_hash: "c".repeat(64),
+            postings_data_len: 0,
+            postings_tail_hash: "e".repeat(64),
             docs_len: 1,
             docs_hash: "d".repeat(64),
             min_key: "a".into(),
             max_key: "z".into(),
             dead_hash: String::new(),
             dead_len: 0,
+            failed_source_count: 0,
             packs: vec![PackMeta {
                 hash: "e".repeat(64),
                 len: 1,

@@ -568,3 +568,118 @@ fn partially_cached_large_documents_reassemble_in_order() -> Result<()> {
     assert_eq!(repeat.len(), 1);
     Ok(())
 }
+
+#[test]
+fn corrupt_postings_blocks_abort_the_query_loudly() -> Result<()> {
+    // Same-length corruption of a postings block is the one shape that
+    // could silently drop documents; the per-block table must turn it into
+    // a loud error, never an empty result (#45).
+    let _lock = env_lock();
+    let _cache_max = EnvGuard::new("SEAGREP_CACHE_MAX");
+    // Disable the local range cache so the query reads the corrupted blob.
+    std::env::set_var("SEAGREP_CACHE_MAX", "0");
+    // The needle lives in a strict subset: a gram in every document
+    // resolves to ALL and never touches postings at all.
+    let objects: BTreeMap<String, Vec<u8>> = (0..40)
+        .map(|index| {
+            let body = if index % 3 == 0 {
+                format!("filler text for document {index}\nthe shared needle body\n")
+            } else {
+                format!("filler text for document {index}\nplain body only\n")
+            };
+            (format!("doc-{index:03}.txt"), body.into_bytes())
+        })
+        .collect();
+    let listing: Vec<(String, String, u64)> = objects
+        .iter()
+        .map(|(key, body)| {
+            (
+                key.clone(),
+                format!("{:016x}", seagrep_core::hash_ngram(body)),
+                body.len() as u64,
+            )
+        })
+        .collect();
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let corpus_for = |shard: &[(String, String, u64)]| {
+        let keys: Vec<String> = shard.iter().map(|(key, _, _)| key.clone()).collect();
+        let bodies = keys.iter().map(|key| objects[key].clone()).collect();
+        MemCorpus::new(keys, bodies)
+    };
+    update_index(
+        &LocalBlobStore::new(store_dir.path()),
+        cache_dir.path(),
+        &test_source(),
+        Some(Strategy::Sparse),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(corpus_for(shard))),
+    )?;
+
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    let clean = search(&reader, "shared needle body")?;
+    assert_eq!(
+        clean.len(),
+        14,
+        "the needle subset matches before corruption"
+    );
+    drop(reader);
+
+    // Flip one byte in every postings.bin data region (first byte: inside
+    // the first verification block whenever any posting list exists).
+    let mut corrupted = 0;
+    for entry in walkdir(store_dir.path())? {
+        if entry.file_name() == Some(std::ffi::OsStr::new("postings.bin")) {
+            let mut bytes = std::fs::read(&entry)?;
+            if bytes.len() > 64 {
+                bytes[0] ^= 0x01;
+                std::fs::write(&entry, bytes)?;
+                corrupted += 1;
+            }
+        }
+    }
+    assert!(
+        corrupted > 0,
+        "test must corrupt at least one postings blob"
+    );
+
+    let fresh_cache = tempfile::tempdir()?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        fresh_cache.path(),
+        &test_source(),
+    )?;
+    let error = match search(&reader, "shared needle body") {
+        Err(error) => error,
+        Ok(results) => panic!(
+            "corrupt postings must error, not return {} results",
+            results.len()
+        ),
+    };
+    assert!(
+        format!("{error:#}").contains("failed verification"),
+        "{error:#}"
+    );
+    Ok(())
+}
+
+fn walkdir(root: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
+}

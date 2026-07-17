@@ -20,7 +20,7 @@ pub(super) use runs::{
 };
 pub(super) use runs::{
     collect_file_trigrams, key_bytes, merge_posting_runs, write_posting_record, write_posting_runs,
-    IndexedGrams, MergedBlob,
+    IndexedGrams, MergedBlob, PostingsTail,
 };
 
 /// Docs are fetched and gram-extracted in chunks bounded BOTH by doc count

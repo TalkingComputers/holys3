@@ -285,6 +285,7 @@ pub fn search_streaming(
             candidates: 0,
             total_docs,
             bytes_fetched: 0,
+            excluded_objects: reader.excluded_objects(),
         });
     }
     let query = seagrep_query::plan(pattern, reader.strategy())?;
@@ -336,6 +337,7 @@ pub fn search_streaming(
         candidates,
         total_docs,
         bytes_fetched,
+        excluded_objects: reader.excluded_objects(),
     })
 }
 

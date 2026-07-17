@@ -579,6 +579,12 @@ fn execute_search(
     if let Some(scope) = execution.scope {
         scope.report();
     }
+    if search_stats.excluded_objects > 0 {
+        eprintln!(
+            "note: {} object(s) in this index could not be decoded and are not searchable (see the index build warnings)",
+            search_stats.excluded_objects
+        );
+    }
     if execution.stats_line {
         eprintln!(
             "candidates={} total={} hits={}",

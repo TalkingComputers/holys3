@@ -700,6 +700,13 @@ pub(crate) struct MergedBlob {
     pub(crate) hash: String,
 }
 
+/// The postings verification table's identity: data-region length plus the
+/// SHA-256 of the appended table+footer tail.
+pub(crate) struct PostingsTail {
+    pub(crate) data_len: u64,
+    pub(crate) tail_hash: String,
+}
+
 /// `io::Write` over a `StreamingPut` so the hashing/buffering writer stack
 /// feeds a streaming upload instead of a temp file.
 struct SinkWriter<'a> {
@@ -730,7 +737,7 @@ pub(crate) fn merge_posting_runs<'a>(
     doc_count: u32,
     terms_sink: Box<dyn StreamingPut + 'a>,
     postings_sink: Box<dyn StreamingPut + 'a>,
-) -> Result<(MergedBlob, MergedBlob, String)> {
+) -> Result<(MergedBlob, MergedBlob, String, PostingsTail)> {
     let paths = collapse_posting_runs(runs, strategy)?;
     let mut runs = paths
         .iter()
@@ -749,10 +756,10 @@ pub(crate) fn merge_posting_runs<'a>(
     }
     let mut postings_writer = BufWriter::with_capacity(
         RUN_IO_BUFFER_BYTES,
-        HashWriter::new(SinkWriter {
+        crate::postings_table::PostingsTableWriter::new(HashWriter::new(SinkWriter {
             sink: postings_sink,
             written: 0,
-        }),
+        })),
     );
     let run_bytes = paths.iter().try_fold(0u64, |total, path| -> Result<u64> {
         total
@@ -813,14 +820,14 @@ pub(crate) fn merge_posting_runs<'a>(
         .into_inner()
         .map_err(std::io::IntoInnerError::into_error)?
         .finish();
-    let (postings_sink, postings_hash) = postings_writer
+    let (postings_hasher, postings_data_len, postings_tail_hash) = postings_writer
         .into_inner()
         .map_err(std::io::IntoInnerError::into_error)?
-        .finish();
+        .finish()?;
+    let (postings_sink, postings_hash) = postings_hasher.finish();
     anyhow::ensure!(
-        postings_len == postings_sink.written,
-        "postings writer tracked {postings_len} bytes but streamed {}",
-        postings_sink.written
+        postings_len == postings_data_len,
+        "postings writer tracked {postings_len} data bytes but streamed {postings_data_len}"
     );
     let fst_len = fst_sink.written;
     let postings_written = postings_sink.written;
@@ -836,6 +843,10 @@ pub(crate) fn merge_posting_runs<'a>(
             hash: postings_hash,
         },
         tail_hash.unwrap_or_default(),
+        PostingsTail {
+            data_len: postings_data_len,
+            tail_hash: postings_tail_hash,
+        },
     ))
 }
 

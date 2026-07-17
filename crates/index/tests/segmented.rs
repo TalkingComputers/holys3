@@ -2034,3 +2034,81 @@ fn colliding_gram_hashes_keep_results_exact() -> Result<()> {
     assert_eq!(matches.len(), 1);
     Ok(())
 }
+
+#[test]
+fn undecodable_objects_surface_in_search_stats() -> Result<()> {
+    let mut bucket = Bucket::default();
+    bucket.put("good.txt", b"a searchable needle line\n");
+    // A truncated gzip stream sniffs as gzip but fails mid-decode; the
+    // object is excluded with a build warning and queries must surface
+    // the gap, not hide it.
+    bucket.put(
+        "poison.gz",
+        &[
+            0x1f, 0x8b, 0x08, 0x00, 0xc5, 0x60, 0x5a, 0x6a, 0x02, 0xff, 0xed, 0xca, 0xc1, 0x0d,
+            0x80, 0x20, 0x10, 0x44, 0xd1, 0xbb, 0x55, 0x4c, 0x6d, 0xba,
+        ],
+    );
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let store = LocalBlobStore::new(store_dir.path());
+    let listing = bucket.listing();
+    let report = update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Some(Strategy::Trigram),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    assert_eq!(report.added, 2, "both objects are tracked as sources");
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    let (matches, stats) = search_collect(&reader, "searchable needle")?;
+    assert_eq!(stats.hits, ["good.txt"]);
+    assert_eq!(matches.len(), 1);
+    assert_eq!(
+        stats.excluded_objects, 1,
+        "the poisoned object must be counted as unsearchable"
+    );
+    drop(reader);
+
+    // Fixing the object and updating clears the count: the old failed
+    // source goes dead, and the exclusion tally must go with it.
+    bucket.put(
+        "poison.gz",
+        &[
+            0x1f, 0x8b, 0x08, 0x00, 0x8c, 0x65, 0x5a, 0x6a, 0x02, 0xff, 0x2b, 0x28, 0x4a, 0x2d,
+            0xcb, 0xcc, 0x2f, 0x2d, 0xce, 0xa9, 0x54, 0x28, 0xc8, 0xcf, 0x2c, 0xce, 0xcf, 0x4b,
+            0x4d, 0x51, 0xc8, 0x4b, 0x4d, 0x4d, 0xc9, 0x49, 0x55, 0x48, 0xce, 0xcf, 0x2b, 0x49,
+            0xcd, 0x2b, 0xe1, 0x2a, 0xa0, 0x8a, 0x12, 0x00, 0xf6, 0xc9, 0x99, 0x57, 0x69, 0x00,
+            0x00, 0x00,
+        ],
+    );
+    let listing = bucket.listing();
+    update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Some(Strategy::Trigram),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    let (_, stats) = search_collect(&reader, "previously poisoned needle")?;
+    assert_eq!(stats.hits, ["poison.gz"], "the fixed object is searchable");
+    assert_eq!(
+        stats.excluded_objects, 0,
+        "a re-decoded source must leave the exclusion count"
+    );
+    Ok(())
+}
