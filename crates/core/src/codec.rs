@@ -174,6 +174,131 @@ fn decode_body_inner(
     }
 }
 
+/// ripgrep parity: a document beginning with a UTF-16 byte-order mark
+/// transcodes to UTF-8 before indexing and search (BOM stripped, invalid
+/// code units become U+FFFD) — a UTF-8 pattern can never match raw wide
+/// bytes, so leaving them untranscoded silently hides Windows-style text.
+fn transcode_utf16_body(body: DocumentBody) -> AnyhowResult<DocumentBody> {
+    let little_endian = match body.bom_prefix()? {
+        Some([0xFF, 0xFE]) => true,
+        Some([0xFE, 0xFF]) => false,
+        _ => return Ok(body),
+    };
+    match body.storage {
+        DocumentStorage::Bytes(bytes) => {
+            let mut out = Vec::with_capacity(bytes.len().saturating_mul(3) / 2);
+            let mut transcoder = Utf16Transcoder::new(little_endian);
+            transcoder.push(&bytes[2..], &mut out);
+            transcoder.finish(&mut out);
+            Ok(DocumentBody::from_bytes(out.into()))
+        }
+        DocumentStorage::File { mut file, .. } => {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            file.seek(SeekFrom::Start(2))?;
+            let spool = tempfile::NamedTempFile::new()?;
+            let mut writer = std::io::BufWriter::new(spool.as_file());
+            let mut transcoder = Utf16Transcoder::new(little_endian);
+            let mut chunk = vec![0u8; 1 << 16];
+            let mut out = Vec::with_capacity(3 << 15);
+            loop {
+                let read = file.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                out.clear();
+                transcoder.push(&chunk[..read], &mut out);
+                writer.write_all(&out)?;
+            }
+            out.clear();
+            transcoder.finish(&mut out);
+            writer.write_all(&out)?;
+            writer.flush()?;
+            drop(writer);
+            let file = spool.into_file();
+            let len = file.metadata()?.len();
+            Ok(DocumentBody::from_file(file, len))
+        }
+    }
+}
+
+/// Incremental UTF-16 -> UTF-8: carries an odd byte and an unpaired high
+/// surrogate across chunk boundaries; anything invalid becomes U+FFFD,
+/// matching ripgrep's transcoding behavior.
+struct Utf16Transcoder {
+    little_endian: bool,
+    carry_byte: Option<u8>,
+    carry_unit: Option<u16>,
+}
+
+impl Utf16Transcoder {
+    fn new(little_endian: bool) -> Self {
+        Self {
+            little_endian,
+            carry_byte: None,
+            carry_unit: None,
+        }
+    }
+
+    fn push(&mut self, mut data: &[u8], out: &mut Vec<u8>) {
+        let mut units: Vec<u16> = Vec::with_capacity(data.len() / 2 + 2);
+        if let Some(first) = self.carry_byte.take() {
+            if let Some((&second, rest)) = data.split_first() {
+                units.push(self.unit(first, second));
+                data = rest;
+            } else {
+                self.carry_byte = Some(first);
+                return;
+            }
+        }
+        let mut pairs = data.chunks_exact(2);
+        for pair in pairs.by_ref() {
+            units.push(self.unit(pair[0], pair[1]));
+        }
+        if let [last] = pairs.remainder() {
+            self.carry_byte = Some(*last);
+        }
+        // an unpaired high surrogate at a chunk edge needs its partner
+        let mut buffered: Vec<u16> = self.carry_unit.take().into_iter().chain(units).collect();
+        if buffered
+            .last()
+            .is_some_and(|last| (0xD800..=0xDBFF).contains(last))
+        {
+            self.carry_unit = buffered.pop();
+        }
+        let mut scratch = [0u8; 4];
+        for decoded in char::decode_utf16(buffered) {
+            let ch = decoded.unwrap_or(char::REPLACEMENT_CHARACTER);
+            out.extend_from_slice(ch.encode_utf8(&mut scratch).as_bytes());
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        let mut scratch = [0u8; 4];
+        // a leftover surrogate and a leftover odd byte are independent
+        // errors: one replacement character each
+        for leftover in [
+            self.carry_unit.take().is_some(),
+            self.carry_byte.take().is_some(),
+        ] {
+            if leftover {
+                out.extend_from_slice(
+                    char::REPLACEMENT_CHARACTER
+                        .encode_utf8(&mut scratch)
+                        .as_bytes(),
+                );
+            }
+        }
+    }
+
+    fn unit(&self, a: u8, b: u8) -> u16 {
+        if self.little_endian {
+            u16::from_le_bytes([a, b])
+        } else {
+            u16::from_be_bytes([a, b])
+        }
+    }
+}
+
 pub fn decode_body(key: &str, bytes: Vec<u8>) -> AnyhowResult<Vec<u8>> {
     Ok(
         decode_body_inner(key, bytes.into(), None, DECODE_MEMORY_LIMIT)?
@@ -409,6 +534,7 @@ impl DecodeState<'_> {
     }
 
     fn emit(&mut self, member_path: Option<String>, body: DocumentBody) -> AnyhowResult<()> {
+        let body = transcode_utf16_body(body)?;
         let len = body.len();
         let expanded_bytes = self
             .expanded_bytes
@@ -743,6 +869,58 @@ pub fn decode_requested_body(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn utf16_bodies_transcode_like_ripgrep() {
+        // LE with BOM
+        let text = "needle line\nsecond needle\n";
+        let mut le = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            le.extend_from_slice(&unit.to_le_bytes());
+        }
+        let body = transcode_utf16_body(DocumentBody::from_bytes(le.into())).unwrap();
+        assert_eq!(body.into_bytes().unwrap(), text.as_bytes());
+
+        // BE with BOM, non-BMP char forces a surrogate pair
+        let text = "emoji \u{1F600} needle\n";
+        let mut be = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            be.extend_from_slice(&unit.to_be_bytes());
+        }
+        let body = transcode_utf16_body(DocumentBody::from_bytes(be.into())).unwrap();
+        assert_eq!(body.into_bytes().unwrap(), text.as_bytes());
+
+        // no BOM: bytes pass through untouched
+        let raw = b"plain needle\n".to_vec();
+        let body = transcode_utf16_body(DocumentBody::from_bytes(raw.clone().into())).unwrap();
+        assert_eq!(body.into_bytes().unwrap(), raw);
+
+        // lone high surrogate and odd trailing byte become U+FFFD
+        let mut bad = vec![0xFF, 0xFE];
+        bad.extend_from_slice(&0xD800u16.to_le_bytes());
+        bad.push(0x41);
+        let body = transcode_utf16_body(DocumentBody::from_bytes(bad.into())).unwrap();
+        assert_eq!(body.into_bytes().unwrap(), "\u{FFFD}\u{FFFD}".as_bytes());
+    }
+
+    #[test]
+    fn utf16_transcoder_carries_across_chunk_boundaries() {
+        // Split a surrogate pair and a code unit across pushes at every
+        // offset; the output must be identical regardless of chunking.
+        let text = "a\u{1F600}b needle \u{1F680}\n";
+        let mut encoded = Vec::new();
+        for unit in text.encode_utf16() {
+            encoded.extend_from_slice(&unit.to_le_bytes());
+        }
+        for split in 0..encoded.len() {
+            let mut transcoder = Utf16Transcoder::new(true);
+            let mut out = Vec::new();
+            transcoder.push(&encoded[..split], &mut out);
+            transcoder.push(&encoded[split..], &mut out);
+            transcoder.finish(&mut out);
+            assert_eq!(out, text.as_bytes(), "split at {split}");
+        }
+    }
+
     use super::*;
     use crate::{grep_doc, MatchOptions};
 
