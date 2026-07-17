@@ -507,12 +507,18 @@ pub fn update_index(
 
     let mut metas = existing;
     let mut changed_dead = vec![false; metas.len()];
+    // Exclusion counts stay live: a failed source that is deleted or
+    // re-decoded goes dead here, and its segment's count must drop with it.
+    let mut failed_dead = vec![0u32; metas.len()];
     for group in newly_dead.chunk_by(|a, b| a.0 == b.0) {
         let seg_idx = group[0].0;
         let mut dead = dead_sets[seg_idx].clone();
         for &(_, source_id) in group {
             dead.sources.push(source_id);
             let source = &tables[seg_idx].sources[source_id as usize];
+            if source.failed {
+                failed_dead[seg_idx] += 1;
+            }
             dead.documents
                 .extend(source.first_doc..source.first_doc + source.doc_count);
         }
@@ -526,6 +532,9 @@ pub fn update_index(
     let mut keep = Vec::with_capacity(metas.len());
     let mut repacked = false;
     for (seg_idx, (mut meta, dead)) in metas.drain(..).zip(dead_sets).enumerate() {
+        meta.failed_source_count = meta
+            .failed_source_count
+            .saturating_sub(failed_dead[seg_idx]);
         if dead.sources.len() == tables[seg_idx].sources.len() {
             continue;
         }

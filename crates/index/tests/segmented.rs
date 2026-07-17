@@ -2075,5 +2075,40 @@ fn undecodable_objects_surface_in_search_stats() -> Result<()> {
         stats.excluded_objects, 1,
         "the poisoned object must be counted as unsearchable"
     );
+    drop(reader);
+
+    // Fixing the object and updating clears the count: the old failed
+    // source goes dead, and the exclusion tally must go with it.
+    bucket.put(
+        "poison.gz",
+        &[
+            0x1f, 0x8b, 0x08, 0x00, 0x8c, 0x65, 0x5a, 0x6a, 0x02, 0xff, 0x2b, 0x28, 0x4a, 0x2d,
+            0xcb, 0xcc, 0x2f, 0x2d, 0xce, 0xa9, 0x54, 0x28, 0xc8, 0xcf, 0x2c, 0xce, 0xcf, 0x4b,
+            0x4d, 0x51, 0xc8, 0x4b, 0x4d, 0x4d, 0xc9, 0x49, 0x55, 0x48, 0xce, 0xcf, 0x2b, 0x49,
+            0xcd, 0x2b, 0xe1, 0x2a, 0xa0, 0x8a, 0x12, 0x00, 0xf6, 0xc9, 0x99, 0x57, 0x69, 0x00,
+            0x00, 0x00,
+        ],
+    );
+    let listing = bucket.listing();
+    update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Some(Strategy::Trigram),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    let (_, stats) = search_collect(&reader, "previously poisoned needle")?;
+    assert_eq!(stats.hits, ["poison.gz"], "the fixed object is searchable");
+    assert_eq!(
+        stats.excluded_objects, 0,
+        "a re-decoded source must leave the exclusion count"
+    );
     Ok(())
 }
