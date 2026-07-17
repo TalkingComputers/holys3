@@ -49,7 +49,7 @@ jobs:
         with:
           tool: cargo-nextest
           fallback: none
-      # Live S3 integration tests self-skip unless HOLYS3_TEST_BUCKET is set,
+      # Live S3 integration tests self-skip unless SEAGREP_TEST_BUCKET is set,
       # so the full workspace test run is safe without cloud credentials.
       - name: Run tests
         run: cargo nextest run --locked --workspace --all-features --profile ci
@@ -57,7 +57,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.rust == '1.96.1'
         run: |
           ulimit -n 96
-          cargo test --locked -p holys3-index tests::posting_run_merge_bounds_open_files -- --exact
+          cargo test --locked -p seagrep-index tests::posting_run_merge_bounds_open_files -- --exact
       - name: Run doc tests
         run: cargo test --locked --workspace --all-features --doc
 
@@ -78,8 +78,8 @@ jobs:
       - run: cargo test --locked --release --workspace --all-features
       - name: Enforce release binary size
         run: |
-          cargo build --locked --release -p holys3
-          bytes=$(stat -c %s target/release/holys3)
+          cargo build --locked --release -p seagrep
+          bytes=$(stat -c %s target/release/seagrep)
           limit=33554432
           printf 'release binary: %s bytes (limit %s)\n' "$bytes" "$limit"
           test "$bytes" -le "$limit"
@@ -95,7 +95,7 @@ jobs:
         id: msrv
         run: |
           MSRV=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "holys3") | .rust_version')
+            | jq -r '.packages[] | select(.name == "seagrep") | .rust_version')
           echo "version=$MSRV" | tee -a "$GITHUB_OUTPUT"
       - name: Install Rust (${{ steps.msrv.outputs.version }})
         id: toolchain

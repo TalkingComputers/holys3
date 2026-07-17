@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use holys3_core::{decode_body, testutil::MemCorpus, Corpus};
+use seagrep_core::{decode_body, testutil::MemCorpus, Corpus};
 use std::io::Write;
 
 pub(crate) const PATTERNS: &[&str] = &[
@@ -76,7 +76,7 @@ pub(crate) fn gzipped_corpus() -> MemCorpus {
 /// Same corpus with a different format per doc — every supported codec plus
 /// parquet and avro projections carrying the same searchable text.
 pub(crate) fn encoded_corpus() -> MemCorpus {
-    use holys3_core::testutil::encode;
+    use seagrep_core::testutil::encode;
     let mut bodies: Vec<Vec<u8>> = bodies()
         .into_iter()
         .enumerate()

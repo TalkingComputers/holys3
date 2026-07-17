@@ -2,8 +2,8 @@ use super::HashWriter;
 use crate::terms::TermBuilder;
 use crate::{encode_posting_block, eval};
 use anyhow::{Context, Result};
-use holys3_core::{iterate_sparse_grams, start_sparse_gram_ranges, DocId, Strategy, StreamingPut};
 use rayon::prelude::*;
+use seagrep_core::{iterate_sparse_grams, start_sparse_gram_ranges, DocId, Strategy, StreamingPut};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
@@ -240,7 +240,7 @@ impl SparseRunWriter {
         let mut recent = [None, None];
         let mut recent_index = 0usize;
         for gram in iterate_sparse_grams(text) {
-            let hash = holys3_core::hash_ngram(gram);
+            let hash = seagrep_core::hash_ngram(gram);
             if recent.contains(&Some(hash)) {
                 continue;
             }
@@ -293,11 +293,11 @@ impl SparseRunWriter {
                 continue;
             }
             let hash = if is_inline {
-                holys3_core::hash_ngram(&inline[..range.len()])
+                seagrep_core::hash_ngram(&inline[..range.len()])
             } else {
                 scratch.resize(range.len(), 0);
                 text.read_bytes(&range, &mut scratch)?;
-                holys3_core::hash_ngram(&scratch)
+                seagrep_core::hash_ngram(&scratch)
             };
             if recent.contains(&Some(hash)) {
                 continue;
@@ -843,7 +843,7 @@ pub(crate) fn merge_posting_runs<'a>(
 mod tests {
     #[test]
     fn sparse_runs_carry_fixed_width_hashed_keys() {
-        use holys3_core::hash_ngram;
+        use seagrep_core::hash_ngram;
         let mut writer = SparseRunWriter::new(7, 1 << 20).unwrap();
         let text = b"the quick brown fox jumps over the lazy dog";
         writer.add(text).unwrap();

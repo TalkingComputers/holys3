@@ -2,15 +2,15 @@
 
 ## Bird's Eye View
 
-holys3 is a grep-style CLI for private S3 buckets. It builds a compact gram index and immutable compressed content snapshot, uses the grams only to reduce the candidate set, and runs the final regex over snapshot bytes. The correctness model is deliberately simple: indexed search must return the same document set as scanning the canonical bytes captured by that index generation.
+seagrep is a grep-style CLI for private S3 buckets. It builds a compact gram index and immutable compressed content snapshot, uses the grams only to reduce the candidate set, and runs the final regex over snapshot bytes. The correctness model is deliberately simple: indexed search must return the same document set as scanning the canonical bytes captured by that index generation.
 
-The main boundary is IO. `holys3-core`, `holys3-query`, and `holys3-index` are mostly pure format and planning code. `holys3-s3` owns AWS network calls. `holys3` wires those pieces into a user-facing CLI.
+The main boundary is IO. `seagrep-core`, `seagrep-query`, and `seagrep-index` are mostly pure format and planning code. `seagrep-s3` owns AWS network calls. `seagrep` wires those pieces into a user-facing CLI.
 
 ## Entry Points
 
 ### Index pipeline
 
-`holys3 index s3://bucket[/prefix]` lists the prefix, filters out any co-located index namespace, diffs (key, etag) pairs against the union of existing segment doc tables, writes immutable tombstones and bounded content-addressed segments over the changes, optionally repacks or merges segments, and atomically swaps the index root pointer. The index defaults to `<prefix>/.holys3/`; `--index s3://other-bucket/path` selects an independent bucket and namespace. Large blobs upload as concurrent multipart parts.
+`seagrep index s3://bucket[/prefix]` lists the prefix, filters out any co-located index namespace, diffs (key, etag) pairs against the union of existing segment doc tables, writes immutable tombstones and bounded content-addressed segments over the changes, optionally repacks or merges segments, and atomically swaps the index root pointer. The index defaults to `<prefix>/.seagrep/`; `--index s3://other-bucket/path` selects an independent bucket and namespace. Large blobs upload as concurrent multipart parts.
 
 `--watch --interval SECONDS` opens the target once, retains one refreshing S3 client, and serializes fresh listing/diff/CAS cycles through the same pipeline. The interval begins after an attempt completes. Continuous mode adds no daemon database, event-consumer path, or second index transaction.
 
@@ -46,7 +46,7 @@ The contract is `index == captured scan`: indexed search must return the same lo
 
 ### AWS transport
 
-The official AWS SDK owns credential discovery, refresh, endpoint rules, and request signing. holys3 owns operation scheduling, adaptive concurrency, retry jitter, hedging, range coalescing, and bounded body storage above that transport.
+The official AWS SDK owns credential discovery, refresh, endpoint rules, and request signing. seagrep owns operation scheduling, adaptive concurrency, retry jitter, hedging, range coalescing, and bounded body storage above that transport.
 
 ### Error handling
 
@@ -56,7 +56,7 @@ Continuous indexing fails its first cycle so invalid targets, credentials, and i
 
 ### Index storage
 
-S3 sources default to index data under `.holys3/` or `<prefix>/.holys3/` in the source bucket. `--index` may instead name any prefixed S3 location; `--index-region` and `--index-endpoint` independently configure that S3 client. The search path reads the selected root pointer, verifies its source identity, opens each live segment, then uses coalesced ranged GETs against postings and content packs. Searches may narrow the recorded source prefix but cannot broaden it or change its endpoint or bucket. Co-located explicit namespaces are excluded from source listings only when endpoint and bucket both match, and namespaces that contain the source prefix are rejected. Because packs contain canonical decoded content, the index storage boundary has the same confidentiality requirements as the source. Large index blobs stream to their final keys as multipart uploads during the build; failure paths abort the upload, but a hard crash (release builds abort on panic and skip destructors) can strand an incomplete multipart that accrues storage invisibly. Configure an `AbortIncompleteMultipartUpload` lifecycle rule (one day is plenty) scoped to the index namespace — the `.holys3/` prefix for co-located indexes, or the `--index` prefix — so unrelated multipart uploads in a shared bucket are never aborted.
+S3 sources default to index data under `.seagrep/` or `<prefix>/.seagrep/` in the source bucket. `--index` may instead name any prefixed S3 location; `--index-region` and `--index-endpoint` independently configure that S3 client. The search path reads the selected root pointer, verifies its source identity, opens each live segment, then uses coalesced ranged GETs against postings and content packs. Searches may narrow the recorded source prefix but cannot broaden it or change its endpoint or bucket. Co-located explicit namespaces are excluded from source listings only when endpoint and bucket both match, and namespaces that contain the source prefix are rejected. Because packs contain canonical decoded content, the index storage boundary has the same confidentiality requirements as the source. Large index blobs stream to their final keys as multipart uploads during the build; failure paths abort the upload, but a hard crash (release builds abort on panic and skip destructors) can strand an incomplete multipart that accrues storage invisibly. Configure an `AbortIncompleteMultipartUpload` lifecycle rule (one day is plenty) scoped to the index namespace — the `.seagrep/` prefix for co-located indexes, or the `--index` prefix — so unrelated multipart uploads in a shared bucket are never aborted.
 
 ### Reader consistency
 

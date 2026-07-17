@@ -3,8 +3,8 @@ use crate::gen::{
 };
 use crate::{dir_cache_dir, dir_source_identity, percentile_ms};
 use anyhow::{Context, Result};
-use holys3_core::{BlobStore, LocalBlobStore, MatchOptions, Strategy};
-use holys3_index::{
+use seagrep_core::{BlobStore, LocalBlobStore, MatchOptions, Strategy};
+use seagrep_index::{
     search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, NullSink, SegmentedReader,
     UpdateOptions,
 };
@@ -90,7 +90,7 @@ impl BlobStore for ChurnStore {
         self.inner.put_if(name, bytes, expected)
     }
 
-    fn put_streaming<'a>(&'a self, name: &str) -> Result<Box<dyn holys3_core::StreamingPut + 'a>> {
+    fn put_streaming<'a>(&'a self, name: &str) -> Result<Box<dyn seagrep_core::StreamingPut + 'a>> {
         self.inner.put_streaming(name)
     }
 }
@@ -292,7 +292,7 @@ fn build_churn_body(seed: u64, sequence: usize, size: usize) -> Result<Vec<u8>> 
     let mut record = ChurnRecord {
         timestamp: format!("2026-07-12T{:02}:00:00Z", sequence % 24),
         level: "INFO",
-        service: format!("holys3-bench-{:04x}", seed & 0xffff),
+        service: format!("seagrep-bench-{:04x}", seed & 0xffff),
         request_id: format!("{seed:016x}-{sequence:016x}"),
         message: format!("CHURN_NEEDLE sequence={sequence}"),
     };

@@ -11,7 +11,7 @@
 //! packs/<hash>.pack             immutable canonical decoded content frames
 //! ```
 //!
-//! `holys3 index` becomes a diff: list the bucket, compare (key, etag)
+//! `seagrep index` becomes a diff: list the bucket, compare (key, etag)
 //! against the union of segment doc tables, build bounded segments over the
 //! changes, tombstone superseded documents, periodically repack, and atomically
 //! swap segments.bin.
@@ -25,8 +25,8 @@ use crate::{candidates_with, INDEX_FORMAT};
 use anyhow::{Context, Result};
 use cache::{cached_blob, cached_bytes, cached_file, map_file};
 use compact::{maybe_compact, merge_segments};
-use holys3_core::{BlobStore, Corpus, DocAddress, IndexAddress, ProgressSender, Strategy};
-use holys3_query::Query;
+use seagrep_core::{BlobStore, Corpus, DocAddress, IndexAddress, ProgressSender, Strategy};
+use seagrep_query::Query;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -485,7 +485,7 @@ pub fn update_index(
     let added = to_add.len();
     let removed = newly_dead.len();
     if let Some(progress) = progress {
-        progress.emit(holys3_core::ProgressEvent::DiffComputed {
+        progress.emit(seagrep_core::ProgressEvent::DiffComputed {
             to_add: added as u64,
             to_remove: removed as u64,
         });
@@ -582,7 +582,7 @@ pub fn update_index(
             &postcard::to_allocvec(&list)?,
             root_version.as_deref()
         )?,
-        "another holys3 index run updated this index concurrently; rerun to pick up its result"
+        "another seagrep index run updated this index concurrently; rerun to pick up its result"
     );
     collect_garbage(store, &replaced, &list.segments);
     Ok(UpdateReport {
@@ -947,9 +947,9 @@ impl SegmentedReader {
         let (bytes, root_version) = store
             .get_versioned("segments.bin")
             .context("reading segments.bin")?
-            .context("no index found — run `holys3 index` first")?;
+            .context("no index found — run `seagrep index` first")?;
         let list = parse_segment_list(&bytes)
-            .context("index is not usable as-is; run `holys3 index` to rebuild")?;
+            .context("index is not usable as-is; run `seagrep index` to rebuild")?;
         if let Some(source) = source {
             anyhow::ensure!(
                 list.source.can_search(source),
@@ -1089,7 +1089,7 @@ impl SegmentedReader {
                 _ => None,
             };
             let lookup = |gram: &[u8]| match &remote_values {
-                Some(values) => Ok(values.get(&holys3_core::hash_ngram(gram)).copied()),
+                Some(values) => Ok(values.get(&seagrep_core::hash_ngram(gram)).copied()),
                 None => segment.map.get(gram),
             };
             let ids = self.classify_index_result(candidates_with(
@@ -1242,10 +1242,10 @@ fn posting_ranges(
 
 /// Sparse dictionaries at or above this size open remotely: only the block
 /// index downloads, and queries fetch just the blocks their grams need.
-/// `HOLYS3_SPARSE_REMOTE_MIN` overrides the byte threshold (testing and
+/// `SEAGREP_SPARSE_REMOTE_MIN` overrides the byte threshold (testing and
 /// forced-mode verification); a malformed value fails loudly.
 fn sparse_remote_terms_min() -> Result<u64> {
-    parse_remote_terms_min(std::env::var("HOLYS3_SPARSE_REMOTE_MIN").ok().as_deref())
+    parse_remote_terms_min(std::env::var("SEAGREP_SPARSE_REMOTE_MIN").ok().as_deref())
 }
 
 fn parse_remote_terms_min(configured: Option<&str>) -> Result<u64> {
@@ -1253,7 +1253,7 @@ fn parse_remote_terms_min(configured: Option<&str>) -> Result<u64> {
         None => Ok(64 * 1024 * 1024),
         Some(value) => value
             .parse()
-            .with_context(|| format!("HOLYS3_SPARSE_REMOTE_MIN is not a byte count: {value:?}")),
+            .with_context(|| format!("SEAGREP_SPARSE_REMOTE_MIN is not a byte count: {value:?}")),
     }
 }
 
@@ -1278,8 +1278,8 @@ impl std::fmt::Display for SampleWindowFull {
 
 impl std::error::Error for SampleWindowFull {}
 
-impl holys3_core::DecodeSink for SampleWindow {
-    fn begin(&mut self, _: &holys3_core::LogicalDocumentMeta) -> Result<()> {
+impl seagrep_core::DecodeSink for SampleWindow {
+    fn begin(&mut self, _: &seagrep_core::LogicalDocumentMeta) -> Result<()> {
         Ok(())
     }
 
@@ -1343,13 +1343,13 @@ fn detect_strategy(
                 cap: SAMPLE_WINDOW,
             };
             if let Err(error) =
-                holys3_core::decode_source(key, bytes, holys3_core::DECODE_LIMITS, &mut sample)
+                seagrep_core::decode_source(key, bytes, seagrep_core::DECODE_LIMITS, &mut sample)
             {
                 if !error.is::<SampleWindowFull>() {
                     continue;
                 }
             }
-            match holys3_core::is_prose_like(&sample.window) {
+            match seagrep_core::is_prose_like(&sample.window) {
                 Some(true) => {
                     prose_bytes += sample.window.len() as u64;
                     classified_bytes += sample.window.len() as u64;
@@ -1387,16 +1387,16 @@ fn detect_strategy(
     Ok(strategy)
 }
 
-/// Byte cap for the on-disk pack/postings range cache. `HOLYS3_CACHE_MAX`
+/// Byte cap for the on-disk pack/postings range cache. `SEAGREP_CACHE_MAX`
 /// overrides; `0` disables range caching entirely (gram-block and whole-file
 /// caches are unaffected — they are bounded and load-bearing).
 fn range_cache_max() -> Result<u64> {
     const DEFAULT_MAX: u64 = 4 * 1024 * 1024 * 1024;
-    match std::env::var("HOLYS3_CACHE_MAX") {
+    match std::env::var("SEAGREP_CACHE_MAX") {
         Ok(value) => value
             .trim()
             .parse::<u64>()
-            .with_context(|| format!("HOLYS3_CACHE_MAX is not a byte count: {value:?}")),
+            .with_context(|| format!("SEAGREP_CACHE_MAX is not a byte count: {value:?}")),
         Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MAX),
         Err(error) => Err(error.into()),
     }
@@ -1562,11 +1562,11 @@ impl crate::IndexReader for SegmentedReader {
     }
 }
 
-impl holys3_core::DocFetcher for SegmentedReader {
+impl seagrep_core::DocFetcher for SegmentedReader {
     fn fetch_each(
         &self,
         documents: &[DocAddress],
-        consume: &mut dyn FnMut(usize, holys3_core::DocumentBody) -> Result<()>,
+        consume: &mut dyn FnMut(usize, seagrep_core::DocumentBody) -> Result<()>,
     ) -> Result<()> {
         let mut grouped = std::collections::BTreeMap::<u32, Vec<(usize, u32)>>::new();
         for (index, document) in documents.iter().enumerate() {
@@ -1673,7 +1673,7 @@ mod tests {
         assert_eq!(parse_remote_terms_min(Some("1")).unwrap(), 1);
         let error = parse_remote_terms_min(Some("64MB")).unwrap_err();
         assert!(
-            error.to_string().contains("HOLYS3_SPARSE_REMOTE_MIN"),
+            error.to_string().contains("SEAGREP_SPARSE_REMOTE_MIN"),
             "{error:#}"
         );
     }
@@ -1685,19 +1685,19 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            !format!("{parse_error:#}").contains("run `holys3 index`"),
+            !format!("{parse_error:#}").contains("run `seagrep index`"),
             "index-path notes embed this message next to 'rebuilding from scratch', so remediation advice would contradict: {parse_error:#}"
         );
 
         let dir = tempfile::tempdir().unwrap();
-        let store = holys3_core::LocalBlobStore::new(dir.path());
+        let store = seagrep_core::LocalBlobStore::new(dir.path());
         store.put("segments.bin", b"garbage").unwrap();
         let open_error = match SegmentedReader::inspect(Box::new(store), dir.path()) {
             Ok(_) => panic!("corrupt root must not open"),
             Err(error) => error,
         };
         assert!(
-            format!("{open_error:#}").contains("run `holys3 index` to rebuild"),
+            format!("{open_error:#}").contains("run `seagrep index` to rebuild"),
             "{open_error:#}"
         );
     }
@@ -1754,7 +1754,7 @@ mod tests {
     fn index_update_rejects_source_change_without_rebuild() {
         let store_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
-        let store = holys3_core::LocalBlobStore::new(store_dir.path());
+        let store = seagrep_core::LocalBlobStore::new(store_dir.path());
         store.put("segments.bin", &encoded(Vec::new())).unwrap();
         let other = SourceIdentity::Local {
             prefix: "/other/".into(),
@@ -1776,7 +1776,7 @@ mod tests {
     fn segment_root_references_uploaded_content_packs() {
         let store_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
-        let store = holys3_core::LocalBlobStore::new(store_dir.path());
+        let store = seagrep_core::LocalBlobStore::new(store_dir.path());
         let listing = vec![("a.txt".to_owned(), "v1".to_owned(), 5)];
         update_index(
             &store,
@@ -1786,7 +1786,7 @@ mod tests {
             &listing,
             UpdateOptions::default(),
             &|_| {
-                Ok(Box::new(holys3_core::testutil::MemCorpus::new(
+                Ok(Box::new(seagrep_core::testutil::MemCorpus::new(
                     vec!["a.txt".to_owned()],
                     vec![b"alpha".to_vec()],
                 )))
@@ -1812,7 +1812,7 @@ mod tests {
                 key: "actual".into(),
                 version: "v1".into(),
                 encoded_size: 1,
-                encoding: holys3_core::SourceEncoding::Raw,
+                encoding: seagrep_core::SourceEncoding::Raw,
                 first_doc: 0,
                 doc_count: 1,
                 failed: false,
@@ -1847,7 +1847,7 @@ mod tests {
     fn cached_blob_repairs_same_length_corruption() {
         let store_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
-        let store = holys3_core::LocalBlobStore::new(store_dir.path());
+        let store = seagrep_core::LocalBlobStore::new(store_dir.path());
         let segment_id = "a".repeat(64);
         let name = "docs.bin";
         store
@@ -1884,7 +1884,7 @@ mod tests {
     fn unmergeable_segment_set_converges_without_root_rewrite() {
         let store_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
-        let store = holys3_core::LocalBlobStore::new(store_dir.path());
+        let store = seagrep_core::LocalBlobStore::new(store_dir.path());
         let mut segments = Vec::new();
         let mut listing = Vec::new();
         for index in 0..=SEGMENT_COUNT_TARGET {
@@ -1894,7 +1894,7 @@ mod tests {
                     key: key.clone(),
                     version: "v1".into(),
                     encoded_size: 1,
-                    encoding: holys3_core::SourceEncoding::Raw,
+                    encoding: seagrep_core::SourceEncoding::Raw,
                     first_doc: 0,
                     doc_count: 1,
                     failed: false,
@@ -1961,7 +1961,7 @@ mod tests {
     fn compaction_rejects_overflowing_segment_sizes_without_panicking() {
         let store_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
-        let store = holys3_core::LocalBlobStore::new(store_dir.path());
+        let store = seagrep_core::LocalBlobStore::new(store_dir.path());
         for (terms_fst_len, postings_len, docs_len) in
             [(u64::MAX, 0, 0), (0, u64::MAX, 0), (0, 0, u64::MAX)]
         {
@@ -1983,7 +1983,7 @@ mod tests {
     #[test]
     fn segment_build_splits_on_logical_document_count() {
         let store_dir = tempfile::tempdir().unwrap();
-        let store = holys3_core::LocalBlobStore::new(store_dir.path());
+        let store = seagrep_core::LocalBlobStore::new(store_dir.path());
         let docs = (0..5)
             .map(|index| (format!("doc-{index}"), "v1".to_owned(), 1))
             .collect::<Vec<_>>();
@@ -1996,7 +1996,7 @@ mod tests {
                 .iter()
                 .map(|key| format!("body {key}").into_bytes())
                 .collect::<Vec<_>>();
-            Ok(Box::new(holys3_core::testutil::MemCorpus::new(
+            Ok(Box::new(seagrep_core::testutil::MemCorpus::new(
                 keys, bodies,
             )))
         };
@@ -2015,16 +2015,16 @@ mod tests {
     #[test]
     fn segment_cap_stops_before_later_archive_failure() {
         let store_dir = tempfile::tempdir().unwrap();
-        let store = holys3_core::LocalBlobStore::new(store_dir.path());
+        let store = seagrep_core::LocalBlobStore::new(store_dir.path());
         let docs = vec![("bundle.zip".to_owned(), "v1".to_owned(), 1)];
-        let body = holys3_core::testutil::encode::zip(&[
+        let body = seagrep_core::testutil::encode::zip(&[
             ("a.log", b"a"),
             ("b.log", b"b"),
             ("c.log", b"c"),
             ("../invalid.log", b"invalid"),
         ]);
         let factory = |shard: &[(String, String, u64)]| -> Result<Box<dyn Corpus>> {
-            Ok(Box::new(holys3_core::testutil::MemCorpus::new(
+            Ok(Box::new(seagrep_core::testutil::MemCorpus::new(
                 vec![shard[0].0.clone()],
                 vec![body.clone()],
             )))

@@ -3,11 +3,11 @@
 
 use crate::{IndexReader, SearchStats};
 use anyhow::{Context, Result};
-use holys3_core::{
+use rayon::iter::{ParallelBridge, ParallelIterator};
+use seagrep_core::{
     bounded_match_len, can_search_as_document, grep_bytes, grep_bytes_fast, has_line_match,
     has_line_match_fast, DocAddress, DocFetcher, DocumentBody, LineEvent, MatchOptions,
 };
-use rayon::iter::{ParallelBridge, ParallelIterator};
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -287,7 +287,7 @@ pub fn search_streaming(
             bytes_fetched: 0,
         });
     }
-    let query = holys3_query::plan(pattern, reader.strategy())?;
+    let query = seagrep_query::plan(pattern, reader.strategy())?;
     let re = regex::bytes::Regex::new(pattern)?;
     let whole_document = can_search_as_document(pattern)?;
     let bounded_len = bounded_match_len(pattern)?;
@@ -402,8 +402,8 @@ pub fn search_collect(
 mod tests {
     use super::*;
     use crate::{IndexReader, IndexStats};
-    use holys3_core::{DocAddress, SourceEncoding, Strategy};
-    use holys3_query::Query;
+    use seagrep_core::{DocAddress, SourceEncoding, Strategy};
+    use seagrep_query::Query;
 
     #[test]
     fn bounded_file_search_matches_in_memory_across_chunks() {
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn single_candidate_does_not_start_rayon_pool() {
-        const PROBE: &str = "HOLYS3_SINGLE_CANDIDATE_RAYON_PROBE";
+        const PROBE: &str = "SEAGREP_SINGLE_CANDIDATE_RAYON_PROBE";
         if std::env::var_os(PROBE).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([

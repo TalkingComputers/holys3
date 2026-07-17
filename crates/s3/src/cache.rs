@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use fs4::FileExt;
-use holys3_core::{DocumentBody, DocumentSpool};
+use seagrep_core::{DocumentBody, DocumentSpool};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};

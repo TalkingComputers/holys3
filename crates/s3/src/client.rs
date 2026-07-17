@@ -10,7 +10,7 @@ use aws_smithy_runtime_api::client::result::SdkError as SmithyError;
 use aws_smithy_types::byte_stream::ByteStream;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use holys3_core::{DocumentBody, DocumentSpool};
+use seagrep_core::{DocumentBody, DocumentSpool};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -261,7 +261,7 @@ impl S3Client {
             secret_access_key,
             session_token,
             None,
-            "holys3-static",
+            "seagrep-static",
         );
         Self::connect_with_credentials(Some(region), endpoint, cfg, Some(credentials))
     }
@@ -542,7 +542,7 @@ impl S3Client {
         &self,
         bucket: &str,
         prefix: &str,
-        progress: Option<&holys3_core::ProgressSender>,
+        progress: Option<&seagrep_core::ProgressSender>,
     ) -> Result<Vec<ObjectMeta>> {
         self.0.rt.block_on(async {
             let mut objects = Vec::new();
@@ -595,7 +595,7 @@ impl S3Client {
                     objects.push(ObjectMeta { key, etag, size });
                 }
                 if let Some(progress) = progress {
-                    progress.emit(holys3_core::ProgressEvent::Listed {
+                    progress.emit(seagrep_core::ProgressEvent::Listed {
                         objects: objects.len() as u64,
                     });
                 }
@@ -956,8 +956,8 @@ mod tests {
         )
         .unwrap();
         let error = client.get_if_match("bucket", "key", "\"old\"").unwrap_err();
-        assert!(error.is::<holys3_core::StaleSource>(), "{error:#}");
-        let stale = error.downcast_ref::<holys3_core::StaleSource>().unwrap();
+        assert!(error.is::<seagrep_core::StaleSource>(), "{error:#}");
+        let stale = error.downcast_ref::<seagrep_core::StaleSource>().unwrap();
         assert_eq!(stale.key, "key");
         assert_eq!(stale.expected, "\"old\"");
         server.join().unwrap();
@@ -1257,7 +1257,7 @@ mod tests {
         let result = client.get_file("bucket", "key", &mut output, u64::try_from(size).unwrap());
         let requests = server.join().unwrap();
         let error = result.unwrap_err();
-        assert!(error.is::<holys3_core::StaleSource>(), "{error:#}");
+        assert!(error.is::<seagrep_core::StaleSource>(), "{error:#}");
         assert_eq!(requests.len(), 2);
         assert!(requests.iter().all(|request| {
             let request = request.to_ascii_lowercase();
@@ -1284,7 +1284,7 @@ mod tests {
         let result = client.get_ranges("bucket", "key", &[(0, 4), (1024 * 1024, 4)]);
         let requests = server.join().unwrap();
         let error = result.unwrap_err();
-        assert!(error.is::<holys3_core::StaleSource>(), "{error:#}");
+        assert!(error.is::<seagrep_core::StaleSource>(), "{error:#}");
         assert_eq!(requests.len(), 2);
     }
 

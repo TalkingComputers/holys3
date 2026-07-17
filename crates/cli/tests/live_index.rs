@@ -1,13 +1,13 @@
-use holys3_core::Strategy;
-use holys3_index::{search_collect, update_index, SegmentedReader, SourceIdentity, UpdateOptions};
-use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus};
+use seagrep_core::Strategy;
+use seagrep_index::{search_collect, update_index, SegmentedReader, SourceIdentity, UpdateOptions};
+use seagrep_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus};
 
 #[test]
 fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
-    let bucket = match std::env::var("HOLYS3_TEST_BUCKET") {
+    let bucket = match std::env::var("SEAGREP_TEST_BUCKET") {
         Ok(bucket) => bucket,
         Err(_) => {
-            eprintln!("skipping: set HOLYS3_TEST_BUCKET to run");
+            eprintln!("skipping: set SEAGREP_TEST_BUCKET to run");
             return Ok(());
         }
     };

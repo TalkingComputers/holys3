@@ -7,8 +7,8 @@
 use crate::sparse_table::lookup_in_block;
 use crate::sparse_table::{hex, SparseTableIndex, FOOTER_BYTES};
 use anyhow::{Context, Result};
-use holys3_core::{hash_ngram, BlobStore};
-use holys3_query::Query;
+use seagrep_core::{hash_ngram, BlobStore};
+use seagrep_query::Query;
 use sha2::{Digest, Sha256};
 
 /// Two ranged reads: the fixed-size footer locates the block index, then the
@@ -166,7 +166,7 @@ fn collect_gram_hashes(q: &Query, out: &mut Vec<u64>) {
 mod tests {
     use super::*;
     use crate::sparse_table::SparseTableWriter;
-    use holys3_core::LocalBlobStore;
+    use seagrep_core::LocalBlobStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingStore {

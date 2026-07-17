@@ -151,7 +151,7 @@ fn decode_body_inner(
         ),
         Codec::Lz4Frame => decode_lz4_frames(key, &bytes, limit, memory_limit),
         Codec::Lz4Legacy => anyhow::bail!(
-            "{key} is an lz4 LEGACY frame (`lz4 -l` output), which holys3 does \
+            "{key} is an lz4 LEGACY frame (`lz4 -l` output), which seagrep does \
              not decode; re-compress with the default lz4 frame format"
         ),
         Codec::Xz => decode_xz_streams(key, &bytes, limit, memory_limit),

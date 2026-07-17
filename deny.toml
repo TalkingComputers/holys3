@@ -1,4 +1,4 @@
-# cargo-deny configuration for the holys3 workspace.
+# cargo-deny configuration for the seagrep workspace.
 # Validate locally with: cargo deny check
 # The license `allow` list below is a starting point covering the licenses
 # pulled in by reqwest/rustls/tokio/clap. Run `cargo deny check licenses`

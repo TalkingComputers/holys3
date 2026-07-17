@@ -274,7 +274,7 @@ Create 1,024 in-memory 4 KiB documents from the existing deterministic generator
 Run:
 
 ```bash
-cargo +1.96.1 bench --locked -p holys3-index --bench hot_paths -- index_build_1024x4096 --noplot
+cargo +1.96.1 bench --locked -p seagrep-index --bench hot_paths -- index_build_1024x4096 --noplot
 ```
 
 Expected: both benchmark IDs produce positive medians and the existing benchmark comparator reports them as new, not missing.
@@ -307,7 +307,7 @@ For lengths `0, 1, 2, 3, 31, 255, 256, 4096, 600000`, generate deterministic byt
 - [ ] **Step 2: Verify the test fails before implementation**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-core grams::tests::packed_sort_matches_control
+cargo +1.96.1 test --locked -p seagrep-core grams::tests::packed_sort_matches_control
 ```
 
 Expected: compilation fails because `sort_packed_grams` is absent.
@@ -319,8 +319,8 @@ Add radsort at the workspace and core manifests. Benchmark crossover candidates 
 - [ ] **Step 4: Verify behavior and speed**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-core grams::tests
-cargo +1.96.1 bench --locked -p holys3-index --bench hot_paths -- grams_index_trigram --noplot
+cargo +1.96.1 test --locked -p seagrep-core grams::tests
+cargo +1.96.1 bench --locked -p seagrep-index --bench hot_paths -- grams_index_trigram --noplot
 ```
 
 Expected: all tests pass and trigram extraction does not regress by more than 10 percent.
@@ -350,7 +350,7 @@ Cover ordered, reverse-completion, duplicate, empty-gram, repeated-text, random-
 - [ ] **Step 2: Run the tests and confirm missing implementations**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-index build::runs::tests
+cargo +1.96.1 test --locked -p seagrep-index build::runs::tests
 ```
 
 - [ ] **Step 3: Implement radix and k-way candidates**
@@ -368,7 +368,7 @@ Retain the implementation with the lowest median unless it uses more than 1.5 ti
 - [ ] **Step 6: Verify full index equivalence**
 
 ```bash
-cargo +1.96.1 nextest run --locked -p holys3-index --all-features
+cargo +1.96.1 nextest run --locked -p seagrep-index --all-features
 ```
 
 Expected: every index, segmented lifecycle, and differential test passes.
@@ -407,7 +407,7 @@ Use `par_iter` over the already sorted path vector. Preserve indexed collection 
 - [ ] **Step 4: Verify tests and benchmark listing phase**
 
 ```bash
-cargo +1.96.1 nextest run --locked -p holys3-index -p holys3
+cargo +1.96.1 nextest run --locked -p seagrep-index -p seagrep
 ```
 
 Expected: same-size/same-mtime rewrite remains detected and listing output is deterministic.

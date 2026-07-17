@@ -7,7 +7,7 @@ use crate::format::{DeadSet, DocEntry, SegmentTables, SourceEntry};
 use crate::pack::{fetch_documents, request_windows, PackBuilder, PackRequest, PackSlice};
 use crate::terms::TermMap;
 use anyhow::{Context, Result};
-use holys3_core::{BlobStore, DocId, DocumentBody, Strategy};
+use seagrep_core::{BlobStore, DocId, DocumentBody, Strategy};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 

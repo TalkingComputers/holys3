@@ -1,7 +1,7 @@
-# holys3-bench
+# seagrep-bench
 
-`holys3-bench` is the unpublished deterministic performance harness. Its local
-backend exercises the index engine only; the `holys3` product CLI remains
+`seagrep-bench` is the unpublished deterministic performance harness. Its local
+backend exercises the index engine only; the `seagrep` product CLI remains
 S3-only.
 
 ## MinIO
@@ -20,12 +20,12 @@ Results are written to `crates/xbench/runs/latest.json` and
 ## AWS S3
 
 Use a dedicated benchmark bucket. The harness writes source objects under
-`xbench/` and index data under `xbench/.holys3/`.
+`xbench/` and index data under `xbench/.seagrep/`.
 
 ```sh
 AWS_PROFILE=your-profile \
-HOLYS3_BENCH_BUCKET=your-bucket \
-HOLYS3_BENCH_REGION=us-east-1 \
+SEAGREP_BENCH_BUCKET=your-bucket \
+SEAGREP_BENCH_REGION=us-east-1 \
 make bench-s3 BENCH_OBJECTS=25000 BENCH_ITERATIONS=3
 ```
 
@@ -45,9 +45,9 @@ The churn benchmark is local and deterministic. It requires a freshly seeded
 and locally indexed benchmark corpus:
 
 ```sh
-cargo run --locked --release -p holys3-bench -- seed --seed 1 --objects 25000 --size 4096
-cargo run --locked --release -p holys3-bench -- upload --target dir
-cargo run --locked --release -p holys3-bench -- churn --cycles 30 --changes 250
+cargo run --locked --release -p seagrep-bench -- seed --seed 1 --objects 25000 --size 4096
+cargo run --locked --release -p seagrep-bench -- upload --target dir
+cargo run --locked --release -p seagrep-bench -- churn --cycles 30 --changes 250
 ```
 
 It writes `crates/xbench/runs/churn.json` and mutates the generated corpus;

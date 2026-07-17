@@ -1,5 +1,5 @@
 [package]
-name = "holys3-bench"
+name = "seagrep-bench"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -8,19 +8,19 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
-description = "Benchmark harness for holys3"
+description = "Benchmark harness for seagrep"
 keywords.workspace = true
 categories.workspace = true
 publish = false
 
 [[bin]]
-name = "holys3-bench"
+name = "seagrep-bench"
 path = "src/main.rs"
 
 [dependencies]
-holys3-core = { path = "../core", version = "0.6.0" }
-holys3-index = { path = "../index", version = "0.6.0" }
-holys3-s3 = { path = "../s3", version = "0.6.0" }
+seagrep-core = { path = "../core", version = "0.6.0" }
+seagrep-index = { path = "../index", version = "0.6.0" }
+seagrep-s3 = { path = "../s3", version = "0.6.0" }
 anyhow.workspace = true
 mimalloc = "0.1.52"
 clap.workspace = true

@@ -1,10 +1,10 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use holys3_core::{
+use seagrep_core::{
     grams_index, grams_query, pack_trigram_grams, testutil::MemCorpus, Corpus, LocalBlobStore,
     Strategy,
 };
-use holys3_index::{update_index, IndexReader, SegmentedReader, SourceIdentity, UpdateOptions};
-use holys3_query::plan;
+use seagrep_index::{update_index, IndexReader, SegmentedReader, SourceIdentity, UpdateOptions};
+use seagrep_query::plan;
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Duration;

@@ -1,5 +1,5 @@
 [package]
-name = "holys3-index"
+name = "seagrep-index"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -13,8 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-holys3-core = { path = "../core", version = "0.6.0" }
-holys3-query = { path = "../query", version = "0.6.0" }
+seagrep-core = { path = "../core", version = "0.6.0" }
+seagrep-query = { path = "../query", version = "0.6.0" }
 anyhow.workspace = true
 serde.workspace = true
 postcard.workspace = true
@@ -32,7 +32,7 @@ zstd = "0.13.3"
 getrandom = "0.4"
 
 [dev-dependencies]
-holys3-core = { path = "../core", version = "0.6.0", features = ["testutil"] }
+seagrep-core = { path = "../core", version = "0.6.0", features = ["testutil"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 

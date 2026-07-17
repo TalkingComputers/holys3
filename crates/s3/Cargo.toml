@@ -1,5 +1,5 @@
 [package]
-name = "holys3-s3"
+name = "seagrep-s3"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-holys3-core = { path = "../core", version = "0.6.0" }
+seagrep-core = { path = "../core", version = "0.6.0" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -34,7 +34,7 @@ tempfile.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-holys3-core = { path = "../core", version = "0.6.0", features = ["testutil"] }
+seagrep-core = { path = "../core", version = "0.6.0", features = ["testutil"] }
 
 [lints]
 workspace = true

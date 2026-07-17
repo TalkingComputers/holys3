@@ -1,7 +1,7 @@
 /target
 /bench-micro.md
 /benches/current.json
-# stray local tooling artifacts (not part of holys3)
+# stray local tooling artifacts (not part of seagrep)
 agentdb.rvf
 agentdb.rvf.lock
 ruvector.db

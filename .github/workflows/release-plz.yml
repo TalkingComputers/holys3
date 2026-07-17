@@ -97,7 +97,7 @@ jobs:
         env:
           RELEASES: ${{ steps.release.outputs.releases }}
         run: |
-          tag="$(jq -r 'first(.[] | select(.package_name == "holys3") | .tag) // empty' <<< "$RELEASES")"
+          tag="$(jq -r 'first(.[] | select(.package_name == "seagrep") | .tag) // empty' <<< "$RELEASES")"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   release-assets:

@@ -4,12 +4,12 @@
 
 use anyhow::Result;
 use bytes::Bytes;
-use holys3_core::{
+use seagrep_core::{
     decode_body, scan_matching_docs,
     testutil::{encode, MemCorpus},
     BlobStore, Corpus, LocalBlobStore, MatchOptions, SourceEncoding, SourceObject, Strategy,
 };
-use holys3_index::{
+use seagrep_index::{
     search_collect, search_streaming, update_index, IndexChanged, IndexReader, KeyScope, NullSink,
     SegmentedReader, SourceIdentity, UpdateOptions,
 };
@@ -40,7 +40,7 @@ impl Bucket {
             .map(|(key, body)| {
                 (
                     key.clone(),
-                    format!("{:016x}", holys3_core::hash_ngram(body)),
+                    format!("{:016x}", seagrep_core::hash_ngram(body)),
                     body.len() as u64,
                 )
             })
@@ -81,7 +81,7 @@ fn reindex(bucket: &Bucket, store_dir: &Path, cache_dir: &Path, strategy: Strate
 
 #[test]
 fn update_index_reports_progress_events() -> Result<()> {
-    use holys3_core::{ProgressEvent, ProgressSender};
+    use seagrep_core::{ProgressEvent, ProgressSender};
     let mut bucket = Bucket::default();
     bucket.put("a.log", b"alpha needle line\n");
     bucket.put("b.log", b"beta line two\n");
@@ -151,7 +151,7 @@ fn update_index_reports_progress_events() -> Result<()> {
 
 #[test]
 fn progress_receiver_drop_does_not_affect_indexing() -> Result<()> {
-    use holys3_core::ProgressSender;
+    use seagrep_core::ProgressSender;
     let mut bucket = Bucket::default();
     bucket.put("a.log", b"alpha needle line\n");
     let store_dir = tempfile::tempdir()?;
@@ -409,7 +409,7 @@ fn archive_members_follow_source_lifecycle() -> Result<()> {
         cache_dir.path(),
         &test_source(),
     )?;
-    let query = holys3_query::plan("needle", Strategy::Trigram)?;
+    let query = seagrep_query::plan("needle", Strategy::Trigram)?;
     let candidates = reader.candidate_docs(&query, Some("logs/bundle.zip!/"))?;
     assert_eq!(
         candidates
@@ -571,7 +571,7 @@ fn reports_changed_root_when_garbage_collection_invalidates_reader() -> Result<(
         Strategy::Trigram,
     )?;
 
-    let query = holys3_query::plan("needle", Strategy::Trigram)?;
+    let query = seagrep_query::plan("needle", Strategy::Trigram)?;
     let error = reader
         .candidate_docs(&query, None)
         .expect_err("stale reader should fail");
@@ -1667,7 +1667,7 @@ fn repack_fetches_all_window_ranges_in_one_call() -> Result<()> {
 
 #[test]
 fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
-    use holys3_core::BlobStore;
+    use seagrep_core::BlobStore;
 
     struct FlakyStore {
         inner: LocalBlobStore,
@@ -1777,11 +1777,11 @@ struct FailingStreamStore {
 }
 
 struct BudgetedPut<'a> {
-    inner: Box<dyn holys3_core::StreamingPut + 'a>,
+    inner: Box<dyn seagrep_core::StreamingPut + 'a>,
     budget: &'a AtomicUsize,
 }
 
-impl holys3_core::StreamingPut for BudgetedPut<'_> {
+impl seagrep_core::StreamingPut for BudgetedPut<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         let before = self.budget.fetch_sub(bytes.len(), Ordering::Relaxed);
         anyhow::ensure!(
@@ -1829,7 +1829,7 @@ impl BlobStore for FailingStreamStore {
         self.inner.put_if(name, bytes, expected)
     }
 
-    fn put_streaming<'a>(&'a self, name: &str) -> Result<Box<dyn holys3_core::StreamingPut + 'a>> {
+    fn put_streaming<'a>(&'a self, name: &str) -> Result<Box<dyn seagrep_core::StreamingPut + 'a>> {
         Ok(Box::new(BudgetedPut {
             inner: self.inner.put_streaming(name)?,
             budget: &self.budget,
@@ -2000,9 +2000,9 @@ fn colliding_gram_hashes_keep_results_exact() -> Result<()> {
     // through the public API so a hash-function change fails loudly here.
     let doc_a = "jmbv utzoib puqp gebp";
     let doc_b = "xwpekcg gprvy yivsfiv sfivsf";
-    let collides = holys3_core::iterate_sparse_grams(doc_a.as_bytes()).any(|gram_a| {
-        holys3_core::iterate_sparse_grams(doc_b.as_bytes()).any(|gram_b| {
-            gram_a != gram_b && holys3_core::hash_ngram(gram_a) == holys3_core::hash_ngram(gram_b)
+    let collides = seagrep_core::iterate_sparse_grams(doc_a.as_bytes()).any(|gram_a| {
+        seagrep_core::iterate_sparse_grams(doc_b.as_bytes()).any(|gram_b| {
+            gram_a != gram_b && seagrep_core::hash_ngram(gram_a) == seagrep_core::hash_ngram(gram_b)
         })
     });
     assert!(collides, "fixture documents must emit colliding grams");

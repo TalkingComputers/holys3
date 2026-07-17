@@ -280,8 +280,8 @@ pub(crate) fn key_base() -> Option<KeyBase> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let mut path = holys3_core::cache_home().ok()?;
-    path.push("holys3");
+    let mut path = seagrep_core::cache_home().ok()?;
+    path.push("seagrep");
     path.push("credentials");
     path.push(format!("{key}.json"));
     Some(KeyBase { path, frozen })
@@ -349,7 +349,7 @@ fn read_cached(path: &Path, now: SystemTime) -> Option<Credentials> {
         .access_key_id(stored.access_key_id)
         .secret_access_key(stored.secret_access_key)
         .expiry(expiry)
-        .provider_name("holys3-disk-cache");
+        .provider_name("seagrep-disk-cache");
     builder.set_session_token(stored.session_token);
     builder.set_account_id(stored.account_id.map(Into::into));
     Some(builder.build())

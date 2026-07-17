@@ -2084,145 +2084,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "holys3"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "clap",
- "ctrlc",
- "globset",
- "holys3-core",
- "holys3-index",
- "holys3-s3",
- "indicatif",
- "mimalloc",
- "regex",
- "regex-syntax",
- "serde",
- "serde_json",
- "tempfile",
- "termcolor",
- "time",
-]
-
-[[package]]
-name = "holys3-bench"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "clap",
- "holys3-core",
- "holys3-index",
- "holys3-s3",
- "mimalloc",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "holys3-core"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "apache-avro",
- "arrow-array 58.3.0",
- "arrow-array 59.1.0",
- "arrow-ipc 59.1.0",
- "arrow-json 58.3.0",
- "arrow-json 59.1.0",
- "arrow-schema 59.1.0",
- "blake3",
- "brotli",
- "bytes",
- "bzip2",
- "flate2",
- "fs4",
- "liblzma",
- "lz4_flex 0.13.1",
- "memchr",
- "memmap2",
- "num-bigint",
- "orc-rust",
- "parquet",
- "prost",
- "radsort",
- "rapidhash",
- "regex",
- "regex-syntax",
- "serde",
- "serde_json",
- "snap",
- "tar",
- "tempfile",
- "zip",
- "zstd",
-]
-
-[[package]]
-name = "holys3-index"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "blake3",
- "bytes",
- "criterion",
- "flate2",
- "fst",
- "getrandom 0.4.3",
- "holys3-core",
- "holys3-query",
- "memmap2",
- "postcard",
- "radsort",
- "rapidhash",
- "rayon",
- "regex",
- "serde",
- "sha2",
- "tempfile",
- "zstd",
-]
-
-[[package]]
-name = "holys3-query"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "holys3-core",
- "regex-syntax",
-]
-
-[[package]]
-name = "holys3-s3"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "blake3",
- "bytes",
- "fs4",
- "futures",
- "holys3-core",
- "percent-encoding",
- "rand 0.10.2",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "http"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3443,6 +3304,145 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "seagrep"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "clap",
+ "ctrlc",
+ "globset",
+ "indicatif",
+ "mimalloc",
+ "regex",
+ "regex-syntax",
+ "seagrep-core",
+ "seagrep-index",
+ "seagrep-s3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "termcolor",
+ "time",
+]
+
+[[package]]
+name = "seagrep-bench"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mimalloc",
+ "regex",
+ "seagrep-core",
+ "seagrep-index",
+ "seagrep-s3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "seagrep-core"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "apache-avro",
+ "arrow-array 58.3.0",
+ "arrow-array 59.1.0",
+ "arrow-ipc 59.1.0",
+ "arrow-json 58.3.0",
+ "arrow-json 59.1.0",
+ "arrow-schema 59.1.0",
+ "blake3",
+ "brotli",
+ "bytes",
+ "bzip2",
+ "flate2",
+ "fs4",
+ "liblzma",
+ "lz4_flex 0.13.1",
+ "memchr",
+ "memmap2",
+ "num-bigint",
+ "orc-rust",
+ "parquet",
+ "prost",
+ "radsort",
+ "rapidhash",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "snap",
+ "tar",
+ "tempfile",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "seagrep-index"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytes",
+ "criterion",
+ "flate2",
+ "fst",
+ "getrandom 0.4.3",
+ "memmap2",
+ "postcard",
+ "radsort",
+ "rapidhash",
+ "rayon",
+ "regex",
+ "seagrep-core",
+ "seagrep-query",
+ "serde",
+ "sha2",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
+name = "seagrep-query"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "regex-syntax",
+ "seagrep-core",
+]
+
+[[package]]
+name = "seagrep-s3"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "blake3",
+ "bytes",
+ "fs4",
+ "futures",
+ "percent-encoding",
+ "rand 0.10.2",
+ "seagrep-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "url",
+]
 
 [[package]]
 name = "security-framework"

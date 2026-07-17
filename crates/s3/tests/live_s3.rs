@@ -1,9 +1,9 @@
-use holys3_s3::{FetchConfig, S3Client};
+use seagrep_s3::{FetchConfig, S3Client};
 
 #[test]
 fn list_and_get_roundtrip() {
-    let Ok(bucket) = std::env::var("HOLYS3_TEST_BUCKET") else {
-        eprintln!("skipping: set HOLYS3_TEST_BUCKET to run");
+    let Ok(bucket) = std::env::var("SEAGREP_TEST_BUCKET") else {
+        eprintln!("skipping: set SEAGREP_TEST_BUCKET to run");
         return;
     };
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
@@ -16,8 +16,8 @@ fn list_and_get_roundtrip() {
 
 #[test]
 fn special_key_roundtrip() -> anyhow::Result<()> {
-    let Ok(bucket) = std::env::var("HOLYS3_TEST_BUCKET") else {
-        eprintln!("skipping: set HOLYS3_TEST_BUCKET to run");
+    let Ok(bucket) = std::env::var("SEAGREP_TEST_BUCKET") else {
+        eprintln!("skipping: set SEAGREP_TEST_BUCKET to run");
         return Ok(());
     };
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
@@ -25,7 +25,7 @@ fn special_key_roundtrip() -> anyhow::Result<()> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
-    let prefix = format!(".holys3-live-test/{nonce}/");
+    let prefix = format!(".seagrep-live-test/{nonce}/");
     let key = format!("{prefix}space and+plus%.txt");
     let expected = b"special key".to_vec();
     client.put_many(&bucket, vec![(key.clone(), expected.clone())])?;

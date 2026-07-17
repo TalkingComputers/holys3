@@ -5,7 +5,7 @@ use super::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use holys3_core::{DocId, DocumentBody, DocumentSpool, StaleSource};
+use seagrep_core::{DocId, DocumentBody, DocumentSpool, StaleSource};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use tokio::sync::Notify;

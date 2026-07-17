@@ -1,25 +1,25 @@
-# Contributing to holys3
+# Contributing to seagrep
 
 Bug reports, documentation fixes, features, and questions are all welcome.
 File bugs and feature requests as
-[issues](https://github.com/TalkingComputers/holys3/issues); general questions
+[issues](https://github.com/TalkingComputers/seagrep/issues); general questions
 belong in
-[discussions](https://github.com/TalkingComputers/holys3/discussions). For a
+[discussions](https://github.com/TalkingComputers/seagrep/discussions). For a
 large change, open a discussion or an issue before writing the code, so we can
 agree on the approach first.
 
 ## Project layout
 
-holys3 is a Cargo workspace:
+seagrep is a Cargo workspace:
 
 | Crate          | Path            | Responsibility                                 |
 | -------------- | --------------- | ---------------------------------------------- |
-| `holys3`       | `crates/cli`    | S3-only user-facing CLI                        |
-| `holys3-core`  | `crates/core`   | Canonical decoding, matching, and shared types |
-| `holys3-query` | `crates/query`  | Regex-to-gram query planning                   |
-| `holys3-index` | `crates/index`  | Segmented snapshot index build and search      |
-| `holys3-s3`    | `crates/s3`     | AWS SDK transport and S3 storage               |
-| `holys3-bench` | `crates/xbench` | Unpublished deterministic benchmark harness    |
+| `seagrep`       | `crates/cli`    | S3-only user-facing CLI                        |
+| `seagrep-core`  | `crates/core`   | Canonical decoding, matching, and shared types |
+| `seagrep-query` | `crates/query`  | Regex-to-gram query planning                   |
+| `seagrep-index` | `crates/index`  | Segmented snapshot index build and search      |
+| `seagrep-s3`    | `crates/s3`     | AWS SDK transport and S3 storage               |
+| `seagrep-bench` | `crates/xbench` | Unpublished deterministic benchmark harness    |
 
 ## Development setup
 
@@ -48,8 +48,8 @@ $ cargo test --workspace
 real bucket. They **self-skip** unless you point them at one:
 
 Use a dedicated disposable bucket, never a production bucket. The CLI test
-indexes the bucket root and leaves its `.holys3/` index in place. The S3 test
-briefly writes under `.holys3-live-test/`, and an interrupted run may leave that
+indexes the bucket root and leaves its `.seagrep/` index in place. The S3 test
+briefly writes under `.seagrep-live-test/`, and an interrupted run may leave that
 object behind. Seed these non-empty fixtures before running the suite:
 
 - `a.rs` containing `handleClick`;
@@ -57,10 +57,10 @@ object behind. Seed these non-empty fixtures before running the suite:
 - `c/d.log` containing `EMAIL`.
 
 ```console
-$ AWS_PROFILE=my-test-profile HOLYS3_TEST_BUCKET=my-test-bucket AWS_REGION=us-east-1 cargo test --locked --workspace --all-features
+$ AWS_PROFILE=my-test-profile SEAGREP_TEST_BUCKET=my-test-bucket AWS_REGION=us-east-1 cargo test --locked --workspace --all-features
 ```
 
-CI never sets `HOLYS3_TEST_BUCKET`, so these tests are skipped there — run them
+CI never sets `SEAGREP_TEST_BUCKET`, so these tests are skipped there — run them
 locally if you touch the `s3` crate.
 
 ## Before opening a PR
@@ -122,7 +122,7 @@ In short, your change must:
 
 ## Sign-off (DCO)
 
-holys3 uses the [Developer Certificate of Origin](https://developercertificate.org/).
+seagrep uses the [Developer Certificate of Origin](https://developercertificate.org/).
 There is **no CLA**. Certify that you wrote (or have the right to submit) your
 change by signing off every commit:
 
@@ -134,14 +134,14 @@ This appends a `Signed-off-by: Your Name <you@example.com>` trailer.
 
 ## Good first issues
 
-Issues labeled [`good first issue`](https://github.com/TalkingComputers/holys3/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+Issues labeled [`good first issue`](https://github.com/TalkingComputers/seagrep/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 are scoped to be approachable without deep knowledge of the codebase — a good
-place to start. [`help wanted`](https://github.com/TalkingComputers/holys3/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
+place to start. [`help wanted`](https://github.com/TalkingComputers/seagrep/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
 issues are larger but still up for grabs. Comment on an issue to claim it.
 
 ## Versioning
 
-holys3 follows [Semantic Versioning](https://semver.org/). The libraries are
+seagrep follows [Semantic Versioning](https://semver.org/). The libraries are
 public API surface. Before 1.0, breaking library changes require a minor bump;
 after 1.0, they require a major bump. Flag every breaking change in your PR.
 

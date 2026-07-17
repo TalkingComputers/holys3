@@ -29,13 +29,13 @@ pub(crate) use build::{build_index_files, BuiltIndexFiles, DocumentCapExceeded};
 
 use anyhow::{Context, Result};
 use eval::Selection;
+use rayon::prelude::*;
 #[cfg(test)]
-use holys3_core::pack_trigram_grams;
-use holys3_core::{
+use seagrep_core::pack_trigram_grams;
+use seagrep_core::{
     Corpus, DocFetcher, DocId, DocumentBody, DocumentSpool, SourceEncoding, SourceObject, Strategy,
 };
-use holys3_query::Query;
-use rayon::prelude::*;
+use seagrep_query::Query;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -53,9 +53,9 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 8 * 1024 * 1024;
 const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
-/// bodies); an index built by an older holys3 must error, not silently
+/// bodies); an index built by an older seagrep must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 15;
+const INDEX_FORMAT: u32 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -80,13 +80,13 @@ pub trait IndexReader: DocFetcher {
         &self,
         q: &Query,
         key_prefix: Option<&str>,
-    ) -> Result<Vec<holys3_core::DocAddress>>;
+    ) -> Result<Vec<seagrep_core::DocAddress>>;
     fn visit_candidates(
         &self,
         q: &Query,
         key_prefix: Option<&str>,
         batch_size: usize,
-        visit: &mut dyn FnMut(Vec<holys3_core::DocAddress>) -> Result<bool>,
+        visit: &mut dyn FnMut(Vec<seagrep_core::DocAddress>) -> Result<bool>,
     ) -> Result<()> {
         anyhow::ensure!(batch_size > 0, "candidate batch size must be positive");
         let documents = self.candidate_docs(q, key_prefix)?;
@@ -368,7 +368,7 @@ fn read_local_body(
     expected_size: u64,
 ) -> Result<DocumentBody> {
     let stale = || {
-        anyhow::Error::new(holys3_core::StaleSource {
+        anyhow::Error::new(seagrep_core::StaleSource {
             key: key.to_owned(),
             expected: expected_version.to_owned(),
         })
@@ -494,7 +494,7 @@ fn read_local_group(
         &group.version,
         group.encoded_size,
     )?;
-    holys3_core::decode_requested_body(&group.key, &group.requests, body, consume)
+    seagrep_core::decode_requested_body(&group.key, &group.requests, body, consume)
 }
 
 fn fetch_local_parallel(
@@ -555,7 +555,7 @@ fn fetch_local_parallel(
 impl DocFetcher for LocalFetcher {
     fn fetch_each(
         &self,
-        documents: &[holys3_core::DocAddress],
+        documents: &[seagrep_core::DocAddress],
         consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
     ) -> Result<()> {
         let mut groups = BTreeMap::new();
@@ -613,9 +613,9 @@ impl DocFetcher for LocalFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use holys3_core::testutil::MemCorpus;
-    use holys3_core::BlobStore as _;
-    use holys3_core::{LineEvent, LineKind, LocalBlobStore, MatchOptions, SubMatch};
+    use seagrep_core::testutil::MemCorpus;
+    use seagrep_core::BlobStore as _;
+    use seagrep_core::{LineEvent, LineKind, LocalBlobStore, MatchOptions, SubMatch};
 
     fn test_source() -> SourceIdentity {
         SourceIdentity::Local {
@@ -853,7 +853,7 @@ mod tests {
         builder.insert(&[0x7f, 0x03, 0x04], 2).unwrap();
         builder.insert(&[0xff, 0x05, 0x06], 3).unwrap();
         let (bytes, _) = builder.finish().unwrap();
-        assert_eq!(&bytes[..8], b"HS3TERM1");
+        assert_eq!(&bytes[..8], b"SGTERM01");
     }
 
     /// Merge runs into a scratch store and return (terms bytes, postings
@@ -891,7 +891,7 @@ mod tests {
         )
         .unwrap();
         let (bytes, _, _) = merge_to_store(runs, Strategy::Trigram, 1);
-        assert_ne!(&bytes[..8], b"HS3TERM1");
+        assert_ne!(&bytes[..8], b"SGTERM01");
     }
 
     #[test]
@@ -899,7 +899,7 @@ mod tests {
         let text = (0..16_384usize)
             .map(|index| ((index * 31 + index / 7) % 251) as u8)
             .collect::<Vec<_>>();
-        let expected = holys3_core::sparse_grams_all_bytes(&text);
+        let expected = seagrep_core::sparse_grams_all_bytes(&text);
         let runs = write_posting_runs(
             vec![(0, IndexedGrams::Sparse(text.into()))],
             Strategy::Sparse,
@@ -919,13 +919,13 @@ mod tests {
         };
         let mut expected_hashes: Vec<u64> = expected
             .iter()
-            .map(|gram| holys3_core::hash_ngram(gram))
+            .map(|gram| seagrep_core::hash_ngram(gram))
             .collect();
         expected_hashes.sort_unstable();
         expected_hashes.dedup();
         assert_eq!(index.entry_count, expected_hashes.len() as u64);
         for gram in expected {
-            let packed = lookup(holys3_core::hash_ngram(&gram)).expect("indexed sparse gram");
+            let packed = lookup(seagrep_core::hash_ngram(&gram)).expect("indexed sparse gram");
             let (offset, count) = eval::unpack_posting(packed);
             let start = usize::try_from(offset).unwrap();
             let end = start + usize::try_from(posting_block_len(count, 1)).unwrap();
@@ -1112,7 +1112,7 @@ mod tests {
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
             let (_s, _c, r) = build_tmp(&c, strategy);
             let cands = r
-                .candidate_docs(&holys3_query::plan("world", r.strategy()).unwrap(), None)
+                .candidate_docs(&seagrep_query::plan("world", r.strategy()).unwrap(), None)
                 .unwrap();
             assert!(cands.iter().any(|document| document.display_key == "x"));
             assert!(cands
@@ -1296,7 +1296,7 @@ mod tests {
         assert_eq!(body.into_bytes().unwrap(), expected);
 
         let source = &corpus.sources()[0];
-        let document = holys3_core::DocAddress {
+        let document = seagrep_core::DocAddress {
             display_key: source.key.clone(),
             source_key: source.key.clone(),
             source_version: source.version.clone(),
@@ -1333,7 +1333,7 @@ mod tests {
         let path = dir.path().join("event.log");
         std::fs::write(&path, b"alpha").unwrap();
         let key = path.to_string_lossy().into_owned();
-        let document = holys3_core::DocAddress {
+        let document = seagrep_core::DocAddress {
             display_key: key.clone(),
             source_key: key.clone(),
             source_version: blake3::hash(b"alpha").to_hex().to_string(),
@@ -1347,7 +1347,7 @@ mod tests {
             .unwrap()
             .fetch_each(&[document], &mut |_, _| Ok(()))
             .unwrap_err();
-        assert!(error.is::<holys3_core::StaleSource>(), "{error:#}");
+        assert!(error.is::<seagrep_core::StaleSource>(), "{error:#}");
     }
 
     #[test]
@@ -1359,7 +1359,7 @@ mod tests {
                 let body = format!("event {index}");
                 std::fs::write(&path, &body).unwrap();
                 let key = path.to_string_lossy().into_owned();
-                holys3_core::DocAddress {
+                seagrep_core::DocAddress {
                     display_key: key.clone(),
                     source_key: key,
                     source_version: blake3::hash(body.as_bytes()).to_hex().to_string(),
@@ -1394,9 +1394,9 @@ mod tests {
         let corpus = LocalCorpus::new(dir.path()).unwrap();
         std::fs::write(&path, b"bravo").unwrap();
         let error = corpus.fetch(0).unwrap_err();
-        assert!(error.is::<holys3_core::StaleSource>(), "{error:#}");
+        assert!(error.is::<seagrep_core::StaleSource>(), "{error:#}");
         let error = corpus.fetch_many(0..1).unwrap_err();
-        assert!(error.is::<holys3_core::StaleSource>(), "{error:#}");
+        assert!(error.is::<seagrep_core::StaleSource>(), "{error:#}");
     }
 
     #[test]

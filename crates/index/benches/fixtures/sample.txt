@@ -1,4 +1,4 @@
-2026-06-04T00:00:01Z INFO holys3 indexer start bucket=bench prefix=logs shard=0001
+2026-06-04T00:00:01Z INFO seagrep indexer start bucket=bench prefix=logs shard=0001
 2026-06-04T00:00:02Z DEBUG request_id=01HX path=/api/search pattern=ERROR42 strategy=trigram
 fn parse_event(line: &str) -> anyhow::Result<Event> {
     let (level, body) = line.split_once(' ').context("missing level")?;
@@ -32,7 +32,7 @@ impl BlobStore for LocalBlobStore {
 }
 2026-06-04T00:00:08Z DEBUG plan alternation=(timeout|panicked|denied) literal_extractor=complete
 2026-06-04T00:00:09Z INFO cache hit build_id=0123456789abcdef terms_fst=65536 postings=524288
-2026-06-04T00:00:01Z INFO holys3 indexer start bucket=bench prefix=logs shard=0001
+2026-06-04T00:00:01Z INFO seagrep indexer start bucket=bench prefix=logs shard=0001
 2026-06-04T00:00:02Z DEBUG request_id=01HX path=/api/search pattern=ERROR42 strategy=trigram
 fn parse_event(line: &str) -> anyhow::Result<Event> {
     let (level, body) = line.split_once(' ').context("missing level")?;
@@ -66,7 +66,7 @@ impl BlobStore for LocalBlobStore {
 }
 2026-06-04T00:00:08Z DEBUG plan alternation=(timeout|panicked|denied) literal_extractor=complete
 2026-06-04T00:00:09Z INFO cache hit build_id=0123456789abcdef terms_fst=65536 postings=524288
-2026-06-04T00:00:01Z INFO holys3 indexer start bucket=bench prefix=logs shard=0001
+2026-06-04T00:00:01Z INFO seagrep indexer start bucket=bench prefix=logs shard=0001
 2026-06-04T00:00:02Z DEBUG request_id=01HX path=/api/search pattern=ERROR42 strategy=trigram
 fn parse_event(line: &str) -> anyhow::Result<Event> {
     let (level, body) = line.split_once(' ').context("missing level")?;
@@ -100,7 +100,7 @@ impl BlobStore for LocalBlobStore {
 }
 2026-06-04T00:00:08Z DEBUG plan alternation=(timeout|panicked|denied) literal_extractor=complete
 2026-06-04T00:00:09Z INFO cache hit build_id=0123456789abcdef terms_fst=65536 postings=524288
-2026-06-04T00:00:01Z INFO holys3 indexer start bucket=bench prefix=logs shard=0001
+2026-06-04T00:00:01Z INFO seagrep indexer start bucket=bench prefix=logs shard=0001
 2026-06-04T00:00:02Z DEBUG request_id=01HX path=/api/search pattern=ERROR42 strategy=trigram
 fn parse_event(line: &str) -> anyhow::Result<Event> {
     let (level, body) = line.split_once(' ').context("missing level")?;

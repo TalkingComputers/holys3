@@ -297,7 +297,7 @@ Assert `if-match` appears in signed headers and transmitted headers, a matching 
 - [ ] **Step 2: Run the focused tests before implementation**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-s3 conditional_get
+cargo +1.96.1 test --locked -p seagrep-s3 conditional_get
 ```
 
 Expected: compilation or assertions fail because conditional immutable reads are absent.
@@ -313,8 +313,8 @@ Carry `Bytes` through `Outcome`, `send_resilient`, and fetch methods. Sign both 
 - [ ] **Step 5: Verify request behavior**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-sigv4 -p holys3-s3 conditional_get
-cargo +1.96.1 clippy --locked -p holys3-s3 --all-targets -- -D warnings
+cargo +1.96.1 test --locked -p seagrep-sigv4 -p seagrep-s3 conditional_get
+cargo +1.96.1 clippy --locked -p seagrep-s3 --all-targets -- -D warnings
 ```
 
 Expected: all focused tests pass and clippy is clean.
@@ -340,7 +340,7 @@ Create candidates for three members in one ZIP source plus one raw source. Asser
 - [ ] **Step 2: Verify the test fails before grouping**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-index grouped_sources_fetch_once
+cargo +1.96.1 test --locked -p seagrep-index grouped_sources_fetch_once
 ```
 
 Expected: fetch count exceeds two or typed candidates are not yet available.
@@ -352,8 +352,8 @@ Build an insertion-ordered source vector and source-to-logical-index map from ca
 - [ ] **Step 4: Verify grouped behavior and deterministic output**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-index grouped_sources_fetch_once
-cargo +1.96.1 test --locked -p holys3-cli --test cli archive
+cargo +1.96.1 test --locked -p seagrep-index grouped_sources_fetch_once
+cargo +1.96.1 test --locked -p seagrep-cli --test cli archive
 ```
 
 Expected: exact output is stable across fetch completion order and each source is fetched once.
@@ -378,7 +378,7 @@ For deterministic bodies around every part boundary, assert exact reassembly for
 - [ ] **Step 2: Verify focused failures**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-s3 ordered_ranges
+cargo +1.96.1 test --locked -p seagrep-s3 ordered_ranges
 ```
 
 Expected: methods are absent.
@@ -394,8 +394,8 @@ Run MinIO loopback and latency-injected tests for 16 MiB, 64 MiB, 256 MiB, and 1
 - [ ] **Step 5: Verify exact transfer behavior**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-s3 ordered_ranges
-cargo +1.96.1 test --locked -p holys3-s3 --test minio range
+cargo +1.96.1 test --locked -p seagrep-s3 ordered_ranges
+cargo +1.96.1 test --locked -p seagrep-s3 --test minio range
 ```
 
 Expected: all bodies are byte-identical, peak retained range bytes stay within the configured bound, and the chosen mode wins or is within 10 percent of full GET.
@@ -420,8 +420,8 @@ Cover disabled-by-absence, paired flags, zero cap, key separation for endpoint/b
 - [ ] **Step 2: Verify focused failures**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-s3 cache
-cargo +1.96.1 test --locked -p holys3-cli --test cli object_cache
+cargo +1.96.1 test --locked -p seagrep-s3 cache
+cargo +1.96.1 test --locked -p seagrep-cli --test cli object_cache
 ```
 
 Expected: cache types and flags are absent.
@@ -437,8 +437,8 @@ Return hits directly; on misses fetch with `If-Match`, atomically cache complete
 - [ ] **Step 5: Verify privacy and behavior**
 
 ```bash
-cargo +1.96.1 test --locked -p holys3-s3 cache
-cargo +1.96.1 test --locked -p holys3-cli --test cli object_cache
+cargo +1.96.1 test --locked -p seagrep-s3 cache
+cargo +1.96.1 test --locked -p seagrep-cli --test cli object_cache
 cargo +1.96.1 clippy --locked --workspace --all-targets -- -D warnings
 ```
 
@@ -457,7 +457,7 @@ Expected: all cache tests pass, no cache path contains object keys, and no cache
 
 - [ ] **Step 1: Instrument the local S3 test server**
 
-Count only source-body GETs and bytes; exclude index metadata and posting ranges using the reserved `.holys3` namespace.
+Count only source-body GETs and bytes; exclude index metadata and posting ranges using the reserved `.seagrep` namespace.
 
 - [ ] **Step 2: Add deterministic scenarios**
 
@@ -466,7 +466,7 @@ Add one archive with 10,000 candidate members and one 256 MiB raw object, each s
 - [ ] **Step 3: Run the S3 benchmark matrix**
 
 ```bash
-cargo +1.96.1 run --locked --release -p holys3-xbench -- s3 --profile local
+cargo +1.96.1 run --locked --release -p seagrep-xbench -- s3 --profile local
 ```
 
 Expected: cold grouped archive uses one body GET, warm cache uses zero body GETs, stale versions fail before verification, and result hashes equal the cache-disabled control.
@@ -480,7 +480,7 @@ Reject missing fields, warm-cache body GETs above zero, grouped-source body GETs
 ```bash
 cargo +1.96.1 test --locked --workspace --all-targets
 cargo +1.96.1 clippy --locked --workspace --all-targets -- -D warnings
-cargo +1.96.1 run --locked --release -p holys3-xbench -- s3 --profile local
+cargo +1.96.1 run --locked --release -p seagrep-xbench -- s3 --profile local
 ```
 
 Expected: tests and clippy pass, result hashes are unchanged, cold performance passes its gate, and warm verification performs zero source-body GETs.

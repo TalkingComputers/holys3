@@ -11,31 +11,31 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use holys3_core::{BlobStore, MatchOptions, Strategy};
-use holys3_index::{
+use scope::Scope;
+use seagrep_core::{BlobStore, MatchOptions, Strategy};
+use seagrep_index::{
     search_streaming, update_index, IndexChanged, KeyScope, MatchSink, SearchStats,
     SegmentedReader, SourceIdentity, UpdateOptions,
 };
-use holys3_s3::{
+use seagrep_s3::{
     build_fetch_config, build_index_namespace, is_index_key, list_prefix, ObjectMeta, S3BlobStore,
     S3Client, S3Corpus,
 };
-use scope::Scope;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
-    name = "holys3",
+    name = "seagrep",
     version,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
     about = "Indexed regex search over S3 buckets",
-    long_about = "holys3 PATTERN TARGET searches a prebuilt index.\n\
+    long_about = "seagrep PATTERN TARGET searches a prebuilt index.\n\
         TARGET is s3://bucket[/prefix].\n\
         To search for a pattern named like the `index` subcommand,\n\
-        use -e: `holys3 -e index s3://bucket`."
+        use -e: `seagrep -e index s3://bucket`."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -258,7 +258,7 @@ impl IndexStorage {
 
     fn store_with_progress(
         &self,
-        progress: Option<holys3_core::ProgressSender>,
+        progress: Option<seagrep_core::ProgressSender>,
     ) -> Box<dyn BlobStore> {
         let mut store =
             S3BlobStore::at(self.client.clone(), self.bucket.clone(), self.root.clone());
@@ -388,7 +388,7 @@ fn split_pattern_target(args: Vec<String>, regexp: Vec<String>) -> Result<(Vec<S
         return Ok((regexp, target));
     }
     let [pattern, target] = <[String; 2]>::try_from(args)
-        .map_err(|_| anyhow::anyhow!("usage: holys3 PATTERN TARGET"))?;
+        .map_err(|_| anyhow::anyhow!("usage: seagrep PATTERN TARGET"))?;
     Ok((vec![pattern], target))
 }
 
@@ -434,7 +434,7 @@ fn build_source_identity(source: &S3Source) -> SourceIdentity {
 fn list_user_objects(
     src: &S3Source,
     index: &IndexStorage,
-    progress: Option<&holys3_core::ProgressSender>,
+    progress: Option<&seagrep_core::ProgressSender>,
 ) -> Result<Vec<ObjectMeta>> {
     Ok(src
         .client
@@ -455,7 +455,7 @@ fn build_s3(
     show_progress: bool,
 ) -> Result<index::IndexResult> {
     let (progress, bar) = if show_progress {
-        let (sender, receiver) = holys3_core::ProgressSender::channel();
+        let (sender, receiver) = seagrep_core::ProgressSender::channel();
         let target = format!("s3://{}/{}", src.bucket, src.prefix);
         (
             Some(sender),
@@ -477,7 +477,7 @@ fn build_s3_inner(
     strategy: Option<Strategy>,
     rebuild: bool,
     purge_deleted: bool,
-    progress: Option<holys3_core::ProgressSender>,
+    progress: Option<seagrep_core::ProgressSender>,
 ) -> Result<index::IndexResult> {
     // Real sizes ride the listing so the build bounds its fetch chunks by
     // bytes, not just doc count — a bucket of huge objects must not OOM.
@@ -486,7 +486,7 @@ fn build_s3_inner(
         .map(|object| (object.key, object.etag, object.size))
         .collect::<Vec<_>>();
     if let Some(progress) = &progress {
-        progress.emit(holys3_core::ProgressEvent::ListingComplete {
+        progress.emit(seagrep_core::ProgressEvent::ListingComplete {
             objects: listing.len() as u64,
         });
     }
@@ -759,7 +759,7 @@ fn main() -> std::process::ExitCode {
         Ok(true) => std::process::ExitCode::SUCCESS,
         Ok(false) => std::process::ExitCode::from(1),
         Err(err) => {
-            eprintln!("holys3: {err:#}");
+            eprintln!("seagrep: {err:#}");
             std::process::ExitCode::from(2)
         }
     }
@@ -769,12 +769,12 @@ fn main() -> std::process::ExitCode {
 /// short hash so `a/b` vs `a__b` prefixes (or the same bucket name on two
 /// endpoints) can never share state.
 fn build_cache_dir(endpoint: Option<&str>, bucket: &str, prefix: &str) -> Result<PathBuf> {
-    let mut path = holys3_core::cache_home()?;
-    path.push("holys3");
+    let mut path = seagrep_core::cache_home()?;
+    path.push("seagrep");
     let scope = format!("{}\0{bucket}\0{prefix}", endpoint.unwrap_or(""));
     path.push(format!(
         "{bucket}-{:016x}",
-        holys3_core::hash_cache_scope(scope.as_bytes())
+        seagrep_core::hash_cache_scope(scope.as_bytes())
     ));
     Ok(path)
 }
@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn clap_parses_rg_style_invocations() {
         // subcommand wins the first positional
-        let cli = Cli::try_parse_from(["holys3", "index", "s3://b", "--purge-deleted"]).unwrap();
+        let cli = Cli::try_parse_from(["seagrep", "index", "s3://b", "--purge-deleted"]).unwrap();
         assert!(matches!(
             cli.cmd,
             Some(Cmd::Index {
@@ -852,24 +852,24 @@ mod tests {
             })
         ));
         // -e escape hatch searches for the literal word "index"
-        let cli = Cli::try_parse_from(["holys3", "-e", "index", "s3://b"]).unwrap();
+        let cli = Cli::try_parse_from(["seagrep", "-e", "index", "s3://b"]).unwrap();
         assert!(cli.cmd.is_none());
         assert_eq!(cli.search.regexp, vec!["index"]);
         // last case flag wins
-        let cli = Cli::try_parse_from(["holys3", "-i", "-s", "p", "t"]).unwrap();
+        let cli = Cli::try_parse_from(["seagrep", "-i", "-s", "p", "t"]).unwrap();
         assert!(cli.search.case_sensitive && !cli.search.ignore_case);
         // --json conflicts with -c
-        assert!(Cli::try_parse_from(["holys3", "--json", "-c", "p", "t"]).is_err());
+        assert!(Cli::try_parse_from(["seagrep", "--json", "-c", "p", "t"]).is_err());
     }
 
     #[test]
     fn clap_parses_independent_index_locations() {
         let cli = Cli::try_parse_from([
-            "holys3",
+            "seagrep",
             "index",
             "s3://source/logs",
             "--index",
-            "s3://search-index/holys3/logs",
+            "s3://search-index/seagrep/logs",
             "--index-region",
             "us-west-2",
             "--index-endpoint",
@@ -881,7 +881,7 @@ mod tests {
         };
         assert_eq!(
             index.location.as_deref(),
-            Some("s3://search-index/holys3/logs")
+            Some("s3://search-index/seagrep/logs")
         );
         assert_eq!(index.index_region.as_deref(), Some("us-west-2"));
         assert_eq!(
@@ -889,7 +889,7 @@ mod tests {
             Some("http://127.0.0.1:9000")
         );
         assert!(Cli::try_parse_from([
-            "holys3",
+            "seagrep",
             "needle",
             "s3://source/logs",
             "--index-region",

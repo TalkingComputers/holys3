@@ -22,12 +22,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - `IndexReader` now owns candidate delivery and snapshot-byte fetching; `search_collect` and `search_streaming` no longer accept a separate source fetcher.
 - Source targets and index storage locations are S3-only.
 - The workspace version is now 0.6.0 for the index-format and public library API break.
-- S3 now uses the official AWS SDK credential, endpoint, signing, and operation implementations while retaining holys3's adaptive concurrency, retries, hedging, range coalescing, and bounded body storage.
+- S3 now uses the official AWS SDK credential, endpoint, signing, and operation implementations while retaining seagrep's adaptive concurrency, retries, hedging, range coalescing, and bounded body storage.
 - The minimum supported Rust version is now 1.94.1, required by the current AWS SDK.
 
 ### Removed
 
-- The internal `holys3-sigv4` crate and custom IAM Identity Center credential exchange.
+- The internal `seagrep-sigv4` crate and custom IAM Identity Center credential exchange.
 - The `--object-cache` and `--object-cache-cap` CLI flags; search reads immutable packed index content instead of source-object bodies.
 - Local source targets and the legacy `--out` flag.
 

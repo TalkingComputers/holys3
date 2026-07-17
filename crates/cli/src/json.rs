@@ -3,8 +3,8 @@
 
 use anyhow::Result;
 use base64::Engine;
-use holys3_core::LineKind;
-use holys3_index::{DocResult, MatchSink, SinkFlow};
+use seagrep_core::LineKind;
+use seagrep_index::{DocResult, MatchSink, SinkFlow};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::io::Write;
@@ -128,7 +128,7 @@ impl JsonSink {
     /// The final JSON line. `searches` = candidate docs actually verified.
     pub(crate) fn write_summary(
         &self,
-        stats: &holys3_index::SearchStats,
+        stats: &seagrep_index::SearchStats,
         elapsed_total: std::time::Duration,
     ) -> Result<()> {
         let msg = JsonMsg::Summary(SummaryData {

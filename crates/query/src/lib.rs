@@ -1,7 +1,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
-//! Regex query planning for holys3 indexes.
+//! Regex query planning for seagrep indexes.
 
-use holys3_core::{grams_query, Strategy};
+use seagrep_core::{grams_query, Strategy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {

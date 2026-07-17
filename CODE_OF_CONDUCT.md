@@ -37,7 +37,7 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported by requesting a private maintainer contact, without incident details, in a [repository discussion](https://github.com/TalkingComputers/holys3/discussions). All complaints will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported by requesting a private maintainer contact, without incident details, in a [repository discussion](https://github.com/TalkingComputers/seagrep/discussions). All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the reporter of any incident.
 

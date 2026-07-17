@@ -8,10 +8,10 @@ version = "0.6.0"
 rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
 description = "Indexed regex search for private S3 buckets"
-repository = "https://github.com/TalkingComputers/holys3"
-homepage = "https://github.com/TalkingComputers/holys3"
-documentation = "https://docs.rs/holys3"
-authors = ["holys3 contributors"]
+repository = "https://github.com/TalkingComputers/seagrep"
+homepage = "https://github.com/TalkingComputers/seagrep"
+documentation = "https://docs.rs/seagrep"
+authors = ["seagrep contributors"]
 keywords = ["s3", "grep", "regex", "search", "trigram"]
 categories = ["command-line-utilities", "text-processing"]
 

@@ -1,10 +1,10 @@
-# holys3
+# seagrep
 
-[![CI](https://github.com/TalkingComputers/holys3/actions/workflows/ci.yml/badge.svg)](https://github.com/TalkingComputers/holys3/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/holys3.svg)](https://crates.io/crates/holys3)
-[![docs.rs](https://docs.rs/holys3/badge.svg)](https://docs.rs/holys3)
+[![CI](https://github.com/TalkingComputers/seagrep/actions/workflows/ci.yml/badge.svg)](https://github.com/TalkingComputers/seagrep/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/seagrep.svg)](https://crates.io/crates/seagrep)
+[![docs.rs](https://docs.rs/seagrep/badge.svg)](https://docs.rs/seagrep)
 
-holys3 searches S3 buckets with regular expressions. It works like grep, but
+seagrep searches S3 buckets with regular expressions. It works like grep, but
 instead of scanning your objects on every query, it builds a trigram index and
 a compressed snapshot of the decoded content once, stores both in S3, and
 answers queries from those alone. A typical search over 25,000 objects returns
@@ -14,9 +14,9 @@ in about 100 ms. The CLI follows ripgrep: same flags, same exit codes, same
 Dual-licensed under MIT or Apache-2.0.
 
 ```sh
-holys3 index s3://my-logs/prod                # build the index, once
-holys3 'req-7f3e9a2c1b' s3://my-logs/prod     # then grep it
-holys3 -i 'timeout' s3://my-logs -g '*.gz' -C2 --since 6h
+seagrep index s3://my-logs/prod                # build the index, once
+seagrep 'req-7f3e9a2c1b' s3://my-logs/prod     # then grep it
+seagrep -i 'timeout' s3://my-logs -g '*.gz' -C2 --since 6h
 ```
 
 [Installation](#installation) •
@@ -26,11 +26,11 @@ holys3 -i 'timeout' s3://my-logs -g '*.gz' -C2 --since 6h
 [Architecture](ARCHITECTURE.md) •
 [Changelog](CHANGELOG.md)
 
-## Why use holys3?
+## Why use seagrep?
 
 S3 has no grep. The usual workarounds scan: downloading everything and running
 rg pays for every object on every query, and Athena bills per byte scanned.
-holys3 pays the scan once, at index time. After that:
+seagrep pays the scan once, at index time. After that:
 
 - Queries read small index ranges plus only the snapshot bytes of candidate
   documents. A pattern that can't match anything answers in microseconds,
@@ -58,36 +58,36 @@ holys3 pays the scan once, at index time. After that:
 
 Prebuilt binaries for Linux (x86_64, arm64), macOS (Intel, Apple Silicon), and
 Windows ship with every
-[GitHub release](https://github.com/TalkingComputers/holys3/releases):
+[GitHub release](https://github.com/TalkingComputers/seagrep/releases):
 
 ```sh
-cargo binstall holys3   # fetches the prebuilt binary for your platform
-cargo install holys3    # or build from source (Rust 1.94.1+)
+cargo binstall seagrep   # fetches the prebuilt binary for your platform
+cargo install seagrep    # or build from source (Rust 1.94.1+)
 ```
 
 Release archives include SHA-256 checksums and GitHub build-provenance
 attestations. Verify one with
-`gh attestation verify <archive> -R TalkingComputers/holys3`.
+`gh attestation verify <archive> -R TalkingComputers/seagrep`.
 
 ## Usage
 
-The shape is `holys3 PATTERN TARGET`, where TARGET is `s3://bucket[/prefix]`.
+The shape is `seagrep PATTERN TARGET`, where TARGET is `s3://bucket[/prefix]`.
 Credentials come from the standard AWS SDK provider chain, so environment
 variables, shared profiles, IAM Identity Center (SSO) sessions,
 `credential_process`, and container or instance roles all work as usual, and
 temporary credentials refresh automatically.
 
-First build the index. It lives in the bucket, under `<prefix>/.holys3/` by
+First build the index. It lives in the bucket, under `<prefix>/.seagrep/` by
 default:
 
 ```sh
-AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2
+AWS_PROFILE=my-sso seagrep index s3://my-log-bucket/prod --region us-east-2
 ```
 
 Then search:
 
 ```sh
-holys3 'level":"ERROR' s3://my-log-bucket/prod --region us-east-2
+seagrep 'level":"ERROR' s3://my-log-bucket/prod --region us-east-2
 ```
 
 Most rg flags do what you expect. `-i`/`-S` for case, `-C` for context, `-w`
@@ -95,21 +95,21 @@ for word boundaries, `-F` for fixed strings, `-l`, `-c`, `-m`, `-q`, and
 `--json` emits rg-compatible JSON Lines:
 
 ```sh
-holys3 -i 'timeout' s3://my-logs -C2 -g '*.gz' -g '!debug/*'
-holys3 -w -F 'foo(' s3://my-code-bucket -l
-holys3 'req-[0-9a-f]+' s3://my-log-bucket --json | jq .
+seagrep -i 'timeout' s3://my-logs -C2 -g '*.gz' -g '!debug/*'
+seagrep -w -F 'foo(' s3://my-code-bucket -l
+seagrep 'req-[0-9a-f]+' s3://my-log-bucket --json | jq .
 ```
 
 Exit codes are rg's: `0` match, `1` no match, `2` error. Patterns are
 line-oriented like rg: `^` and `$` anchor at every line, and a literal `\n` in
 a pattern is an error. To search for a pattern that collides with a subcommand
-name, use `-e`: `holys3 -e index s3://bucket`.
+name, use `-e`: `seagrep -e index s3://bucket`.
 
 Searches can be scoped by key or by time:
 
 ```sh
-holys3 'ERROR' s3://my-logs --since 6h
-holys3 'ERROR' s3://my-logs --since 2026-06-09 --until 2026-06-10 --key-prefix prod/
+seagrep 'ERROR' s3://my-logs --since 6h
+seagrep 'ERROR' s3://my-logs --since 2026-06-09 --until 2026-06-10 --key-prefix prod/
 ```
 
 `--key-prefix` prunes whole index segments before any fetch, and `--key-regex`
@@ -123,7 +123,7 @@ interval, finishes the active cycle cleanly on SIGINT/SIGTERM, and with
 `--json` emits tagged `indexed`, `error`, and `stopped` lines on stdout:
 
 ```sh
-holys3 index s3://my-log-bucket/prod --watch --interval 30
+seagrep index s3://my-log-bucket/prod --watch --interval 30
 ```
 
 If the source bucket is read-only (or you just want the index elsewhere), put
@@ -131,8 +131,8 @@ it in its own bucket. Pass the same `--index` location when searching;
 `--index-region` and `--index-endpoint` configure that connection separately:
 
 ```sh
-holys3 index s3://my-log-bucket/prod --index s3://my-search-index/prod
-holys3 'ERROR' s3://my-log-bucket/prod --index s3://my-search-index/prod
+seagrep index s3://my-log-bucket/prod --index s3://my-search-index/prod
+seagrep 'ERROR' s3://my-log-bucket/prod --index s3://my-search-index/prod
 ```
 
 For MinIO, R2, or any other S3-compatible store, point `--endpoint` at it.
@@ -184,7 +184,7 @@ private temporary files instead of memory.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/how-it-works-dark.svg">
-  <img alt="How holys3 works: the index pipeline decodes objects and writes a trigram index plus content snapshot to S3; the search pipeline plans grams, fetches posting and pack ranges, and verifies with a real regex" src=".github/assets/how-it-works-light.svg">
+  <img alt="How seagrep works: the index pipeline decodes objects and writes a trigram index plus content snapshot to S3; the search pipeline plans grams, fetches posting and pack ranges, and verifies with a real regex" src=".github/assets/how-it-works-light.svg">
 </picture>
 
 1. The query planner extracts gram constraints from the regex: prefix, suffix,
@@ -262,11 +262,11 @@ part, not the exact milliseconds.
 
 ## Security
 
-Use private buckets. The default index lives under `<source-prefix>/.holys3/`,
+Use private buckets. The default index lives under `<source-prefix>/.seagrep/`,
 and `--index` can place it in a separately permissioned bucket. The index
 contains compressed canonical decoded content, not only grams, so protect it
 with the same access controls, retention policy, and encryption requirements
-as the source data. holys3 contacts the configured source and index S3
+as the source data. seagrep contacts the configured source and index S3
 endpoints plus the AWS credential endpoints required by the active SDK
 provider chain, and nothing else.
 

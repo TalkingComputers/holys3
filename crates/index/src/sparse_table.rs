@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 
-pub(crate) const SPARSE_TABLE_MAGIC: &[u8; 8] = b"H3SPARSE";
+pub(crate) const SPARSE_TABLE_MAGIC: &[u8; 8] = b"SGSPARSE";
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()

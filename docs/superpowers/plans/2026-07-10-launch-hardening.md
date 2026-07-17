@@ -5,7 +5,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Land, validate, publish, and verify holys3 0.4.0 through one protected release path.
+**Goal:** Land, validate, publish, and verify seagrep 0.4.0 through one protected release path.
 
 **Architecture:** GitHub pull requests provide the immutable verification boundary. Release-plz owns version publication, tag creation, the GitHub release, binaries, checksums, and attestations; a protected GitHub environment gates crates.io publication. Live AWS validation uses only process-local configuration and a disposable bucket created for the run.
 
@@ -56,7 +56,7 @@
 **Files:**
 - Modify: the current Git branch and commit graph only.
 
-- Create `feat/holys3-0.4.0` without discarding the dirty worktree.
+- Create `feat/seagrep-0.4.0` without discarding the dirty worktree.
 - Commit the complete reviewed implementation, merge `origin/main`, and resolve only genuine conflicts.
 - Run formatting, check, tests, release tests, Clippy, docs, packaging, cargo-deny, actionlint, typos, and `git diff --check`.
 - Scan the repository for forbidden organization identifiers and credential patterns before pushing.
@@ -76,7 +76,7 @@
 **Files:**
 - Modify: GitHub repository configuration only.
 
-- Push `feat/holys3-0.4.0`, open a pull request, and wait for `ci-success`, `benchmarks-success`, and `security-success`.
+- Push `feat/seagrep-0.4.0`, open a pull request, and wait for `ci-success`, `benchmarks-success`, and `security-success`.
 - Create the `crates-io` environment with a required reviewer and protected-branch deployment policy.
 - Configure crates.io trusted publishing for every published workspace crate against `.github/workflows/release-plz.yml` and environment `crates-io`.
 - Protect `main`: require pull requests, strict required checks, conversation resolution, linear history, no force pushes, and no deletion.
@@ -89,5 +89,5 @@
 
 - Approve the protected `crates-io` deployment after confirming the release commit and version.
 - Wait for crates.io publication and all five release-asset jobs.
-- Verify `cargo install holys3 --version 0.4.0`, `cargo binstall holys3`, SHA-256 checksum files, GitHub attestations, docs.rs, and `holys3 --version`.
+- Verify `cargo install seagrep --version 0.4.0`, `cargo binstall seagrep`, SHA-256 checksum files, GitHub attestations, docs.rs, and `seagrep --version`.
 - Confirm the repository contains no environment-specific identifiers and the release is backed by the merged commit.

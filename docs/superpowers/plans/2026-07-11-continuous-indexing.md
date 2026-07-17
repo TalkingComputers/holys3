@@ -8,7 +8,7 @@
 
 **Architecture:** Keep source listing and index mutation in the existing local/S3 paths. Add one CLI-owned control-loop module around `update_index`; it serializes attempts, owns signal/wait behavior, and emits status without changing the atomic index protocol. Extend the existing benchmark binary with steady-cardinality local log churn and gate it in the established benchmark workflow.
 
-**Tech Stack:** Rust 1.88, clap derive, ctrlc 3.5.2 with `termination`, serde/serde_json, std mpsc, existing holys3 index/store APIs, GitHub Actions, MinIO/local fixtures.
+**Tech Stack:** Rust 1.88, clap derive, ctrlc 3.5.2 with `termination`, serde/serde_json, std mpsc, existing seagrep index/store APIs, GitHub Actions, MinIO/local fixtures.
 
 ## Global Constraints
 
@@ -22,7 +22,7 @@
 - No new source comments, fallback behavior, `any`, underscore-prefixed names, or function names containing `resolve`, `ensure`, or `handle`.
 - Preserve current one-shot human output and exit codes.
 - JSON Lines event schemas are exact and additive only through a future versioned change.
-- Keep the S3 boundary in `holys3-s3`; no network IO enters core/query/index.
+- Keep the S3 boundary in `seagrep-s3`; no network IO enters core/query/index.
 
 ---
 
@@ -35,7 +35,7 @@
 - Modify: `Cargo.lock` through `cargo check --locked` after dependency resolution.
 
 **Interfaces:**
-- Consumes: `holys3_index::UpdateReport` and a caller closure `FnMut(bool) -> anyhow::Result<IndexResult>`.
+- Consumes: `seagrep_index::UpdateReport` and a caller closure `FnMut(bool) -> anyhow::Result<IndexResult>`.
 - Produces:
 
 ```rust
@@ -47,7 +47,7 @@ pub(crate) struct IndexConfig<'a> {
 }
 
 pub(crate) struct IndexResult {
-    pub report: holys3_index::UpdateReport,
+    pub report: seagrep_index::UpdateReport,
     pub location: String,
 }
 
@@ -354,7 +354,7 @@ Each test uses `Duration::ZERO` only inside `run_cycles`, keeps the channel send
 
 - [ ] **Step 2: Run tests to verify failure**
 
-Run: `cargo test -p holys3 index::tests -- --nocapture`
+Run: `cargo test -p seagrep index::tests -- --nocapture`
 
 Expected: compile failure because `IndexConfig`, `IndexResult`, `IndexEvent`, and `run_cycles` do not exist.
 
@@ -520,13 +520,13 @@ fn print_report(cycle: Option<u64>, result: &IndexResult) {
 
 - [ ] **Step 4: Resolve and lock the dependency**
 
-Run: `cargo check -p holys3`
+Run: `cargo check -p seagrep`
 
 Expected: Cargo.lock records `ctrlc 3.5.2`; check succeeds on Rust 1.88+.
 
 - [ ] **Step 5: Run focused tests**
 
-Run: `cargo test -p holys3 index::tests -- --nocapture`
+Run: `cargo test -p seagrep index::tests -- --nocapture`
 
 Expected: 5 passed, 0 failed.
 
@@ -548,7 +548,7 @@ git commit -m "feat: add continuous index control loop"
 
 **Interfaces:**
 - Consumes: `index::IndexConfig`, `index::IndexResult`, `index::run_index` from Task 1.
-- Produces the CLI contract `holys3 index TARGET [--watch --interval SECONDS] [--json]`.
+- Produces the CLI contract `seagrep index TARGET [--watch --interval SECONDS] [--json]`.
 
 Changed `Cmd::Index` field schema:
 
@@ -627,11 +627,11 @@ fn watch_indexes_changes_and_stops_on_sigterm() -> anyhow::Result<()>;
 
 - [ ] **Step 1: Write the failing clap and JSON tests**
 
-Add the two exact tests to `cli.rs`; use `tempfile`, existing `holys3()`, and `serde_json::Value`.
+Add the two exact tests to `cli.rs`; use `tempfile`, existing `seagrep()`, and `serde_json::Value`.
 
 - [ ] **Step 2: Run tests to verify failure**
 
-Run: `cargo test -p holys3 --test cli index_ -- --nocapture`
+Run: `cargo test -p seagrep --test cli index_ -- --nocapture`
 
 Expected: clap rejects unknown `--watch`/`--json`, so tests fail.
 
@@ -658,23 +658,23 @@ Refactor only the report printing out of `build_local` and `build_s3`; preserve 
 
 - [ ] **Step 4: Run clap and JSON tests**
 
-Run: `cargo test -p holys3 --test cli index_ -- --nocapture`
+Run: `cargo test -p seagrep --test cli index_ -- --nocapture`
 
 Expected: both tests pass.
 
 - [ ] **Step 5: Write the real watch SIGTERM test**
 
-Create `watch.rs` with `#![cfg(unix)]`, spawn `env!("CARGO_BIN_EXE_holys3")`, use a reader thread and `recv_timeout`, invoke the system `kill` command with `-TERM`, and perform the exact assertions in the contract.
+Create `watch.rs` with `#![cfg(unix)]`, spawn `env!("CARGO_BIN_EXE_seagrep")`, use a reader thread and `recv_timeout`, invoke the system `kill` command with `-TERM`, and perform the exact assertions in the contract.
 
 - [ ] **Step 6: Run the real process test**
 
-Run: `cargo test -p holys3 --test watch -- --nocapture`
+Run: `cargo test -p seagrep --test watch -- --nocapture`
 
 Expected: 1 passed in roughly 1-3 seconds; child exits 0 and final search succeeds.
 
 - [ ] **Step 7: Run all CLI tests**
 
-Run: `cargo test -p holys3`
+Run: `cargo test -p seagrep`
 
 Expected: all CLI unit/integration/doc tests pass.
 
@@ -747,13 +747,13 @@ Place the wrapper near existing `RacingStore` coverage and write the exact flow 
 
 - [ ] **Step 2: Run the focused test**
 
-Run: `cargo test -p holys3-index --test segmented interrupted_root_swap -- --nocapture`
+Run: `cargo test -p seagrep-index --test segmented interrupted_root_swap -- --nocapture`
 
 Expected: pass against the existing atomic CAS implementation. If it fails, fix the root cause in `update_index` before proceeding and add the changed function contract to this plan.
 
 - [ ] **Step 3: Run segmented lifecycle tests**
 
-Run: `cargo test -p holys3-index --test segmented`
+Run: `cargo test -p seagrep-index --test segmented`
 
 Expected: all lifecycle, race, GC, and recovery tests pass.
 
@@ -854,7 +854,7 @@ Add the two unit tests and extend the existing clap debug assertion through the 
 
 - [ ] **Step 2: Run focused tests to verify failure**
 
-Run: `cargo test -p holys3-bench churn -- --nocapture`
+Run: `cargo test -p seagrep-bench churn -- --nocapture`
 
 Expected: compile failure because the churn module/functions do not exist.
 
@@ -864,16 +864,16 @@ Use `VecDeque<PathBuf>` for live-source FIFO, `Instant` for separate listing/upd
 
 - [ ] **Step 4: Run unit tests**
 
-Run: `cargo test -p holys3-bench churn -- --nocapture`
+Run: `cargo test -p seagrep-bench churn -- --nocapture`
 
 Expected: 2 passed, 0 failed.
 
 - [ ] **Step 5: Run a small end-to-end churn benchmark**
 
 ```bash
-cargo run --locked -p holys3-bench -- seed --seed 1 --objects 100 --size 4096
-cargo run --locked -p holys3-bench -- upload --target dir
-cargo run --locked -p holys3-bench -- churn --cycles 3 --changes 10
+cargo run --locked -p seagrep-bench -- seed --seed 1 --objects 100 --size 4096
+cargo run --locked -p seagrep-bench -- upload --target dir
+cargo run --locked -p seagrep-bench -- churn --cycles 3 --changes 10
 ```
 
 Expected: summary reports `cycles=3`, `changes_per_cycle=10`, `total_docs=100`; `crates/xbench/runs/churn.json` parses and final search validates 30 `CHURN_NEEDLE` documents.
@@ -893,7 +893,7 @@ git commit -m "bench: measure incremental index churn"
 - Modify: `.github/workflows/bench.yml` scale job and artifact list.
 
 **Interfaces:**
-- Consumes: `holys3-bench churn --cycles 10 --changes 250` and `crates/xbench/runs/churn.json` from Task 4.
+- Consumes: `seagrep-bench churn --cycles 10 --changes 250` and `crates/xbench/runs/churn.json` from Task 4.
 - Produces artifacts `bench-churn.txt`, `bench-churn-rss.txt`, and `bench-churn.json`; failures feed the existing `benchmarks-success` gate.
 
 Workflow input/output schema:
@@ -924,7 +924,7 @@ Transformation:
 ```yaml
       - name: Profile incremental churn
         run: |
-          /usr/bin/time -v -o bench-churn-rss.txt target/release/holys3-bench churn --cycles 10 --changes 250 | tee bench-churn.txt
+          /usr/bin/time -v -o bench-churn-rss.txt target/release/seagrep-bench churn --cycles 10 --changes 250 | tee bench-churn.txt
           cp crates/xbench/runs/churn.json bench-churn.json
 ```
 
@@ -945,10 +945,10 @@ Expected: exit 0 with no output.
 - [ ] **Step 5: Run the full local scale workload once**
 
 ```bash
-cargo build --locked --release -p holys3 -p holys3-bench
-target/release/holys3-bench seed --seed 1 --objects 25000 --size 4096
-target/release/holys3-bench upload --target dir
-/usr/bin/time -l target/release/holys3-bench churn --cycles 10 --changes 250
+cargo build --locked --release -p seagrep -p seagrep-bench
+target/release/seagrep-bench seed --seed 1 --objects 25000 --size 4096
+target/release/seagrep-bench upload --target dir
+/usr/bin/time -l target/release/seagrep-bench churn --cycles 10 --changes 250
 ```
 
 Expected: exact summary checks pass; listing p95 <= 2,000 ms and update p95 <= 5,000 ms. On macOS, inspect `maximum resident set size` in bytes and require <= 314,572,800.
@@ -975,7 +975,7 @@ git commit -m "ci: gate continuous index churn"
 
 Documentation transformation:
 
-1. In README quickstart, add `holys3 index ./logs --out holys3.idxdir --watch --interval 30` and an S3 equivalent using a generic profile.
+1. In README quickstart, add `seagrep index ./logs --out seagrep.idxdir --watch --interval 30` and an S3 equivalent using a generic profile.
 2. State that startup failures exit, post-start failures retry, cycles do not overlap, and `--rebuild` affects cycle 1 only.
 3. Document `--json` tagged `indexed`, `error`, and `stopped` events without adding fields outside the approved schema.
 4. Add the 25,000-object/1%-per-cycle churn gate to continuous benchmark coverage.
@@ -989,7 +989,7 @@ Use only exact behavior verified by tests; do not promise notification-driven up
 
 - [ ] **Step 2: Verify command/help agreement**
 
-Run: `cargo run --locked -p holys3 -- index --help`
+Run: `cargo run --locked -p seagrep -- index --help`
 
 Expected help contains `--watch`, `--interval <SECONDS>`, and `--json`; README examples use exactly those forms.
 

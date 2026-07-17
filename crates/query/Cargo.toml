@@ -1,5 +1,5 @@
 [package]
-name = "holys3-query"
+name = "seagrep-query"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-holys3-core = { path = "../core", version = "0.6.0" }
+seagrep-core = { path = "../core", version = "0.6.0" }
 anyhow.workspace = true
 regex-syntax.workspace = true
 

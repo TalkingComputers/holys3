@@ -1,10 +1,10 @@
 //! Remote sparse dictionary tests. These force remote mode through
-//! `HOLYS3_SPARSE_REMOTE_MIN`, which is process-global state, so they live in
+//! `SEAGREP_SPARSE_REMOTE_MIN`, which is process-global state, so they live in
 //! their own integration binary and run as one sequential test.
 
 use anyhow::Result;
-use holys3_core::{testutil::MemCorpus, BlobStore, LocalBlobStore, Strategy};
-use holys3_index::{search_collect, update_index, SegmentedReader, SourceIdentity, UpdateOptions};
+use seagrep_core::{testutil::MemCorpus, BlobStore, LocalBlobStore, Strategy};
+use seagrep_index::{search_collect, update_index, SegmentedReader, SourceIdentity, UpdateOptions};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -117,8 +117,8 @@ fn search(reader: &SegmentedReader, pattern: &str) -> Result<Vec<(String, u64)>>
 #[test]
 fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
     let _lock = env_lock();
-    let _remote_min = EnvGuard::new("HOLYS3_SPARSE_REMOTE_MIN");
-    let _cache_max = EnvGuard::new("HOLYS3_CACHE_MAX");
+    let _remote_min = EnvGuard::new("SEAGREP_SPARSE_REMOTE_MIN");
+    let _cache_max = EnvGuard::new("SEAGREP_CACHE_MAX");
     let objects: BTreeMap<String, Vec<u8>> = (0..50)
         .map(|index| {
             let body = format!(
@@ -132,7 +132,7 @@ fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
         .map(|(key, body)| {
             (
                 key.clone(),
-                format!("{:016x}", holys3_core::hash_ngram(body)),
+                format!("{:016x}", seagrep_core::hash_ngram(body)),
                 body.len() as u64,
             )
         })
@@ -146,7 +146,7 @@ fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
         MemCorpus::new(keys, bodies)
     };
 
-    std::env::set_var("HOLYS3_SPARSE_REMOTE_MIN", "1");
+    std::env::set_var("SEAGREP_SPARSE_REMOTE_MIN", "1");
     let store = CountingStore::open(store_dir.path(), counter.clone());
     update_index(
         &store,
@@ -223,18 +223,18 @@ fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
         "corrupted cached block must be refetched, not trusted"
     );
 
-    std::env::set_var("HOLYS3_SPARSE_REMOTE_MIN", u64::MAX.to_string());
+    std::env::set_var("SEAGREP_SPARSE_REMOTE_MIN", u64::MAX.to_string());
     let cached_mode = open()?;
     assert_eq!(search(&cached_mode, "quick brown fox")?, remote_hits);
-    std::env::remove_var("HOLYS3_SPARSE_REMOTE_MIN");
+    std::env::remove_var("SEAGREP_SPARSE_REMOTE_MIN");
     Ok(())
 }
 
 #[test]
 fn range_cache_evicts_to_its_cap_and_stays_correct() -> Result<()> {
     let _lock = env_lock();
-    let _remote_min = EnvGuard::new("HOLYS3_SPARSE_REMOTE_MIN");
-    let _cache_max = EnvGuard::new("HOLYS3_CACHE_MAX");
+    let _remote_min = EnvGuard::new("SEAGREP_SPARSE_REMOTE_MIN");
+    let _cache_max = EnvGuard::new("SEAGREP_CACHE_MAX");
     let objects: BTreeMap<String, Vec<u8>> = (0..30)
         .map(|index| {
             let body = if index % 3 == 0 {
@@ -250,7 +250,7 @@ fn range_cache_evicts_to_its_cap_and_stays_correct() -> Result<()> {
         .map(|(key, body)| {
             (
                 key.clone(),
-                format!("{:016x}", holys3_core::hash_ngram(body)),
+                format!("{:016x}", seagrep_core::hash_ngram(body)),
                 body.len() as u64,
             )
         })
@@ -262,8 +262,8 @@ fn range_cache_evicts_to_its_cap_and_stays_correct() -> Result<()> {
         let bodies = keys.iter().map(|key| objects[key].clone()).collect();
         MemCorpus::new(keys, bodies)
     };
-    std::env::remove_var("HOLYS3_SPARSE_REMOTE_MIN");
-    std::env::remove_var("HOLYS3_CACHE_MAX");
+    std::env::remove_var("SEAGREP_SPARSE_REMOTE_MIN");
+    std::env::remove_var("SEAGREP_CACHE_MAX");
     update_index(
         &LocalBlobStore::new(store_dir.path()),
         cache_dir.path(),
@@ -309,7 +309,7 @@ fn range_cache_evicts_to_its_cap_and_stays_correct() -> Result<()> {
 
     // A one-byte cap forces the open-time sweep to evict everything; the
     // sweep runs at open, before any search can repopulate.
-    std::env::set_var("HOLYS3_CACHE_MAX", "1");
+    std::env::set_var("SEAGREP_CACHE_MAX", "1");
     let swept = SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache_dir.path(),
@@ -324,7 +324,7 @@ fn range_cache_evicts_to_its_cap_and_stays_correct() -> Result<()> {
     drop(swept);
 
     // Zero disables range caching: correct results, no new cache writes.
-    std::env::set_var("HOLYS3_CACHE_MAX", "0");
+    std::env::set_var("SEAGREP_CACHE_MAX", "0");
     let before = range_files(cache_dir.path());
     assert_eq!(hits("disabled")?, 10);
     assert_eq!(
@@ -390,10 +390,10 @@ impl BlobStore for RangeTallyStore {
 #[test]
 fn repeat_queries_serve_ranges_from_the_local_cache() -> Result<()> {
     let _lock = env_lock();
-    let _remote_min = EnvGuard::new("HOLYS3_SPARSE_REMOTE_MIN");
-    let _cache_max = EnvGuard::new("HOLYS3_CACHE_MAX");
-    std::env::remove_var("HOLYS3_SPARSE_REMOTE_MIN");
-    std::env::set_var("HOLYS3_CACHE_MAX", (4u64 << 30).to_string());
+    let _remote_min = EnvGuard::new("SEAGREP_SPARSE_REMOTE_MIN");
+    let _cache_max = EnvGuard::new("SEAGREP_CACHE_MAX");
+    std::env::remove_var("SEAGREP_SPARSE_REMOTE_MIN");
+    std::env::set_var("SEAGREP_CACHE_MAX", (4u64 << 30).to_string());
 
     let objects: BTreeMap<String, Vec<u8>> = (0..40)
         .map(|index| {
@@ -412,7 +412,7 @@ fn repeat_queries_serve_ranges_from_the_local_cache() -> Result<()> {
         .map(|(key, body)| {
             (
                 key.clone(),
-                format!("{:016x}", holys3_core::hash_ngram(body)),
+                format!("{:016x}", seagrep_core::hash_ngram(body)),
                 body.len() as u64,
             )
         })
@@ -493,10 +493,10 @@ fn repeat_queries_serve_ranges_from_the_local_cache() -> Result<()> {
 #[test]
 fn partially_cached_large_documents_reassemble_in_order() -> Result<()> {
     let _lock = env_lock();
-    let _remote_min = EnvGuard::new("HOLYS3_SPARSE_REMOTE_MIN");
-    let _cache_max = EnvGuard::new("HOLYS3_CACHE_MAX");
-    std::env::remove_var("HOLYS3_SPARSE_REMOTE_MIN");
-    std::env::set_var("HOLYS3_CACHE_MAX", (4u64 << 30).to_string());
+    let _remote_min = EnvGuard::new("SEAGREP_SPARSE_REMOTE_MIN");
+    let _cache_max = EnvGuard::new("SEAGREP_CACHE_MAX");
+    std::env::remove_var("SEAGREP_SPARSE_REMOTE_MIN");
+    std::env::set_var("SEAGREP_CACHE_MAX", (4u64 << 30).to_string());
 
     // A small doc first in pack order shares its pack block with the head of
     // a large multi-block doc; querying the small doc caches that block, so
@@ -523,7 +523,7 @@ fn partially_cached_large_documents_reassemble_in_order() -> Result<()> {
         .map(|(key, body)| {
             (
                 key.clone(),
-                format!("{:016x}", holys3_core::hash_ngram(body)),
+                format!("{:016x}", seagrep_core::hash_ngram(body)),
                 body.len() as u64,
             )
         })

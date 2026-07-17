@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn local_blob_store_round_trips_ranges() -> AnyhowResult<()> {
         let root = std::env::temp_dir().join(format!(
-            "holys3-core-{}-{}",
+            "seagrep-core-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ));
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn preexisting_lock_file_does_not_block_put_if() -> AnyhowResult<()> {
         let root = std::env::temp_dir().join(format!(
-            "holys3-lock-{}-{}",
+            "seagrep-lock-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ));

@@ -1,10 +1,10 @@
 mod common;
 
 use common::{corpus, encoded_corpus, gzipped_corpus, PATTERNS};
-use holys3_core::{
+use seagrep_core::{
     scan_matching_docs, testutil::MemCorpus, Corpus, LocalBlobStore, MatchOptions, Strategy,
 };
-use holys3_index::{
+use seagrep_index::{
     search_collect, search_streaming, update_index, KeyScope, NullSink, SegmentedReader,
     SourceIdentity, UpdateOptions,
 };

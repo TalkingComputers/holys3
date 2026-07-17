@@ -10,7 +10,7 @@ Add a provider-neutral continuous indexing mode that repeatedly applies the exis
 ## CLI Contract
 
 ```text
-holys3 index TARGET --watch --interval SECONDS [--json]
+seagrep index TARGET --watch --interval SECONDS [--json]
 ```
 
 The `index` subcommand gains three options:
@@ -105,10 +105,10 @@ A fault-injection integration test will reject the root swap after segment write
 
 ## Churn Benchmark
 
-`holys3-bench` gains a local `churn` command:
+`seagrep-bench` gains a local `churn` command:
 
 ```text
-holys3-bench churn --cycles CYCLES --changes CHANGES
+seagrep-bench churn --cycles CYCLES --changes CHANGES
 ```
 
 Both values are required positive integers. The command consumes the existing generated corpus and local index. For each cycle it removes exactly `CHANGES` oldest sources and writes exactly `CHANGES` deterministic JSONL log sources under date-partitioned paths, keeping source cardinality constant.

@@ -4,8 +4,8 @@
 
 use crate::ColorArg;
 use anyhow::Result;
-use holys3_core::{LineKind, SubMatch};
-use holys3_index::{DocResult, MatchSink, SinkFlow};
+use seagrep_core::{LineKind, SubMatch};
+use seagrep_index::{DocResult, MatchSink, SinkFlow};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -107,7 +107,7 @@ pub(crate) struct RenderConfig {
 
 /// Absolute byte offset of the first NUL in any output line, rg's binary
 /// heuristic: content with NULs is suppressed unless -a/--text is set.
-fn binary_nul_offset(events: &[holys3_core::LineEvent]) -> Option<u64> {
+fn binary_nul_offset(events: &[seagrep_core::LineEvent]) -> Option<u64> {
     events.iter().find_map(|event| {
         event
             .text
@@ -302,7 +302,7 @@ impl MatchSink for QuietSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use holys3_core::LineEvent;
+    use seagrep_core::LineEvent;
 
     fn event(line: u64, offset: u64, text: &[u8]) -> LineEvent {
         LineEvent {

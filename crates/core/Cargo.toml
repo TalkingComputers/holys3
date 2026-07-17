@@ -1,5 +1,5 @@
 [package]
-name = "holys3-core"
+name = "seagrep-core"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true

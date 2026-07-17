@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use fst::Streamer;
-use holys3_core::Strategy;
+use seagrep_core::Strategy;
 use std::io::Write;
 
 const TRIGRAM_SHARDS: usize = 256;
 const TRIGRAM_OFFSETS: usize = TRIGRAM_SHARDS + 1;
-const TRIGRAM_MAGIC: &[u8; 8] = b"HS3TERM1";
+const TRIGRAM_MAGIC: &[u8; 8] = b"SGTERM01";
 const TRIGRAM_FOOTER_LEN: usize = TRIGRAM_OFFSETS * size_of::<u64>();
 
 struct CountingWriter<W> {
@@ -245,7 +245,7 @@ impl TermMap {
                 bytes,
                 decoded,
             } => {
-                let hash = holys3_core::hash_ngram(gram);
+                let hash = seagrep_core::hash_ngram(gram);
                 let Some(block_id) = index.block_for(hash) else {
                     return Ok(None);
                 };
@@ -357,7 +357,7 @@ mod tests {
         let mut entries: Vec<(u64, u64)> = grams
             .iter()
             .enumerate()
-            .map(|(value, gram)| (holys3_core::hash_ngram(gram), value as u64))
+            .map(|(value, gram)| (seagrep_core::hash_ngram(gram), value as u64))
             .collect();
         entries.sort_unstable();
         let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
@@ -388,14 +388,14 @@ mod tests {
     }
 
     // Two grams colliding at the 40-bit key (the fixture pinned in
-    // holys3-core) share one dictionary entry: lookups for either gram see
+    // seagrep-core) share one dictionary entry: lookups for either gram see
     // the merged value — a candidate superset, never a lost document.
     #[test]
     fn colliding_grams_share_a_merged_entry() {
         let a: &[u8] = b"czopbaaa";
         let b: &[u8] = b"plo ba";
-        let hash = holys3_core::hash_ngram(a);
-        assert_eq!(hash, holys3_core::hash_ngram(b), "fixture must collide");
+        let hash = seagrep_core::hash_ngram(a);
+        assert_eq!(hash, seagrep_core::hash_ngram(b), "fixture must collide");
 
         // Different docs: the build pipeline groups records by key, so the
         // collided entry carries a count-2 union list.
@@ -440,7 +440,7 @@ mod tests {
         let mut entries: Vec<(u64, u64)> = grams
             .iter()
             .enumerate()
-            .map(|(value, gram)| (holys3_core::hash_ngram(gram), value as u64))
+            .map(|(value, gram)| (seagrep_core::hash_ngram(gram), value as u64))
             .collect();
         entries.sort_unstable();
         let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();

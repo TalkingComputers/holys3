@@ -8,7 +8,7 @@ assignees: ""
 
 ## Problem
 
-<!-- What are you trying to do that holys3 doesn't let you do today? -->
+<!-- What are you trying to do that seagrep doesn't let you do today? -->
 
 ## Proposed solution
 

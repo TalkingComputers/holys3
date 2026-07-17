@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use holys3_index::UpdateReport;
+use seagrep_index::UpdateReport;
 use serde::Serialize;
 use std::io::Write;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -232,7 +232,7 @@ fn elapsed_ms(duration: Duration) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use holys3_index::UpdateReport;
+    use seagrep_index::UpdateReport;
     use serde_json::Value;
     use std::sync::mpsc;
     use std::time::Duration;

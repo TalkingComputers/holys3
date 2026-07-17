@@ -8,7 +8,7 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_types::byte_stream::Length;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use holys3_core::{ProgressEvent, ProgressSender};
+use seagrep_core::{ProgressEvent, ProgressSender};
 use std::path::{Path, PathBuf};
 
 const FILE_STREAM_BUFFER_SIZE: usize = 1024 * 1024;

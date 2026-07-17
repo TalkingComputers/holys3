@@ -11,13 +11,13 @@ use gen::{
     doc_path, latest_run_path, local_index_dir, objects_dir, read_manifest, remove_dir,
     reports_dir, write_seed, CorpusKind, SeedManifest,
 };
-use holys3_core::{LocalBlobStore, Strategy};
-use holys3_index::{
+use scenarios::{read_scenarios, Scenario};
+use seagrep_core::{LocalBlobStore, Strategy};
+use seagrep_index::{
     search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, NullSink, SegmentedReader,
     SourceIdentity, UpdateOptions,
 };
-use holys3_s3::{build_fetch_config, build_index_namespace, S3BlobStore, S3Client, S3Corpus};
-use scenarios::{read_scenarios, Scenario};
+use seagrep_s3::{build_fetch_config, build_index_namespace, S3BlobStore, S3Client, S3Corpus};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -43,7 +43,7 @@ fn dir_source_identity() -> Result<SourceIdentity> {
 }
 
 #[derive(Parser)]
-#[command(name = "holys3-bench")]
+#[command(name = "seagrep-bench")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -318,11 +318,11 @@ fn run(scenarios_path: &Path, iterations: usize, warmup: usize, concurrency: usi
     anyhow::ensure!(concurrency > 0, "concurrency must be greater than 0");
     let scenarios = read_scenarios(scenarios_path)?;
     let manifest = read_manifest()?;
-    let has_bucket = read_optional_env("HOLYS3_BENCH_BUCKET")?.is_some();
-    let has_endpoint = read_optional_env("HOLYS3_BENCH_ENDPOINT")?.is_some();
+    let has_bucket = read_optional_env("SEAGREP_BENCH_BUCKET")?.is_some();
+    let has_endpoint = read_optional_env("SEAGREP_BENCH_ENDPOINT")?.is_some();
     let summary = match (has_bucket, has_endpoint) {
         (true, _) => run_s3(scenarios, &manifest, iterations, warmup, concurrency)?,
-        (false, true) => anyhow::bail!("set HOLYS3_BENCH_BUCKET with HOLYS3_BENCH_ENDPOINT"),
+        (false, true) => anyhow::bail!("set SEAGREP_BENCH_BUCKET with SEAGREP_BENCH_ENDPOINT"),
         (false, false) => run_dir(scenarios, &manifest, iterations, warmup, concurrency)?,
     };
     std::fs::create_dir_all(reports_dir())?;
@@ -525,7 +525,7 @@ fn measure_search(reader: &dyn IndexReader, pattern: &str) -> Result<SearchMeasu
         reader,
         pattern,
         KeyScope::default(),
-        holys3_core::MatchOptions::default(),
+        seagrep_core::MatchOptions::default(),
         &NullSink,
     )?;
     Ok(SearchMeasurement {
@@ -610,9 +610,9 @@ fn percent_delta(base: f64, candidate: f64) -> f64 {
 }
 
 fn read_s3_backend(concurrency: usize) -> Result<S3Backend> {
-    let bucket = std::env::var("HOLYS3_BENCH_BUCKET")?;
-    let region = std::env::var("HOLYS3_BENCH_REGION")?;
-    let endpoint = read_optional_env("HOLYS3_BENCH_ENDPOINT")?;
+    let bucket = std::env::var("SEAGREP_BENCH_BUCKET")?;
+    let region = std::env::var("SEAGREP_BENCH_REGION")?;
+    let endpoint = read_optional_env("SEAGREP_BENCH_ENDPOINT")?;
     let client = S3Client::connect(
         Some(region.clone()),
         endpoint.clone(),

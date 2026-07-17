@@ -1,11 +1,11 @@
-# holys3 Engine Expansion Design
+# seagrep Engine Expansion Design
 
 > [!NOTE]
 > Historical design record from 2026-07-10. It does not describe the current CLI or architecture. See [README](../../../README.md), [Architecture](../../../ARCHITECTURE.md), and [Changelog](../../../CHANGELOG.md).
 
 ## Objective
 
-Make holys3 materially faster and more scalable while preserving its exact-search contract, then expand the decoder from one searchable document per object to multiple logical documents per source object.
+Make seagrep materially faster and more scalable while preserving its exact-search contract, then expand the decoder from one searchable document per object to multiple logical documents per source object.
 
 The work covers three coordinated areas:
 
@@ -157,7 +157,7 @@ The same pipeline and canonical projection are used during indexing and verifica
 
 Parquet, Avro, Arrow IPC, and ORC batches project to one compact JSON object per row followed by `\n`. Null, decimal, binary, timestamp, NaN, and nested-value behavior remains aligned with the existing Parquet/Avro policy.
 
-Arrow IPC uses Arrow 59 directly. `orc-rust` 0.8 depends on Arrow 58, so ORC lives behind a narrow adapter that accepts bytes and returns canonical JSONL bytes without exposing Arrow-58 types to the rest of the workspace. ORC disables its default async feature because holys3 already owns transport and scheduling.
+Arrow IPC uses Arrow 59 directly. `orc-rust` 0.8 depends on Arrow 58, so ORC lives behind a narrow adapter that accepts bytes and returns canonical JSONL bytes without exposing Arrow-58 types to the rest of the workspace. ORC disables its default async feature because seagrep already owns transport and scheduling.
 
 ## Index Construction
 
@@ -206,7 +206,7 @@ Small S3 response bodies use shared `bytes::Bytes`; large source ranges and cach
 
 ### Request identity
 
-Every candidate carries the indexed source version. S3 `GetObject` sends `If-Match` with that ETag. HTTP 412 becomes a typed stale-index error that tells the user to rerun `holys3 index`; verification never silently runs against a different object version.
+Every candidate carries the indexed source version. S3 `GetObject` sends `If-Match` with that ETag. HTTP 412 becomes a typed stale-index error that tells the user to rerun `seagrep index`; verification never silently runs against a different object version.
 
 ### Connections, retries, and ranges
 

@@ -1,6 +1,6 @@
 use super::{hex_encode, segment_blob, sha256_hex};
 use anyhow::{Context, Result};
-use holys3_core::BlobStore;
+use seagrep_core::BlobStore;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};

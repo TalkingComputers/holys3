@@ -16,7 +16,7 @@ services:
     depends_on:
       - minio
     entrypoint: >
-      /bin/sh -c 'until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done; mc mb --ignore-existing local/holys3-bench'
+      /bin/sh -c 'until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done; mc mb --ignore-existing local/seagrep-bench'
 
 volumes:
   minio-data:

@@ -6,12 +6,12 @@ git_release_enable = false
 git_tag_enable = false
 
 [[package]]
-name = "holys3"
+name = "seagrep"
 changelog_include = [
-  "holys3-core",
-  "holys3-index",
-  "holys3-query",
-  "holys3-s3",
+  "seagrep-core",
+  "seagrep-index",
+  "seagrep-query",
+  "seagrep-s3",
 ]
 changelog_path = "./CHANGELOG.md"
 changelog_update = true

@@ -1,11 +1,11 @@
 use crate::format::{DocEntry, SegmentTables, SourceEntry};
 use crate::pack::{PackBuilder, PackFile};
 use anyhow::{Context, Result};
-use holys3_core::{
+use rayon::prelude::*;
+use seagrep_core::{
     decode_source_body, is_raw_body, pack_trigram_grams, Corpus, DecodeSink, DocumentBody,
     LogicalDocumentMeta, SourceEncoding, SourceObject, Strategy, DECODE_LIMITS,
 };
-use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -450,7 +450,7 @@ struct ChunkIngest<'a> {
     sources: &'a [SourceObject],
     strategy: Strategy,
     document_cap: Option<usize>,
-    progress: Option<&'a holys3_core::ProgressSender>,
+    progress: Option<&'a seagrep_core::ProgressSender>,
     tables: &'a mut SegmentTables,
     pack_builder: &'a mut PackBuilder,
     failed: &'a mut usize,
@@ -544,7 +544,7 @@ impl ChunkIngest<'_> {
                     }
                 };
             if let Some(progress) = progress {
-                progress.emit(holys3_core::ProgressEvent::SourceIngested {
+                progress.emit(seagrep_core::ProgressEvent::SourceIngested {
                     decoded_bytes: expanded_bytes,
                 });
             }
@@ -611,7 +611,7 @@ pub(crate) fn build_index_files(
     corpus: &dyn Corpus,
     strategy: Strategy,
     document_cap: Option<usize>,
-    progress: Option<&holys3_core::ProgressSender>,
+    progress: Option<&seagrep_core::ProgressSender>,
 ) -> Result<BuiltIndexFiles> {
     if let Some(document_cap) = document_cap {
         anyhow::ensure!(document_cap > 0, "segment document cap must be positive");

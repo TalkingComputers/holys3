@@ -1,6 +1,6 @@
 use crate::segment::cache::{read_verified, write_back};
 use anyhow::{Context, Result};
-use holys3_core::{BlobStore, DocumentBody, DocumentSpool};
+use seagrep_core::{BlobStore, DocumentBody, DocumentSpool};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
