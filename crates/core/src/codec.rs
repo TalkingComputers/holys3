@@ -203,14 +203,14 @@ fn transcode_utf16_body(body: DocumentBody) -> AnyhowResult<DocumentBody> {
         DocumentStorage::File { mut file, .. } => {
             use std::io::{Seek, SeekFrom, Write};
             file.seek(SeekFrom::Start(0))?;
-            let spool = tempfile::NamedTempFile::new()?;
-            let mut writer = std::io::BufWriter::new(spool.as_file());
+            // anonymous: the OS reclaims it when the body drops
+            let spool = tempfile::tempfile()?;
+            let mut writer = std::io::BufWriter::new(&spool);
             std::io::copy(&mut reader(Box::new(file)), &mut writer)?;
             writer.flush()?;
             drop(writer);
-            let file = spool.into_file();
-            let len = file.metadata()?.len();
-            Ok(DocumentBody::from_file(file, len))
+            let len = spool.metadata()?.len();
+            Ok(DocumentBody::from_file(spool, len))
         }
     }
 }
