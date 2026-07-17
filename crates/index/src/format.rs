@@ -1,6 +1,6 @@
 use crate::pack::{PackBlock, PACK_BLOCK_BYTES};
 use anyhow::{Context, Result};
-use holys3_core::SourceEncoding;
+use s3grep_core::SourceEncoding;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 

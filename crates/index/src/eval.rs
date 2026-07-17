@@ -6,8 +6,8 @@
 //! sorted id vectors.
 
 use anyhow::{Context, Result};
-use holys3_core::DocId;
-use holys3_query::Query;
+use s3grep_core::DocId;
+use s3grep_query::Query;
 use std::collections::BTreeMap;
 
 /// Keep at most this many (rarest) gram constraints per AND group. Extra

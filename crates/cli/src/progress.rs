@@ -2,8 +2,8 @@
 //! One render thread owns the bar and consumes the channel; producers never
 //! touch the terminal.
 
-use holys3_core::ProgressEvent;
 use indicatif::{ProgressBar, ProgressStyle};
+use s3grep_core::ProgressEvent;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 

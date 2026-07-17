@@ -6,12 +6,12 @@ git_release_enable = false
 git_tag_enable = false
 
 [[package]]
-name = "holys3"
+name = "s3grep"
 changelog_include = [
-  "holys3-core",
-  "holys3-index",
-  "holys3-query",
-  "holys3-s3",
+  "s3grep-core",
+  "s3grep-index",
+  "s3grep-query",
+  "s3grep-s3",
 ]
 changelog_path = "./CHANGELOG.md"
 changelog_update = true

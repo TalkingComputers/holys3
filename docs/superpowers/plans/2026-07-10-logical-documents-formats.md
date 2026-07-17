@@ -285,7 +285,7 @@ pub trait IndexReader {
     fn total_docs(&self) -> usize;
     fn candidate_docs(
         &self,
-        query: &holys3_query::Query,
+        query: &s3grep_query::Query,
         key_prefix: Option<&str>,
     ) -> anyhow::Result<Vec<DocAddress>>;
     fn stats(&self) -> IndexStats;
@@ -350,7 +350,7 @@ Expose only `decode_source`, `DecodeLimits`, `DecodeSink`, `DecodeSummary`, `Log
 - [ ] **Step 3: Verify byte-identical existing projections**
 
 ```bash
-cargo +1.96.1 nextest run --locked -p holys3-core --all-features
+cargo +1.96.1 nextest run --locked -p s3grep-core --all-features
 ```
 
 - [ ] **Step 4: Commit codec decomposition**
@@ -437,9 +437,9 @@ Only `.br`, `.zlib`, and `.zz` select these codecs without magic. Require succes
 - [ ] **Step 6: Verify format matrix and binary size**
 
 ```bash
-cargo +1.96.1 nextest run --locked -p holys3-core -p holys3-index --all-features
-cargo +1.96.1 build --locked --release -p holys3
-test "$(stat -f %z target/release/holys3)" -le 26214400
+cargo +1.96.1 nextest run --locked -p s3grep-core -p s3grep-index --all-features
+cargo +1.96.1 build --locked --release -p s3grep
+test "$(stat -f %z target/release/s3grep)" -le 26214400
 ```
 
 - [ ] **Step 7: Commit structured formats**

@@ -51,12 +51,12 @@ jobs:
       - name: Run base Criterion benches
         if: github.event_name == 'pull_request'
         working-directory: benchmark-base
-        run: cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --save-baseline pull-request-base
+        run: cargo bench --locked -p s3grep-index --bench hot_paths -- --noplot --save-baseline pull-request-base
       - name: Import base baselines
         if: github.event_name == 'pull_request'
         # The base build gets its own target dir so its artifacts can never
         # satisfy PR compilation units (a shared dir let a stale
-        # holys3-core rlib shadow the PR's when the public API changed);
+        # s3grep-core rlib shadow the PR's when the public API changed);
         # only the Criterion baselines cross over.
         run: |
           mkdir -p target/criterion
@@ -64,11 +64,11 @@ jobs:
           rm -rf target/criterion/*/new target/criterion/*/change target/criterion/*/report
       - name: Run Criterion benches against PR base
         if: github.event_name == 'pull_request'
-        run: cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --baseline-lenient pull-request-base
+        run: cargo bench --locked -p s3grep-index --bench hot_paths -- --noplot --baseline-lenient pull-request-base
       - name: Run Criterion benches
         if: github.event_name != 'pull_request'
         run: |
-          cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --save-baseline pr
+          cargo bench --locked -p s3grep-index --bench hot_paths -- --noplot --save-baseline pr
       - name: Collect Criterion medians
         run: |
           python3 <<'PY'
@@ -171,7 +171,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Start MinIO service
         run: |
-          docker run -d --name holys3-minio -p 9000:9000 \
+          docker run -d --name s3grep-minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
             "$MINIO_IMAGE" server /data --address :9000
@@ -185,37 +185,37 @@ jobs:
             test "$attempts" -lt 60
             sleep 1
           done
-          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-bench
-          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-index
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/s3grep-bench
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/s3grep-index
       - name: Build benchmark binaries
-        run: cargo build --locked --release -p holys3 -p holys3-bench
+        run: cargo build --locked --release -p s3grep -p s3grep-bench
       - name: Run xbench
         env:
           AWS_ACCESS_KEY_ID: minioadmin
           AWS_SECRET_ACCESS_KEY: minioadmin
-          HOLYS3_BENCH_BUCKET: holys3-bench
-          HOLYS3_BENCH_REGION: us-east-1
-          HOLYS3_BENCH_ENDPOINT: http://127.0.0.1:9000
+          S3GREP_BENCH_BUCKET: s3grep-bench
+          S3GREP_BENCH_REGION: us-east-1
+          S3GREP_BENCH_ENDPOINT: http://127.0.0.1:9000
         run: |
-          target/release/holys3-bench seed --seed 1 --objects 1000 --size 4096
-          target/release/holys3-bench upload --target s3
-          target/release/holys3-bench run --scenarios crates/xbench/scenarios/queries.toml --iterations 3 --warmup 1 --concurrency 64
-          target/release/holys3-bench render --input crates/xbench/runs/latest.json > bench-e2e.md
+          target/release/s3grep-bench seed --seed 1 --objects 1000 --size 4096
+          target/release/s3grep-bench upload --target s3
+          target/release/s3grep-bench run --scenarios crates/xbench/scenarios/queries.toml --iterations 3 --warmup 1 --concurrency 64
+          target/release/s3grep-bench render --input crates/xbench/runs/latest.json > bench-e2e.md
       - name: Test independent index bucket
         env:
           AWS_ACCESS_KEY_ID: minioadmin
           AWS_SECRET_ACCESS_KEY: minioadmin
           MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
-          source_index_keys=$(docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ls --recursive --json local/holys3-bench/xbench/.holys3 | wc -l)
-          target/release/holys3 index s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild --strategy trigram
-          target/release/holys3 -l longliteralbenchmarktoken s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-independent-index-hits.txt
+          source_index_keys=$(docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ls --recursive --json local/s3grep-bench/xbench/.s3grep | wc -l)
+          target/release/s3grep index s3://s3grep-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild --strategy trigram
+          target/release/s3grep -l longliteralbenchmarktoken s3://s3grep-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-independent-index-hits.txt
           test "$(wc -l < bench-independent-index-hits.txt)" -eq 334
-          if target/release/holys3 -q longliteralbenchmarktoken s3://holys3-bench/xbench/missing --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64; then exit 1; else test "$?" -eq 1; fi
-          if target/release/holys3 -q longliteralbenchmarktoken s3://holys3-bench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64; then exit 1; else test "$?" -eq 2; fi
-          test "$(docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ls --recursive --json local/holys3-bench/xbench/.holys3 | wc -l)" -eq "$source_index_keys"
-          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" rm --recursive --force local/holys3-bench/xbench
-          target/release/holys3 -l longliteralbenchmarktoken s3://holys3-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-source-deleted-hits.txt
+          if target/release/s3grep -q longliteralbenchmarktoken s3://s3grep-bench/xbench/missing --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64; then exit 1; else test "$?" -eq 1; fi
+          if target/release/s3grep -q longliteralbenchmarktoken s3://s3grep-bench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64; then exit 1; else test "$?" -eq 2; fi
+          test "$(docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" ls --recursive --json local/s3grep-bench/xbench/.s3grep | wc -l)" -eq "$source_index_keys"
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" rm --recursive --force local/s3grep-bench/xbench
+          target/release/s3grep -l longliteralbenchmarktoken s3://s3grep-bench/xbench --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-index/xbench --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-source-deleted-hits.txt
           test "$(wc -l < bench-source-deleted-hits.txt)" -eq 334
       - name: Test large-object ranged fetch
         env:
@@ -225,12 +225,12 @@ jobs:
         run: |
           truncate -s 536870912 bench-large.log
           printf RANGE_NEEDLE | dd of=bench-large.log bs=1 seek=268435456 conv=notrunc status=none
-          docker run --rm --network host -e MC_HOST_local -v "$PWD/bench-large.log:/bench-large.log:ro" "$MC_IMAGE" cp /bench-large.log local/holys3-bench/range/large.log
-          /usr/bin/time -v -o bench-s3-trigram-index.txt target/release/holys3 index s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --strategy trigram
-          /usr/bin/time -v -o bench-s3-trigram-search.txt target/release/holys3 -l RANGE_NEEDLE s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-s3-trigram-hits.txt
+          docker run --rm --network host -e MC_HOST_local -v "$PWD/bench-large.log:/bench-large.log:ro" "$MC_IMAGE" cp /bench-large.log local/s3grep-bench/range/large.log
+          /usr/bin/time -v -o bench-s3-trigram-index.txt target/release/s3grep index s3://s3grep-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --strategy trigram
+          /usr/bin/time -v -o bench-s3-trigram-search.txt target/release/s3grep -l RANGE_NEEDLE s3://s3grep-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-s3-trigram-hits.txt
           test "$(wc -l < bench-s3-trigram-hits.txt)" -eq 1
-          /usr/bin/time -v -o bench-s3-sparse-index.txt target/release/holys3 index s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse --rebuild
-          /usr/bin/time -v -o bench-s3-sparse-search.txt target/release/holys3 -l RANGE_NEEDLE s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-s3-sparse-hits.txt
+          /usr/bin/time -v -o bench-s3-sparse-index.txt target/release/s3grep index s3://s3grep-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse --rebuild
+          /usr/bin/time -v -o bench-s3-sparse-search.txt target/release/s3grep -l RANGE_NEEDLE s3://s3grep-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-s3-sparse-hits.txt
           test "$(wc -l < bench-s3-sparse-hits.txt)" -eq 1
           python3 <<'PY'
           from pathlib import Path
@@ -257,9 +257,9 @@ jobs:
           dd if=/dev/urandom of=bench-entropy.log bs=1048576 count=64 status=none
           printf ENTROPY_NEEDLE | dd of=bench-entropy.log bs=1 seek=33554432 conv=notrunc status=none
           gzip -1 -c bench-entropy.log > bench-entropy.log.gz
-          docker run --rm --network host -e MC_HOST_local -v "$PWD/bench-entropy.log.gz:/bench-entropy.log.gz:ro" "$MC_IMAGE" cp /bench-entropy.log.gz local/holys3-bench/entropy/large.log.gz
-          /usr/bin/time -v -o bench-entropy-index.txt target/release/holys3 index s3://holys3-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild --strategy trigram
-          /usr/bin/time -v -o bench-entropy-search.txt target/release/holys3 -l ENTROPY_NEEDLE s3://holys3-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-entropy-hits.txt
+          docker run --rm --network host -e MC_HOST_local -v "$PWD/bench-entropy.log.gz:/bench-entropy.log.gz:ro" "$MC_IMAGE" cp /bench-entropy.log.gz local/s3grep-bench/entropy/large.log.gz
+          /usr/bin/time -v -o bench-entropy-index.txt target/release/s3grep index s3://s3grep-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild --strategy trigram
+          /usr/bin/time -v -o bench-entropy-search.txt target/release/s3grep -l ENTROPY_NEEDLE s3://s3grep-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-entropy-hits.txt
           test "$(wc -l < bench-entropy-hits.txt)" -eq 1
           python3 <<'PY'
           from pathlib import Path
@@ -277,7 +277,7 @@ jobs:
           PY
       - name: Stop MinIO
         if: always()
-        run: docker rm --force holys3-minio
+        run: docker rm --force s3grep-minio
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
@@ -304,33 +304,33 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-on-failure: true
-      - run: cargo build --locked --release -p holys3 -p holys3-bench
+      - run: cargo build --locked --release -p s3grep -p s3grep-bench
       - name: Profile 25,000-object index
         run: |
-          target/release/holys3-bench seed --seed 1 --objects 25000 --size 4096
-          /usr/bin/time -v -o bench-scale-index.txt target/release/holys3-bench upload --target dir | tee bench-scale-build.txt
-          target/release/holys3-bench run --scenarios crates/xbench/scenarios/queries.toml --iterations 1 --warmup 0 --concurrency 64
-          target/release/holys3-bench render --input crates/xbench/runs/latest.json > bench-scale.md
+          target/release/s3grep-bench seed --seed 1 --objects 25000 --size 4096
+          /usr/bin/time -v -o bench-scale-index.txt target/release/s3grep-bench upload --target dir | tee bench-scale-build.txt
+          target/release/s3grep-bench run --scenarios crates/xbench/scenarios/queries.toml --iterations 1 --warmup 0 --concurrency 64
+          target/release/s3grep-bench render --input crates/xbench/runs/latest.json > bench-scale.md
           cp crates/xbench/runs/latest.json bench-scale.json
       - name: Profile incremental churn
         run: |
-          /usr/bin/time -v -o bench-churn-rss.txt target/release/holys3-bench churn --cycles 30 --changes 250 | tee bench-churn.txt
+          /usr/bin/time -v -o bench-churn-rss.txt target/release/s3grep-bench churn --cycles 30 --changes 250 | tee bench-churn.txt
           cp crates/xbench/runs/churn.json bench-churn.json
       - name: Profile prose corpus (trigram vs sparse)
         run: |
-          target/release/holys3-bench seed --seed 1 --objects 1000 --size 65536 --corpus prose
-          target/release/holys3-bench upload --target dir
-          target/release/holys3-bench run --scenarios crates/xbench/scenarios/prose.toml --iterations 1 --warmup 0 --concurrency 64
+          target/release/s3grep-bench seed --seed 1 --objects 1000 --size 65536 --corpus prose
+          target/release/s3grep-bench upload --target dir
+          target/release/s3grep-bench run --scenarios crates/xbench/scenarios/prose.toml --iterations 1 --warmup 0 --concurrency 64
           cp crates/xbench/runs/latest.json bench-prose-trigram.json
-          target/release/holys3-bench upload --target dir --strategy sparse
-          target/release/holys3-bench run --scenarios crates/xbench/scenarios/prose.toml --iterations 1 --warmup 0 --concurrency 64
+          target/release/s3grep-bench upload --target dir --strategy sparse
+          target/release/s3grep-bench run --scenarios crates/xbench/scenarios/prose.toml --iterations 1 --warmup 0 --concurrency 64
           cp crates/xbench/runs/latest.json bench-prose-sparse.json
           {
             echo '#### prose corpus, trigram'
-            target/release/holys3-bench render --input bench-prose-trigram.json
+            target/release/s3grep-bench render --input bench-prose-trigram.json
             echo
             echo '#### prose corpus, sparse'
-            target/release/holys3-bench render --input bench-prose-sparse.json
+            target/release/s3grep-bench render --input bench-prose-sparse.json
           } > bench-prose.md
       - name: Gate prose candidate counts
         run: |
@@ -369,7 +369,7 @@ jobs:
           PY
       - name: Start MinIO service
         run: |
-          docker run -d --name holys3-scale-minio -p 9000:9000 \
+          docker run -d --name s3grep-scale-minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
             "$MINIO_IMAGE" server /data --address :9000
@@ -383,24 +383,24 @@ jobs:
             test "$attempts" -lt 60
             sleep 1
           done
-          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-scale
-          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/holys3-scale-index
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/s3grep-scale
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" mb --ignore-existing local/s3grep-scale-index
       - name: Profile 256 MiB decoded workload
         env:
           AWS_ACCESS_KEY_ID: minioadmin
           AWS_SECRET_ACCESS_KEY: minioadmin
           MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
-          mkdir -p /tmp/holys3-large-data
-          truncate -s 134217728 /tmp/holys3-large-data/large.log
-          printf needle | dd of=/tmp/holys3-large-data/large.log bs=1 seek=67108864 conv=notrunc status=none
-          gzip -c /tmp/holys3-large-data/large.log > /tmp/holys3-large-data/large.log.gz
-          docker run --rm --network host -e MC_HOST_local -v /tmp/holys3-large-data:/data:ro "$MC_IMAGE" cp --recursive /data/ local/holys3-scale/large/
-          /usr/bin/time -v -o bench-scale-large.txt target/release/holys3 index s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy trigram
-          hits=$(target/release/holys3 -l needle s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 | wc -l)
+          mkdir -p /tmp/s3grep-large-data
+          truncate -s 134217728 /tmp/s3grep-large-data/large.log
+          printf needle | dd of=/tmp/s3grep-large-data/large.log bs=1 seek=67108864 conv=notrunc status=none
+          gzip -c /tmp/s3grep-large-data/large.log > /tmp/s3grep-large-data/large.log.gz
+          docker run --rm --network host -e MC_HOST_local -v /tmp/s3grep-large-data:/data:ro "$MC_IMAGE" cp --recursive /data/ local/s3grep-scale/large/
+          /usr/bin/time -v -o bench-scale-large.txt target/release/s3grep index s3://s3grep-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-scale-index/large-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy trigram
+          hits=$(target/release/s3grep -l needle s3://s3grep-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-scale-index/large-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 | wc -l)
           test "$hits" -eq 2
-          /usr/bin/time -v -o bench-scale-sparse.txt target/release/holys3 index s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
-          hits=$(target/release/holys3 -l needle s3://holys3-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/large-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 | wc -l)
+          /usr/bin/time -v -o bench-scale-sparse.txt target/release/s3grep index s3://s3grep-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-scale-index/large-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
+          hits=$(target/release/s3grep -l needle s3://s3grep-scale/large --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-scale-index/large-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 | wc -l)
           test "$hits" -eq 2
       - name: Profile 512 MiB compression expansion
         env:
@@ -408,16 +408,16 @@ jobs:
           AWS_SECRET_ACCESS_KEY: minioadmin
           MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
-          mkdir -p /tmp/holys3-expansion-data
-          truncate -s 536870912 /tmp/holys3-expansion-data/expanded.log
-          printf EXPANSION_NEEDLE | dd of=/tmp/holys3-expansion-data/expanded.log bs=1 seek=268435456 conv=notrunc status=none
-          gzip /tmp/holys3-expansion-data/expanded.log
-          docker run --rm --network host -e MC_HOST_local -v /tmp/holys3-expansion-data:/data:ro "$MC_IMAGE" cp --recursive /data/ local/holys3-scale/expansion/
-          /usr/bin/time -v -o bench-expansion-index.txt target/release/holys3 index s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy trigram
-          /usr/bin/time -v -o bench-expansion-search.txt target/release/holys3 -l EXPANSION_NEEDLE s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-expansion-hits.txt
+          mkdir -p /tmp/s3grep-expansion-data
+          truncate -s 536870912 /tmp/s3grep-expansion-data/expanded.log
+          printf EXPANSION_NEEDLE | dd of=/tmp/s3grep-expansion-data/expanded.log bs=1 seek=268435456 conv=notrunc status=none
+          gzip /tmp/s3grep-expansion-data/expanded.log
+          docker run --rm --network host -e MC_HOST_local -v /tmp/s3grep-expansion-data:/data:ro "$MC_IMAGE" cp --recursive /data/ local/s3grep-scale/expansion/
+          /usr/bin/time -v -o bench-expansion-index.txt target/release/s3grep index s3://s3grep-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-scale-index/expansion-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy trigram
+          /usr/bin/time -v -o bench-expansion-search.txt target/release/s3grep -l EXPANSION_NEEDLE s3://s3grep-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-scale-index/expansion-trigram --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-expansion-hits.txt
           test "$(wc -l < bench-expansion-hits.txt)" -eq 1
-          /usr/bin/time -v -o bench-expansion-sparse-index.txt target/release/holys3 index s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
-          /usr/bin/time -v -o bench-expansion-sparse-search.txt target/release/holys3 -l EXPANSION_NEEDLE s3://holys3-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/expansion-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-expansion-sparse-hits.txt
+          /usr/bin/time -v -o bench-expansion-sparse-index.txt target/release/s3grep index s3://s3grep-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-scale-index/expansion-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
+          /usr/bin/time -v -o bench-expansion-sparse-search.txt target/release/s3grep -l EXPANSION_NEEDLE s3://s3grep-scale/expansion --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-scale-index/expansion-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-expansion-sparse-hits.txt
           test "$(wc -l < bench-expansion-sparse-hits.txt)" -eq 1
       - name: Profile 20,000-member TAR snapshot
         env:
@@ -430,7 +430,7 @@ jobs:
           import tarfile
           from pathlib import Path
 
-          root = Path("/tmp/holys3-archive-data")
+          root = Path("/tmp/s3grep-archive-data")
           root.mkdir()
           size = 32 * 1024
           body = bytearray(b"x" * size)
@@ -443,10 +443,10 @@ jobs:
                   member.mode = 0o600
                   archive.addfile(member, io.BytesIO(body))
           PY
-          docker run --rm --network host -e MC_HOST_local -v /tmp/holys3-archive-data:/data:ro "$MC_IMAGE" cp /data/members.tar local/holys3-scale/archive/members.tar
-          /usr/bin/time -v -o bench-archive-sparse-index.txt target/release/holys3 index s3://holys3-scale/archive --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/archive-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
-          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" rm --recursive --force local/holys3-scale/archive
-          target/release/holys3 -l ARCHIVE_NEEDLE s3://holys3-scale/archive --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://holys3-scale-index/archive-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-archive-source-deleted-hits.txt
+          docker run --rm --network host -e MC_HOST_local -v /tmp/s3grep-archive-data:/data:ro "$MC_IMAGE" cp /data/members.tar local/s3grep-scale/archive/members.tar
+          /usr/bin/time -v -o bench-archive-sparse-index.txt target/release/s3grep index s3://s3grep-scale/archive --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-scale-index/archive-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse
+          docker run --rm --network host -e MC_HOST_local "$MC_IMAGE" rm --recursive --force local/s3grep-scale/archive
+          target/release/s3grep -l ARCHIVE_NEEDLE s3://s3grep-scale/archive --region us-east-1 --endpoint http://127.0.0.1:9000 --index s3://s3grep-scale-index/archive-sparse --index-region us-east-1 --index-endpoint http://127.0.0.1:9000 --concurrency 64 > bench-archive-source-deleted-hits.txt
           test "$(wc -l < bench-archive-source-deleted-hits.txt)" -eq 20
       - name: Enforce peak memory ceilings
         run: |
@@ -555,7 +555,7 @@ jobs:
           PY
       - name: Stop MinIO
         if: always()
-        run: docker rm --force holys3-scale-minio
+        run: docker rm --force s3grep-scale-minio
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
@@ -613,7 +613,7 @@ jobs:
       - name: Build PR comment
         run: |
           {
-            echo '## holys3 benchmarks'
+            echo '## s3grep benchmarks'
             echo
             echo '### micro'
             if [ -f artifacts/bench-micro.md ]; then cat artifacts/bench-micro.md; else echo 'micro did not produce a table'; fi
@@ -629,5 +629,5 @@ jobs:
           } > bench-comment.md
       - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         with:
-          header: holys3-benchmarks
+          header: s3grep-benchmarks
           path: bench-comment.md

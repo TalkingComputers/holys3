@@ -15,7 +15,7 @@ assignees: ""
 Steps or the exact command that triggers it:
 
 ```console
-$ holys3 ...
+$ s3grep ...
 ```
 
 ## Expected behavior
@@ -32,7 +32,7 @@ RUST_BACKTRACE=1 output here
 
 ## Environment
 
-- holys3 version (`holys3 --version`):
+- s3grep version (`s3grep --version`):
 - OS / arch:
 - Rust toolchain (`rustc --version`):
 - S3 service, region, and custom endpoint (if any):

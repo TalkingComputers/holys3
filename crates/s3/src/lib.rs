@@ -8,7 +8,7 @@ pub mod fetch;
 
 use anyhow::Context;
 use bytes::Bytes;
-use holys3_core::{
+use s3grep_core::{
     decode_requested_body, BlobStore, Corpus, DocAddress, DocFetcher, DocId, DocumentBody,
     SourceObject,
 };
@@ -44,9 +44,9 @@ pub fn build_index_key(prefix: &str, name: &str) -> String {
 
 pub fn build_index_namespace(prefix: &str) -> String {
     if prefix.is_empty() {
-        ".holys3".into()
+        ".s3grep".into()
     } else {
-        format!("{}.holys3", list_prefix(prefix))
+        format!("{}.s3grep", list_prefix(prefix))
     }
 }
 
@@ -73,7 +73,7 @@ pub struct S3BlobStore {
     client: S3Client,
     bucket: String,
     root: String,
-    progress: Option<holys3_core::ProgressSender>,
+    progress: Option<s3grep_core::ProgressSender>,
 }
 
 impl S3BlobStore {
@@ -90,7 +90,7 @@ impl S3BlobStore {
         }
     }
 
-    pub fn set_progress(&mut self, progress: holys3_core::ProgressSender) {
+    pub fn set_progress(&mut self, progress: s3grep_core::ProgressSender) {
         self.progress = Some(progress);
     }
 
@@ -105,7 +105,7 @@ impl S3BlobStore {
 
     fn blob_context(&self, name: &str) -> String {
         format!(
-            "index blob s3://{}/{} not found — run `holys3 index` first",
+            "index blob s3://{}/{} not found — run `s3grep index` first",
             self.bucket,
             self.build_key(name)
         )
@@ -116,7 +116,7 @@ struct S3StreamingPut {
     upload: Option<client::StreamingUpload>,
 }
 
-impl holys3_core::StreamingPut for S3StreamingPut {
+impl s3grep_core::StreamingPut for S3StreamingPut {
     fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.upload
             .as_mut()
@@ -160,7 +160,7 @@ impl BlobStore for S3BlobStore {
     fn put_streaming<'a>(
         &'a self,
         name: &str,
-    ) -> anyhow::Result<Box<dyn holys3_core::StreamingPut + 'a>> {
+    ) -> anyhow::Result<Box<dyn s3grep_core::StreamingPut + 'a>> {
         Ok(Box::new(S3StreamingPut {
             upload: Some(self.client.start_streaming_upload(
                 &self.bucket,
@@ -427,7 +427,7 @@ impl DocFetcher for S3Fetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use holys3_core::{DocAddress, DocFetcher, SourceEncoding};
+    use s3grep_core::{DocAddress, DocFetcher, SourceEncoding};
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn grouped_archive_fetches_once_and_warm_cache_avoids_origin() {
-        let body = holys3_core::testutil::encode::zip(&[("a.log", b"alpha"), ("b.log", b"beta")]);
+        let body = s3grep_core::testutil::encode::zip(&[("a.log", b"alpha"), ("b.log", b"beta")]);
         let (endpoint, server) = start_body_server(body.clone());
         let client = S3Client::connect_static(
             "us-east-1".into(),
@@ -529,17 +529,17 @@ mod tests {
 
     #[test]
     fn index_keys_preserve_prefix() {
-        assert_eq!(build_index_key("", "CURRENT"), ".holys3/CURRENT");
+        assert_eq!(build_index_key("", "CURRENT"), ".s3grep/CURRENT");
         assert_eq!(
             build_index_key("root//path/", "/builds/1/footer.bin"),
-            "root//path/.holys3/builds/1/footer.bin"
+            "root//path/.s3grep/builds/1/footer.bin"
         );
-        assert!(is_index_key("root/path", "root/path/.holys3/CURRENT"));
+        assert!(is_index_key("root/path", "root/path/.s3grep/CURRENT"));
         assert!(!is_index_key(
             "root/path",
-            "root/path/child/.holys3/segments.bin"
+            "root/path/child/.s3grep/segments.bin"
         ));
-        assert!(!is_index_key("root/path", "root/path/.holys3-data/log"));
+        assert!(!is_index_key("root/path", "root/path/.s3grep-data/log"));
         assert!(!is_index_key("root/path", "root/path/file.txt"));
     }
 

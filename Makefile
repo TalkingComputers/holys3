@@ -5,8 +5,8 @@ BENCH_SIZE=4096
 BENCH_ITERATIONS=5
 BENCH_WARMUP=1
 BENCH_CONCURRENCY=64
-MINIO_ENV=env -u AWS_PROFILE AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin HOLYS3_BENCH_BUCKET=holys3-bench HOLYS3_BENCH_REGION=us-east-1 HOLYS3_BENCH_ENDPOINT=http://127.0.0.1:9000
-XBENCH=cargo run --locked --release -p holys3-bench --
+MINIO_ENV=env -u AWS_PROFILE AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin S3GREP_BENCH_BUCKET=s3grep-bench S3GREP_BENCH_REGION=us-east-1 S3GREP_BENCH_ENDPOINT=http://127.0.0.1:9000
+XBENCH=cargo run --locked --release -p s3grep-bench --
 
 .PHONY: check package bench bench-micro bench-s3 bench-minio bench-prose
 
@@ -21,17 +21,17 @@ check:
 	typos
 
 package:
-	cargo package --locked -p holys3-core
-	cargo package --locked -p holys3-query --config 'patch.crates-io.holys3-core.path="crates/core"'
-	cargo package --locked -p holys3-index --config 'patch.crates-io.holys3-core.path="crates/core"' --config 'patch.crates-io.holys3-query.path="crates/query"'
-	cargo package --locked -p holys3-s3 --config 'patch.crates-io.holys3-core.path="crates/core"'
-	cargo package --locked -p holys3 --config 'patch.crates-io.holys3-core.path="crates/core"' --config 'patch.crates-io.holys3-index.path="crates/index"' --config 'patch.crates-io.holys3-s3.path="crates/s3"'
-	cargo package --locked -p holys3-bench --config 'patch.crates-io.holys3-core.path="crates/core"' --config 'patch.crates-io.holys3-index.path="crates/index"' --config 'patch.crates-io.holys3-s3.path="crates/s3"'
+	cargo package --locked -p s3grep-core
+	cargo package --locked -p s3grep-query --config 'patch.crates-io.s3grep-core.path="crates/core"'
+	cargo package --locked -p s3grep-index --config 'patch.crates-io.s3grep-core.path="crates/core"' --config 'patch.crates-io.s3grep-query.path="crates/query"'
+	cargo package --locked -p s3grep-s3 --config 'patch.crates-io.s3grep-core.path="crates/core"'
+	cargo package --locked -p s3grep --config 'patch.crates-io.s3grep-core.path="crates/core"' --config 'patch.crates-io.s3grep-index.path="crates/index"' --config 'patch.crates-io.s3grep-s3.path="crates/s3"'
+	cargo package --locked -p s3grep-bench --config 'patch.crates-io.s3grep-core.path="crates/core"' --config 'patch.crates-io.s3grep-index.path="crates/index"' --config 'patch.crates-io.s3grep-s3.path="crates/s3"'
 
 bench: bench-micro
 
 bench-micro:
-	cargo bench --locked -p holys3-index
+	cargo bench --locked -p s3grep-index
 
 bench-prose:
 	$(XBENCH) seed --seed $(BENCH_SEED) --objects 1000 --size 65536 --corpus prose
