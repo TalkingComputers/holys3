@@ -58,7 +58,10 @@ arrow-json-58 = { package = "arrow-json", version = "58.0.0" }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# No panic = "abort": search isolates verifier panics with catch_unwind and
+# the fetch driver maps worker panics to errors — both need unwinding — and
+# unwinding runs Drop, which aborts in-flight multipart uploads and removes
+# temp files instead of stranding them in the user's bucket.
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }
