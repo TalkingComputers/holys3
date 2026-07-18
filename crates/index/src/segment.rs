@@ -291,8 +291,10 @@ fn parse_root_source(bytes: &[u8]) -> Option<SourceIdentity> {
     let (format, rest) = postcard::take_from_bytes::<u32>(bytes).ok()?;
     // Only formats that actually shipped postcard roots: random corruption
     // that happens to decode must not fabricate a mismatched identity and
-    // wrongly refuse a rebuild. 12 introduced this root layout.
-    if !(12..=INDEX_FORMAT + 8).contains(&format) {
+    // wrongly refuse a rebuild. 12 introduced this root layout; a root from
+    // a FUTURE format (downgraded binary) skips the check — corruption
+    // resistance beats covering an unsupported downgrade path.
+    if !(12..=INDEX_FORMAT).contains(&format) {
         return None;
     }
     let (source, _) = postcard::take_from_bytes::<SourceIdentity>(rest).ok()?;
