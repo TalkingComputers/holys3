@@ -286,7 +286,7 @@ enum RootState {
 /// Leading fields of every root format ever shipped: (format, source).
 /// Parses the prefix even when the full root does not, so incompatible
 /// roots keep their source-identity guarantee. `None` (pre-postcard bytes,
-/// true corruption) skips the check rather than mis-asserting.
+/// true corruption) skips the check rather than asserting wrongly.
 fn parse_root_source(bytes: &[u8]) -> Option<SourceIdentity> {
     let (format, rest) = postcard::take_from_bytes::<u32>(bytes).ok()?;
     // Only formats that actually shipped postcard roots: random corruption
@@ -437,7 +437,7 @@ pub fn update_index(
                 Vec::new()
             }
             RootState::Unreadable(reason, root_bytes) => {
-                // The full root is unparseable (old format, corruption) but
+                // The full root is unparsable (old format, corruption) but
                 // its leading fields have been layout-stable across every
                 // format: enforce source identity when they parse, and
                 // inventory the prefix so the rebuild can sweep blobs the
