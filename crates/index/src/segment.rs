@@ -446,7 +446,7 @@ pub fn update_index(
                     anyhow::ensure!(
                         old_source == *source,
                         "index was built for {old_source}, which does not match requested source {source}; \
-                         delete the index location or point --index elsewhere"
+                         use --rebuild to replace it or point --index elsewhere"
                     );
                 }
                 stale_inventory = inventory_stale_blobs(store);
