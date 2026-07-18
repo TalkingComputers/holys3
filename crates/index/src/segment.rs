@@ -406,8 +406,12 @@ pub fn update_index(
         },
     };
     let existing = if rebuild {
-        if let RootState::Loaded(list) = root {
-            replaced = list.segments;
+        match root {
+            RootState::Loaded(list) => replaced = list.segments,
+            // An unreadable root has no SegmentMeta to feed collect_garbage,
+            // so the pre-build inventory is the only way its blobs get swept.
+            RootState::Unreadable(..) => stale_inventory = inventory_stale_blobs(store),
+            RootState::Absent => {}
         }
         Vec::new()
     } else {
@@ -439,7 +443,7 @@ pub fn update_index(
                          delete the index location or point --index elsewhere"
                     );
                 }
-                stale_inventory = store.list_blobs().unwrap_or(None);
+                stale_inventory = inventory_stale_blobs(store);
                 eprintln!("note: {reason}; rebuilding from scratch");
                 forced = true;
                 Vec::new()
@@ -669,6 +673,22 @@ pub fn update_index(
         compacted,
         up_to_date: false,
     })
+}
+
+/// Enumerate blobs ahead of a rebuild over an unreadable root. `Ok(None)`
+/// means the backend cannot enumerate (test doubles) and the sweep quietly
+/// degrades; a listing failure is loud — the leak it would hide has no
+/// other signal and no retry once the root is readable again.
+fn inventory_stale_blobs(store: &dyn BlobStore) -> Option<Vec<String>> {
+    match store.list_blobs() {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to list existing index blobs; old-format blobs will not be swept: {error:#}"
+            );
+            None
+        }
+    }
 }
 
 fn meta_blobs(meta: &SegmentMeta) -> Vec<String> {
