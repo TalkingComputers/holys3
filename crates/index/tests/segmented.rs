@@ -816,6 +816,16 @@ fn gzipped_objects_and_prefix_pruning() -> Result<()> {
 
 #[test]
 fn corrupt_cache_self_heals_and_stale_segments_evict() -> Result<()> {
+    // This test asserts IMMEDIATE eviction; production spares recently
+    // touched directories so a concurrent update's scratch survives (#42).
+    std::env::set_var("SEAGREP_EVICTION_GRACE_SECS", "0");
+    let _reset = DeferReset;
+    struct DeferReset;
+    impl Drop for DeferReset {
+        fn drop(&mut self) {
+            std::env::remove_var("SEAGREP_EVICTION_GRACE_SECS");
+        }
+    }
     let store_dir = tempfile::tempdir()?;
     let cache = tempfile::tempdir()?;
     let mut bucket = Bucket::default();
