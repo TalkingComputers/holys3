@@ -393,13 +393,27 @@ pub fn update_index(
     let (root, root_version) = load_segment_list(store)?;
     // Reject a source mismatch before strategy detection: auto-selection may
     // sample the target, and an invalid index/target pairing must fail
-    // without any fetching.
-    if let (RootState::Loaded(list), false) = (&root, rebuild) {
-        anyhow::ensure!(
-            list.source == *source,
-            "index was built for {}, not {source}; use --rebuild to replace it",
-            list.source
-        );
+    // without any fetching. An unreadable root (old format, corruption)
+    // keeps the guarantee through its leading layout-stable fields; `None`
+    // (prefix unparsable) skips the check rather than asserting wrongly.
+    match (&root, rebuild) {
+        (RootState::Loaded(list), false) => {
+            anyhow::ensure!(
+                list.source == *source,
+                "index was built for {}, not {source}; use --rebuild to replace it",
+                list.source
+            );
+        }
+        (RootState::Unreadable(_, root_bytes), false) => {
+            if let Some(old_source) = parse_root_source(root_bytes) {
+                anyhow::ensure!(
+                    old_source == *source,
+                    "index was built for {old_source}, which does not match requested source {source}; \
+                     use --rebuild to replace it or point --index elsewhere"
+                );
+            }
+        }
+        _ => {}
     }
     let strategy = match strategy {
         Some(strategy) => strategy,
@@ -436,19 +450,10 @@ pub fn update_index(
                 eprintln!("note: no existing index; building from scratch");
                 Vec::new()
             }
-            RootState::Unreadable(reason, root_bytes) => {
-                // The full root is unparsable (old format, corruption) but
-                // its leading fields have been layout-stable across every
-                // format: enforce source identity when they parse, and
-                // inventory the prefix so the rebuild can sweep blobs the
-                // new root does not reference (#59).
-                if let Some(old_source) = parse_root_source(&root_bytes) {
-                    anyhow::ensure!(
-                        old_source == *source,
-                        "index was built for {old_source}, which does not match requested source {source}; \
-                         use --rebuild to replace it or point --index elsewhere"
-                    );
-                }
+            RootState::Unreadable(reason, _) => {
+                // Source identity was already enforced above; inventory the
+                // store so the rebuild can sweep blobs the new root does not
+                // reference (#59).
                 stale_inventory = inventory_stale_blobs(store);
                 eprintln!("note: {reason}; rebuilding from scratch");
                 forced = true;
