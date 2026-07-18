@@ -1210,8 +1210,8 @@ mod tests {
             fn wants_hit_keys(&self) -> bool {
                 false
             }
-            fn on_doc(&self, _key: &str, _doc: &search::DocResult<'_>) -> Result<search::SinkFlow> {
-                Ok(search::SinkFlow::Continue)
+            fn on_doc(&self, _key: &str, _doc: &DocResult<'_>) -> Result<SinkFlow> {
+                Ok(SinkFlow::Continue)
             }
         }
         let c = MemCorpus::new(

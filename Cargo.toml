@@ -4,7 +4,7 @@ members = ["crates/core", "crates/query", "crates/index", "crates/s3", "crates/c
 
 [workspace.package]
 edition = "2021"
-version = "0.6.1"
+version = "0.7.0"
 rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
 description = "Indexed regex search for private S3 buckets"

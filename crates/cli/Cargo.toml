@@ -18,9 +18,9 @@ name = "seagrep"
 path = "src/main.rs"
 
 [dependencies]
-seagrep-core = { path = "../core", version = "0.6.1" }
-seagrep-index = { path = "../index", version = "0.6.1" }
-seagrep-s3 = { path = "../s3", version = "0.6.1" }
+seagrep-core = { path = "../core", version = "0.7.0" }
+seagrep-index = { path = "../index", version = "0.7.0" }
+seagrep-s3 = { path = "../s3", version = "0.7.0" }
 anyhow.workspace = true
 base64 = "0.22.1"
 globset = "0.4.18"
