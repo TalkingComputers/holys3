@@ -90,7 +90,7 @@ fn write_compaction_run(
     let map = TermMap::open(terms, strategy)?;
     let mut file = tempfile::NamedTempFile::new()?;
     let mut writer = BufWriter::new(file.as_file_mut());
-    map.visit(|gram, packed| {
+    map.visit(|gram, packed, len| {
         write_live_entry(
             &mut writer,
             strategy,
@@ -100,6 +100,7 @@ fn write_compaction_run(
             remap,
             gram,
             packed,
+            len,
         )
     })?;
     writer.flush()?;
@@ -117,6 +118,7 @@ fn write_live_entry(
     remap: &[Option<DocId>],
     gram: &[u8],
     packed: u64,
+    len: Option<u64>,
 ) -> Result<()> {
     let (offset, count) = crate::eval::unpack_posting(packed);
     anyhow::ensure!(count > 0, "term map contains an empty posting list");
@@ -143,7 +145,13 @@ fn write_live_entry(
         count <= doc_count,
         "term map posting count exceeds its segment document count"
     );
-    let len = crate::posting_block_len(count, doc_count);
+    let len = match strategy {
+        Strategy::Sparse => len.context("sparse entries must carry a posting length")?,
+        Strategy::Trigram => {
+            anyhow::ensure!(len.is_none(), "trigram lengths derive from counts");
+            crate::posting_block_len(count, doc_count)
+        }
+    };
     let end = offset
         .checked_add(len)
         .context("term map posting length overflows")?;
@@ -154,8 +162,12 @@ fn write_live_entry(
     let block = postings
         .get(usize::try_from(offset)?..usize::try_from(end)?)
         .context("truncated postings.bin during merge")?;
+    let decoded = match strategy {
+        Strategy::Sparse => crate::delta_blocks::decode_delta_blocks(block, count, doc_count)?,
+        Strategy::Trigram => crate::decode_posting_block(block, count, doc_count)?,
+    };
     let mut ids = Vec::new();
-    for id in crate::decode_posting_block(block, count, doc_count)? {
+    for id in decoded {
         if let Some(id) = remap
             .get(usize::try_from(id)?)
             .context("posting document ID is out of bounds")?
@@ -328,6 +340,7 @@ mod tests {
             &[Some(0), Some(1), None, Some(2)],
             b"ninebytes",
             packed,
+            None,
         )
         .expect_err("oversized gram must error");
         assert!(error.to_string().contains("gram width"), "{error:#}");
@@ -346,6 +359,7 @@ mod tests {
             &[Some(0), Some(1), None, Some(2)],
             b"abc",
             packed,
+            None,
         )
         .expect("singleton entry");
         assert!(!writer.is_empty(), "remapped singleton must be written");
@@ -361,6 +375,7 @@ mod tests {
             &[Some(0), Some(1), None, Some(2)],
             b"abc",
             out_of_bounds,
+            None,
         )
         .is_err());
     }

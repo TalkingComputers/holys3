@@ -1124,7 +1124,9 @@ impl SegmentedReader {
                 _ => None,
             };
             let lookup = |gram: &[u8]| match &remote_values {
-                Some(values) => Ok(values.get(&seagrep_core::hash_ngram(gram)).copied()),
+                Some(values) => Ok(values
+                    .get(&seagrep_core::hash_ngram(gram))
+                    .map(|&(packed, len)| crate::eval::TermValue { packed, len })),
                 None => segment.map.get(gram),
             };
             let ids = self.classify_index_result(candidates_with(
@@ -1188,7 +1190,7 @@ impl SegmentedReader {
                     needed
                         .iter()
                         .zip(&ranges)
-                        .map(|((&offset, &count), &(range_offset, range_len))| {
+                        .map(|((&offset, &(count, _)), &(range_offset, range_len))| {
                             let covering = table.blocks_covering(range_offset, range_len)?;
                             let single = covering.len() == 1;
                             let mut assembled = Vec::new();
@@ -1212,7 +1214,14 @@ impl SegmentedReader {
                                 Some(bytes) => bytes,
                                 None => assembled.into(),
                             };
-                            let decoded = crate::decode_posting_block(&bytes, count, doc_count)?;
+                            let decoded = match self.strategy {
+                                Strategy::Sparse => crate::delta_blocks::decode_delta_blocks(
+                                    &bytes, count, doc_count,
+                                )?,
+                                Strategy::Trigram => {
+                                    crate::decode_posting_block(&bytes, count, doc_count)?
+                                }
+                            };
                             Ok((offset, decoded))
                         })
                         .collect()
@@ -1269,19 +1278,19 @@ impl SegmentedReader {
 }
 
 fn posting_ranges(
-    needed: &std::collections::BTreeMap<u64, u32>,
+    needed: &std::collections::BTreeMap<u64, (u32, u64)>,
     doc_count: u32,
     postings_data_len: u64,
 ) -> Result<Vec<(u64, u64)>> {
     needed
         .iter()
-        .map(|(&offset, &count)| {
+        .map(|(&offset, &(count, len))| {
             anyhow::ensure!(count > 0, "term map contains an empty posting list");
             anyhow::ensure!(
                 count <= doc_count,
                 "term map posting count exceeds its segment document count"
             );
-            let len = crate::posting_block_len(count, doc_count);
+            anyhow::ensure!(len > 0, "term map posting length is zero");
             let end = offset
                 .checked_add(len)
                 .context("term map posting length overflows")?;
@@ -1991,7 +2000,7 @@ mod tests {
 
     #[test]
     fn posting_ranges_reject_impossible_metadata() {
-        let needed = std::collections::BTreeMap::from([(0, 2)]);
+        let needed = std::collections::BTreeMap::from([(0u64, (2u32, 1u64))]);
         assert!(posting_ranges(&needed, 1, 1).is_err());
     }
 

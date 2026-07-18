@@ -50,39 +50,45 @@ fn read_varint(block: &[u8], cursor: &mut usize) -> Result<u64> {
     }
 }
 
-/// Decode every (hash, value) entry of a block in order. The first entry
-/// stores its hash raw (big-endian); the rest store deltas from the previous
-/// hash. A value is one tag varint whose low bit marks a singleton — the
-/// tag's high bits are then the doc id — else the high bits are the posting
-/// count and a second varint carries the offset.
+/// Decode every (hash, value, len) entry of a block in order. The first
+/// entry stores its hash raw (big-endian); the rest store deltas from the
+/// previous hash. A value is one tag varint whose low bit marks a singleton
+/// — the tag's high bits are then the doc id — else the high bits are the
+/// posting count, a second varint carries the offset, and a third the
+/// encoded posting-list byte length (delta blocks make it underivable).
 pub(crate) fn for_each_entry(
     block: &[u8],
-    mut visit: impl FnMut(u64, u64) -> Result<()>,
+    mut visit: impl FnMut(u64, u64, Option<u64>) -> Result<()>,
 ) -> Result<()> {
     anyhow::ensure!(block.len() > 8, "sparse table block is too short");
     let mut cursor = 8usize;
     let mut hash = u64::from_be_bytes(block[..8].try_into().expect("eight bytes"));
-    let read_value = |cursor: &mut usize| -> Result<u64> {
+    let read_value = |cursor: &mut usize| -> Result<(u64, Option<u64>)> {
         let tag = read_varint(block, cursor)?;
         if tag & 1 == 1 {
-            return crate::eval::pack_posting(tag >> 1, 1);
+            return Ok((crate::eval::pack_posting(tag >> 1, 1)?, None));
         }
         // The writer always folds count == 1 into an odd tag; accepting the
         // two-varint spelling too would give singletons a second encoding.
         anyhow::ensure!(tag >> 1 != 1, "sparse table singleton is not canonical");
         let offset = read_varint(block, cursor)?;
-        crate::eval::pack_posting(offset, usize::try_from(tag >> 1)?)
+        let len = read_varint(block, cursor)?;
+        anyhow::ensure!(len > 0, "sparse table posting length is zero");
+        Ok((
+            crate::eval::pack_posting(offset, usize::try_from(tag >> 1)?)?,
+            Some(len),
+        ))
     };
-    let value = read_value(&mut cursor)?;
-    visit(hash, value)?;
+    let (value, len) = read_value(&mut cursor)?;
+    visit(hash, value, len)?;
     while cursor < block.len() {
         let delta = read_varint(block, &mut cursor)?;
         anyhow::ensure!(delta > 0, "sparse table hashes must be strictly ascending");
         hash = hash
             .checked_add(delta)
             .context("sparse table hash delta overflows")?;
-        let value = read_value(&mut cursor)?;
-        visit(hash, value)?;
+        let (value, len) = read_value(&mut cursor)?;
+        visit(hash, value, len)?;
     }
     Ok(())
 }
@@ -114,7 +120,7 @@ impl<W: Write> SparseTableWriter<W> {
         })
     }
 
-    pub(crate) fn insert(&mut self, hash: u64, value: u64) -> Result<()> {
+    pub(crate) fn insert(&mut self, hash: u64, value: u64, len: Option<u64>) -> Result<()> {
         anyhow::ensure!(
             self.last_hash.is_none_or(|last| hash > last),
             "sparse table inserts must be ascending and unique"
@@ -134,10 +140,14 @@ impl<W: Write> SparseTableWriter<W> {
         // offset.
         let (offset, count) = crate::eval::unpack_posting(value);
         if count == 1 {
+            anyhow::ensure!(len.is_none(), "singletons have no posting list");
             write_varint(&mut self.block, (offset << 1) | 1);
         } else {
+            let len = len.context("multi-doc sparse entries must carry a posting length")?;
+            anyhow::ensure!(len > 0, "posting length must be positive");
             write_varint(&mut self.block, u64::from(count) << 1);
             write_varint(&mut self.block, offset);
+            write_varint(&mut self.block, len);
         }
         self.last_hash = Some(hash);
         self.entry_count += 1;
@@ -314,7 +324,7 @@ impl SparseTableIndex {
 pub(crate) fn lookup_in_block(block: &[u8], hash: u64) -> Result<Option<u64>> {
     let mut found = None;
     let mut done = false;
-    for_each_entry(block, |entry_hash, value| {
+    for_each_entry(block, |entry_hash, value, _len| {
         if done {
             return Ok(());
         }
@@ -381,7 +391,9 @@ mod tests {
     fn streamed_tail_hash_matches_file_derived_tail_hash() {
         let mut writer = SparseTableWriter::new(Vec::new()).unwrap();
         for entry in 0..20_000u64 {
-            writer.insert(entry * 3 + 1, entry).unwrap();
+            writer
+                .insert(entry * 3 + 1, entry, test_len(entry))
+                .unwrap();
         }
         let (bytes, streamed) = writer.finish().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -394,10 +406,17 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
+    /// Arbitrary test values need the same length rule as the build path:
+    /// singletons carry none, everything else some positive length.
+    fn test_len(value: u64) -> Option<u64> {
+        let (_, count) = crate::eval::unpack_posting(value);
+        (count != 1).then_some(u64::from(count.max(1)))
+    }
+
     fn build(entries: &[(u64, u64)]) -> Vec<u8> {
         let mut writer = SparseTableWriter::new(Vec::new()).unwrap();
         for (hash, value) in entries {
-            writer.insert(*hash, *value).unwrap();
+            writer.insert(*hash, *value, test_len(*value)).unwrap();
         }
         writer.finish().unwrap().0
     }
@@ -443,7 +462,7 @@ mod tests {
         for block in &index.blocks {
             let start = usize::try_from(block.offset).unwrap();
             let end = start + usize::try_from(block.len).unwrap();
-            for_each_entry(&bytes[start..end], |hash, value| {
+            for_each_entry(&bytes[start..end], |hash, value, _len| {
                 walked.push((hash, value));
                 Ok(())
             })
@@ -487,30 +506,30 @@ mod tests {
         // space must error through pack_posting, not wrap.
         let mut block = 10u64.to_be_bytes().to_vec();
         write_varint(&mut block, (1u64 << 41) | 1);
-        assert!(for_each_entry(&block, |_, _| Ok(())).is_err());
+        assert!(for_each_entry(&block, |_, _, _| Ok(())).is_err());
 
         // Raw block: the two-varint spelling of count == 1 is not canonical
         // and must be rejected, not decoded as a singleton.
         let mut block = 10u64.to_be_bytes().to_vec();
         write_varint(&mut block, 1 << 1);
         write_varint(&mut block, 300);
-        let error = for_each_entry(&block, |_, _| Ok(())).expect_err("non-canonical singleton");
+        let error = for_each_entry(&block, |_, _, _| Ok(())).expect_err("non-canonical singleton");
         assert!(error.to_string().contains("canonical"), "{error:#}");
 
         // Raw block: a varint running past ten bytes must error, not spin.
         let mut block = 10u64.to_be_bytes().to_vec();
         block.extend_from_slice(&[0xff; 10]);
-        assert!(for_each_entry(&block, |_, _| Ok(())).is_err());
+        assert!(for_each_entry(&block, |_, _, _| Ok(())).is_err());
     }
 
     #[test]
     fn rejects_unsorted_and_duplicate_inserts() {
         let mut writer = SparseTableWriter::new(Vec::new()).unwrap();
-        writer.insert(10, 0).unwrap();
-        assert!(writer.insert(10, 1).is_err(), "duplicate hash");
+        writer.insert(10, 0, test_len(0)).unwrap();
+        assert!(writer.insert(10, 1, test_len(1)).is_err(), "duplicate hash");
         let mut writer = SparseTableWriter::new(Vec::new()).unwrap();
-        writer.insert(10, 0).unwrap();
-        assert!(writer.insert(9, 1).is_err(), "descending hash");
+        writer.insert(10, 0, test_len(0)).unwrap();
+        assert!(writer.insert(9, 1, test_len(1)).is_err(), "descending hash");
     }
 
     #[test]

@@ -4,7 +4,7 @@ from collections import defaultdict
 H3 = os.environ.get("SEAGREP_BIN", "target/release/seagrep")
 ENV = {**os.environ, "AWS_ACCESS_KEY_ID": "minioadmin", "AWS_SECRET_ACCESS_KEY": "minioadmin"}
 ENV.pop("AWS_PROFILE", None)
-SG_ARGS = ["s3://parity", "--index", "s3://holys3-index/parity-idx",
+SG_ARGS = ["s3://parity", "--index", "s3://seagrep-index/parity-idx",
            "--region", "us-east-1", "--endpoint", "http://127.0.0.1:9000",
            "--index-region", "us-east-1", "--index-endpoint", "http://127.0.0.1:9000"]
 

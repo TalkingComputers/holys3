@@ -558,12 +558,22 @@ fn insert_posting_file<W: Write>(
     // Singleton grams inline their doc id in the offset field and write no
     // posting block at all: `count == 1` is the tag.
     if let [id] = ids.as_slice() {
-        builder.insert(gram, eval::pack_posting(u64::from(*id), 1)?)?;
+        builder.insert(gram, eval::pack_posting(u64::from(*id), 1)?, None)?;
         return Ok(());
     }
     let mut block = Vec::new();
-    encode_posting_block(&mut block, &ids, doc_count);
-    builder.insert(gram, eval::pack_posting(*offset, ids.len())?)?;
+    let len = match strategy {
+        Strategy::Sparse => {
+            // delta blocks: length is not derivable, the dictionary carries it
+            crate::delta_blocks::encode_delta_blocks(&ids, &mut block);
+            Some(block.len() as u64)
+        }
+        Strategy::Trigram => {
+            encode_posting_block(&mut block, &ids, doc_count);
+            None
+        }
+    };
+    builder.insert(gram, eval::pack_posting(*offset, ids.len())?, len)?;
     postings.write_all(&block)?;
     *offset += u64::try_from(block.len())?;
     Ok(())

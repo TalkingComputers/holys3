@@ -2,6 +2,7 @@
 //! Index construction and snapshot-backed search readers.
 
 mod build;
+mod delta_blocks;
 mod eval;
 mod format;
 mod pack;
@@ -56,7 +57,7 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older seagrep must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 18;
+const INDEX_FORMAT: u32 = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -249,10 +250,10 @@ pub(crate) fn decode_posting_block(bytes: &[u8], count: u32, doc_count: u32) -> 
 /// fetch every needed posting block via `fetch_blocks`, evaluate purely.
 /// Returns local ids in `0..doc_count`.
 pub(crate) fn candidates_with(
-    get: impl Fn(&[u8]) -> Result<Option<u64>>,
+    get: impl Fn(&[u8]) -> Result<Option<eval::TermValue>>,
     doc_count: u32,
     q: &Query,
-    fetch_blocks: impl FnOnce(&BTreeMap<u64, u32>) -> Result<BTreeMap<u64, Vec<DocId>>>,
+    fetch_blocks: impl FnOnce(&BTreeMap<u64, (u32, u64)>) -> Result<BTreeMap<u64, Vec<DocId>>>,
 ) -> Result<Vec<DocId>> {
     let resolved = eval::resolve(q, doc_count, &get)?;
     let mut needed = BTreeMap::new();
@@ -857,9 +858,9 @@ mod tests {
     #[test]
     fn trigram_term_map_shards_prefixes() {
         let mut builder = terms::TermBuilder::new(Strategy::Trigram, true, Vec::new()).unwrap();
-        builder.insert(&[0x00, 0x01, 0x02], 1).unwrap();
-        builder.insert(&[0x7f, 0x03, 0x04], 2).unwrap();
-        builder.insert(&[0xff, 0x05, 0x06], 3).unwrap();
+        builder.insert(&[0x00, 0x01, 0x02], 1, None).unwrap();
+        builder.insert(&[0x7f, 0x03, 0x04], 2, None).unwrap();
+        builder.insert(&[0xff, 0x05, 0x06], 3, None).unwrap();
         let (bytes, _) = builder.finish().unwrap();
         assert_eq!(&bytes[..8], b"SGTERM01");
     }

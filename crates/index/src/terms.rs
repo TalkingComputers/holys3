@@ -139,17 +139,23 @@ impl<W: Write> TermBuilder<W> {
         }
     }
 
-    pub(crate) fn insert(&mut self, gram: &[u8], value: u64) -> Result<()> {
+    pub(crate) fn insert(&mut self, gram: &[u8], value: u64, len: Option<u64>) -> Result<()> {
         match &mut self.inner {
-            TermBuilderInner::Single(builder) => builder.insert(gram, value)?,
+            TermBuilderInner::Single(builder) => {
+                anyhow::ensure!(len.is_none(), "trigram lengths derive from counts");
+                builder.insert(gram, value)?;
+            }
             TermBuilderInner::Sparse(builder) => {
                 let hash = u64::from_be_bytes(
                     gram.try_into()
                         .context("sparse term key must be an 8-byte hash")?,
                 );
-                builder.insert(hash, value)?;
+                builder.insert(hash, value, len)?;
             }
-            TermBuilderInner::Trigram(builder) => builder.insert(gram, value)?,
+            TermBuilderInner::Trigram(builder) => {
+                anyhow::ensure!(len.is_none(), "trigram lengths derive from counts");
+                builder.insert(gram, value)?;
+            }
         }
         Ok(())
     }
@@ -170,7 +176,7 @@ impl<W: Write> TermBuilder<W> {
 
 /// Lazily decoded dictionary blocks: block id -> its (hash, value) entries.
 type DecodedBlocks =
-    std::sync::Mutex<rapidhash::RapidHashMap<usize, std::sync::Arc<Vec<(u64, u64)>>>>;
+    std::sync::Mutex<rapidhash::RapidHashMap<usize, std::sync::Arc<Vec<(u64, u64, Option<u64>)>>>>;
 
 pub(crate) enum TermMap {
     Single(fst::Map<memmap2::Mmap>),
@@ -237,9 +243,10 @@ impl TermMap {
 
     /// A lookup failure is a corrupt dictionary and must surface as an error:
     /// mapping it to "gram absent" would silently drop matching documents.
-    pub(crate) fn get(&self, gram: &[u8]) -> Result<Option<u64>> {
+    pub(crate) fn get(&self, gram: &[u8]) -> Result<Option<crate::eval::TermValue>> {
+        use crate::eval::TermValue;
         match self {
-            Self::Single(map) => Ok(map.get(gram)),
+            Self::Single(map) => Ok(map.get(gram).map(|packed| TermValue { packed, len: None })),
             Self::Sparse {
                 index,
                 bytes,
@@ -266,8 +273,8 @@ impl TermMap {
                                 bytes
                                     .get(start..end)
                                     .context("sparse block extends beyond the dictionary")?,
-                                |hash, value| {
-                                    entries.push((hash, value));
+                                |hash, value, len| {
+                                    entries.push((hash, value, len));
                                     Ok(())
                                 },
                             )?;
@@ -278,16 +285,19 @@ impl TermMap {
                     }
                 };
                 Ok(entries
-                    .binary_search_by_key(&hash, |(entry, _)| *entry)
+                    .binary_search_by_key(&hash, |(entry, _, _)| *entry)
                     .ok()
-                    .map(|at| entries[at].1))
+                    .map(|at| TermValue {
+                        packed: entries[at].1,
+                        len: entries[at].2,
+                    }))
             }
             Self::SparseRemote { .. } => {
                 unreachable!("remote sparse lookups are resolved by the reader per query")
             }
-            Self::Trigram(maps) if gram.len() == 3 => {
-                Ok(maps[usize::from(gram[0])].get(&gram[1..]))
-            }
+            Self::Trigram(maps) if gram.len() == 3 => Ok(maps[usize::from(gram[0])]
+                .get(&gram[1..])
+                .map(|packed| TermValue { packed, len: None })),
             Self::Trigram(_) => Ok(None),
         }
     }
@@ -302,12 +312,15 @@ impl TermMap {
         }
     }
 
-    pub(crate) fn visit(&self, mut visit: impl FnMut(&[u8], u64) -> Result<()>) -> Result<()> {
+    pub(crate) fn visit(
+        &self,
+        mut visit: impl FnMut(&[u8], u64, Option<u64>) -> Result<()>,
+    ) -> Result<()> {
         match self {
             Self::Single(map) => {
                 let mut stream = map.stream();
                 while let Some((gram, value)) = stream.next() {
-                    visit(gram, value)?;
+                    visit(gram, value, None)?;
                 }
             }
             Self::SparseRemote { .. } => {
@@ -322,8 +335,8 @@ impl TermMap {
                     let raw = bytes
                         .get(start..end)
                         .context("sparse table block is out of bounds")?;
-                    crate::sparse_table::for_each_entry(raw, |hash, value| {
-                        visit(&hash.to_be_bytes(), value)
+                    crate::sparse_table::for_each_entry(raw, |hash, value, len| {
+                        visit(&hash.to_be_bytes(), value, len)
                     })?;
                 }
             }
@@ -335,7 +348,7 @@ impl TermMap {
                     while let Some((suffix, value)) = stream.next() {
                         anyhow::ensure!(suffix.len() == 2, "trigram suffix has invalid length");
                         gram[1..].copy_from_slice(suffix);
-                        visit(&gram, value)?;
+                        visit(&gram, value, None)?;
                     }
                 }
             }
@@ -347,6 +360,11 @@ impl TermMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn term_test_len(value: u64) -> Option<u64> {
+        let (_, count) = crate::eval::unpack_posting(value);
+        (count != 1).then_some(u64::from(count.max(1)))
+    }
 
     // Compaction round-trips dictionaries through visit() -> insert():
     // whatever key bytes visit emits must be accepted, in order, by a fresh
@@ -362,7 +380,9 @@ mod tests {
         entries.sort_unstable();
         let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
         for (hash, value) in &entries {
-            builder.insert(&hash.to_be_bytes(), *value).unwrap();
+            builder
+                .insert(&hash.to_be_bytes(), *value, term_test_len(*value))
+                .unwrap();
         }
         let (bytes, _) = builder.finish().unwrap();
 
@@ -374,7 +394,7 @@ mod tests {
         let map = TermMap::open(mmap, Strategy::Sparse).unwrap();
 
         let mut rebuilt = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
-        map.visit(|key, value| rebuilt.insert(key, value))
+        map.visit(|key, value, len| rebuilt.insert(key, value, len))
             .expect("visit output must feed a new builder in order");
         let (rebuilt_bytes, _) = rebuilt.finish().unwrap();
         assert_eq!(bytes, rebuilt_bytes, "round trip must be byte-identical");
@@ -401,7 +421,9 @@ mod tests {
         // collided entry carries a count-2 union list.
         let union = crate::eval::pack_posting(0, 2).unwrap();
         let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
-        builder.insert(&hash.to_be_bytes(), union).unwrap();
+        builder
+            .insert(&hash.to_be_bytes(), union, term_test_len(union))
+            .unwrap();
         let (bytes, _) = builder.finish().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("terms.fst");
@@ -409,10 +431,10 @@ mod tests {
         let mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&path).unwrap()) }
             .unwrap();
         let map = TermMap::open(mmap, Strategy::Sparse).unwrap();
-        assert_eq!(map.get(a).expect("lookup"), Some(union));
+        assert_eq!(map.get(a).expect("lookup").map(|v| v.packed), Some(union));
         assert_eq!(
-            map.get(a).expect("lookup"),
-            map.get(b).expect("lookup"),
+            map.get(a).expect("lookup").map(|v| v.packed),
+            map.get(b).expect("lookup").map(|v| v.packed),
             "both grams must resolve to the merged entry"
         );
 
@@ -420,7 +442,9 @@ mod tests {
         // A separate file: Windows refuses to rewrite a mapped file.
         let singleton = crate::eval::pack_posting(7, 1).unwrap();
         let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
-        builder.insert(&hash.to_be_bytes(), singleton).unwrap();
+        builder
+            .insert(&hash.to_be_bytes(), singleton, None)
+            .unwrap();
         let (bytes, _) = builder.finish().unwrap();
         let singleton_path = dir.path().join("terms-singleton.fst");
         std::fs::write(&singleton_path, &bytes).unwrap();
@@ -429,7 +453,10 @@ mod tests {
         }
         .unwrap();
         let map = TermMap::open(mmap, Strategy::Sparse).unwrap();
-        assert_eq!(map.get(b).expect("lookup"), Some(singleton));
+        assert_eq!(
+            map.get(b).expect("lookup").map(|v| v.packed),
+            Some(singleton)
+        );
     }
 
     // A block that fails to decode is a corrupt dictionary: get() must
@@ -445,7 +472,9 @@ mod tests {
         entries.sort_unstable();
         let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
         for (hash, value) in &entries {
-            builder.insert(&hash.to_be_bytes(), *value).unwrap();
+            builder
+                .insert(&hash.to_be_bytes(), *value, term_test_len(*value))
+                .unwrap();
         }
         let (mut bytes, _) = builder.finish().unwrap();
 

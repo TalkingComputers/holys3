@@ -69,7 +69,7 @@ pub(crate) fn fetch_query_gram_values(
     q: &Query,
     cache_dir: &std::path::Path,
     seg_id: &str,
-) -> Result<rapidhash::RapidHashMap<u64, u64>> {
+) -> Result<rapidhash::RapidHashMap<u64, (u64, Option<u64>)>> {
     let mut hashes = Vec::new();
     collect_gram_hashes(q, &mut hashes);
     hashes.sort_unstable();
@@ -126,12 +126,12 @@ pub(crate) fn fetch_query_gram_values(
     // Decode each block exactly once and bisect the decoded entries per
     // gram; scanning the raw block per gram would repeat the full decode
     // for every hash that lands in the same block.
-    let mut decoded: rapidhash::RapidHashMap<usize, Vec<(u64, u64)>> =
+    let mut decoded: rapidhash::RapidHashMap<usize, Vec<(u64, u64, Option<u64>)>> =
         rapidhash::RapidHashMap::default();
     for (block_id, raw) in &blocks {
         let mut entries = Vec::new();
-        crate::sparse_table::for_each_entry(raw, |hash, value| {
-            entries.push((hash, value));
+        crate::sparse_table::for_each_entry(raw, |hash, value, len| {
+            entries.push((hash, value, len));
             Ok(())
         })?;
         decoded.insert(*block_id, entries);
@@ -143,8 +143,8 @@ pub(crate) fn fetch_query_gram_values(
         let entries = decoded
             .get(&block_id)
             .context("sparse term table block was not fetched")?;
-        if let Ok(at) = entries.binary_search_by_key(&hash, |(entry, _)| *entry) {
-            values.insert(hash, entries[at].1);
+        if let Ok(at) = entries.binary_search_by_key(&hash, |(entry, _, _)| *entry) {
+            values.insert(hash, (entries[at].1, entries[at].2));
         }
     }
     Ok(values)
@@ -164,6 +164,11 @@ fn collect_gram_hashes(q: &Query, out: &mut Vec<u64>) {
 
 #[cfg(test)]
 mod tests {
+    fn value_len(value: u64) -> Option<u64> {
+        let (_, count) = crate::eval::unpack_posting(value);
+        (count != 1).then_some(u64::from(count.max(1)))
+    }
+
     use super::*;
     use crate::sparse_table::SparseTableWriter;
     use seagrep_core::LocalBlobStore;
@@ -237,7 +242,7 @@ mod tests {
         pairs.sort_unstable();
         let mut writer = SparseTableWriter::new(Vec::new()).unwrap();
         for (hash, value) in &pairs {
-            writer.insert(*hash, *value).unwrap();
+            writer.insert(*hash, *value, value_len(*value)).unwrap();
         }
         let (bytes, _) = writer.finish().unwrap();
         let index = SparseTableIndex::parse(bytes.len() as u64, &bytes).unwrap();
@@ -300,7 +305,11 @@ mod tests {
                 .iter()
                 .find(|(entry, _)| *entry == hash)
                 .map(|(_, value)| *value);
-            assert_eq!(values.get(&hash).copied(), expected, "gram {gram:?}");
+            assert_eq!(
+                values.get(&hash).map(|(packed, _)| *packed),
+                expected,
+                "gram {gram:?}"
+            );
         }
     }
 
