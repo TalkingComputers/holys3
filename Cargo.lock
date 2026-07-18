@@ -3325,7 +3325,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "seagrep"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -3349,7 +3349,7 @@ dependencies = [
 
 [[package]]
 name = "seagrep-bench"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3366,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "seagrep-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "seagrep-index"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3431,7 +3431,7 @@ dependencies = [
 
 [[package]]
 name = "seagrep-query"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "regex-syntax",
@@ -3440,7 +3440,7 @@ dependencies = [
 
 [[package]]
 name = "seagrep-s3"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "aws-config",

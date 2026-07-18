@@ -15,3 +15,4 @@ crates/xbench/runs/local-index/
 
 # local planning scratch, never tracked
 /docs/
+.commandcode/

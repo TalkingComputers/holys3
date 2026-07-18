@@ -6,6 +6,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-17
+
+### Removed
+
+- Recognition of the pre-rename `.holys3` index namespace; `.seagrep` is the only index namespace.
+
+## [0.6.0] - 2026-07-17
+
 ### Added
 
 - `--index` accepts an independent prefixed S3 location, with separate `--index-region` and `--index-endpoint` controls for read-only source buckets and cross-region or S3-compatible index storage.
