@@ -282,10 +282,21 @@ impl BlobStore for LocalBlobStore {
                 }
             };
             for entry in entries {
-                let path = entry
-                    .with_context(|| format!("listing an entry of {}", dir.display()))?
-                    .path();
-                if path.is_dir() {
+                let entry =
+                    entry.with_context(|| format!("listing an entry of {}", dir.display()))?;
+                // `file_type` does not follow symlinks, and symlinks are
+                // skipped outright: this store never creates them, following
+                // a directory link would let the sweep reach outside the
+                // store (or loop forever on `link -> .`), and naming one
+                // would make the sweep unlink it.
+                let file_type = entry
+                    .file_type()
+                    .with_context(|| format!("inspecting an entry of {}", dir.display()))?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let path = entry.path();
+                if file_type.is_dir() {
                     stack.push(path);
                 } else if let Ok(relative) = path.strip_prefix(&self.root) {
                     names.push(relative.to_string_lossy().replace('\\', "/"));
@@ -563,6 +574,23 @@ mod tests {
         let mut bytes = Vec::new();
         output.read_to_end(&mut bytes)?;
         assert_eq!(bytes, b"file-backed index blob");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_blobs_does_not_follow_directory_symlinks() -> AnyhowResult<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::fs::write(outside.path().join("victim.bin"), b"not ours")?;
+        let store = LocalBlobStore::new(root.path());
+        store.put("segments/a/postings.bin", b"blob")?;
+        // An escape link must not expose the target's files as deletable
+        // names, and a cyclic link must not recurse forever.
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape"))?;
+        std::os::unix::fs::symlink(root.path(), root.path().join("cycle"))?;
+        let names = store.list_blobs()?.expect("local stores enumerate blobs");
+        assert_eq!(names, vec!["segments/a/postings.bin".to_owned()]);
         Ok(())
     }
 
