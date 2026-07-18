@@ -16,3 +16,8 @@ crates/xbench/runs/local-index/
 # local planning scratch, never tracked
 /docs/
 .commandcode/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/Cargo.lock

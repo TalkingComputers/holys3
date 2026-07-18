@@ -1,0 +1,48 @@
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "seconds per target"
+        default: "900"
+
+permissions: {}
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decode_source]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Run fuzzer
+        run: |
+          seconds="${{ github.event.inputs.seconds || '900' }}"
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cp fuzz/seeds/${{ matrix.target }}/* fuzz/corpus/${{ matrix.target }}/
+          cargo fuzz run ${{ matrix.target }} -- -max_total_time="$seconds" -timeout=30 -rss_limit_mb=4096
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

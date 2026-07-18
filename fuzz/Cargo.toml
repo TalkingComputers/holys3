@@ -1,0 +1,26 @@
+[package]
+name = "seagrep-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+anyhow = "1"
+bytes = "1"
+seagrep-core = { path = "../crates/core" }
+
+[[bin]]
+name = "decode_source"
+path = "fuzz_targets/decode_source.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+[workspace]
