@@ -80,7 +80,10 @@ jobs:
         run: |
           cargo build --locked --release -p seagrep
           bytes=$(stat -c %s target/release/seagrep)
-          limit=33554432
+          # 36 MiB: measured 32.7 MiB on Linux with unwinding enabled
+          # (unwind tables cost ~2.5 MiB over panic=abort, which the
+          # panic-isolation and Drop-cleanup design requires).
+          limit=37748736
           printf 'release binary: %s bytes (limit %s)\n' "$bytes" "$limit"
           test "$bytes" -le "$limit"
 
