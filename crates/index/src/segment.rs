@@ -295,9 +295,11 @@ fn parse_root_source(bytes: &[u8]) -> Option<SourceIdentity> {
     if !(12..=INDEX_FORMAT + 8).contains(&format) {
         return None;
     }
-    postcard::take_from_bytes::<SourceIdentity>(rest)
-        .ok()
-        .map(|(source, _)| source)
+    let (source, _) = postcard::take_from_bytes::<SourceIdentity>(rest).ok()?;
+    // Real roots validate on write and on load; a decodable-but-invalid
+    // identity is corruption and must not block the rebuild.
+    source.validate().ok()?;
+    Some(source)
 }
 
 /// A failing store is an error so a transient outage can never silently
@@ -671,7 +673,14 @@ pub fn update_index(
             // the rebuild anyway; the truly orphaned ones stay, bounded and
             // harmless. Segment blobs are random-keyed per build and can
             // never be referenced again.
-            if blob == "segments.bin" || blob.starts_with("packs/") || kept.contains(&blob) {
+            // segments.lock is the local put_if flock target: unlinking it
+            // while another indexer holds the lock lets a third run create a
+            // fresh inode and take a second, useless lock.
+            if blob == "segments.bin"
+                || blob == "segments.lock"
+                || blob.starts_with("packs/")
+                || kept.contains(&blob)
+            {
                 continue;
             }
             if store.delete(&blob).is_err() {
