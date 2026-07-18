@@ -731,14 +731,18 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let code = code.to_owned();
         let thread = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            // The deadline only bounds how long a FAILING run hangs; a
+            // passing run exits at the second request. 10s flaked under
+            // loaded hosts (#52) — parallel builds stretched the client's
+            // scheduling past it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
             let mut requests = 0;
             while requests < 2 && std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_nonblocking(false).unwrap();
                         stream
-                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .set_read_timeout(Some(Duration::from_secs(30)))
                             .unwrap();
                         let mut request = [0u8; 8192];
                         let _ = stream.read(&mut request).unwrap();
