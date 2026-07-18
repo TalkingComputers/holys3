@@ -288,7 +288,13 @@ enum RootState {
 /// roots keep their source-identity guarantee. `None` (pre-postcard bytes,
 /// true corruption) skips the check rather than mis-asserting.
 fn parse_root_source(bytes: &[u8]) -> Option<SourceIdentity> {
-    let (_format, rest) = postcard::take_from_bytes::<u32>(bytes).ok()?;
+    let (format, rest) = postcard::take_from_bytes::<u32>(bytes).ok()?;
+    // Only formats that actually shipped postcard roots: random corruption
+    // that happens to decode must not fabricate a mismatched identity and
+    // wrongly refuse a rebuild. 12 introduced this root layout.
+    if !(12..=INDEX_FORMAT + 8).contains(&format) {
+        return None;
+    }
     postcard::take_from_bytes::<SourceIdentity>(rest)
         .ok()
         .map(|(source, _)| source)
@@ -653,12 +659,20 @@ pub fn update_index(
             list.segments.iter().flat_map(meta_blobs).collect();
         let mut removed_blobs = 0usize;
         for blob in inventory {
-            if blob != "segments.bin" && !kept.contains(&blob) {
-                if store.delete(&blob).is_err() {
-                    eprintln!("warning: failed to delete old-format index blob {blob}");
-                } else {
-                    removed_blobs += 1;
-                }
+            // Packs are content-addressed and therefore RE-REFERENCEABLE: a
+            // concurrent run could republish identical content under the
+            // same key between our publish and this sweep, and deleting it
+            // would break that run's root. Old packs are mostly reused by
+            // the rebuild anyway; the truly orphaned ones stay, bounded and
+            // harmless. Segment blobs are random-keyed per build and can
+            // never be referenced again.
+            if blob == "segments.bin" || blob.starts_with("packs/") || kept.contains(&blob) {
+                continue;
+            }
+            if store.delete(&blob).is_err() {
+                eprintln!("warning: failed to delete old-format index blob {blob}");
+            } else {
+                removed_blobs += 1;
             }
         }
         if removed_blobs > 0 {

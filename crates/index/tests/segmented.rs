@@ -2201,7 +2201,9 @@ fn incompatible_roots_sweep_their_blobs_and_keep_identity() -> Result<()> {
 
     // fabricate an incompatible root: valid (format, source) prefix, then
     // bytes no current parser accepts
-    let mut fake_root = postcard::to_allocvec(&(7u32, test_source()))?;
+    // format 12 was the first shipped postcard root; the identity gate
+    // only trusts prefixes claiming a format that actually existed
+    let mut fake_root = postcard::to_allocvec(&(12u32, test_source()))?;
     fake_root.extend_from_slice(b"\xff\xff\xff not a segment list");
     store.put("segments.bin", &fake_root)?;
     store.put(
