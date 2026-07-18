@@ -21,7 +21,6 @@ seagrep -i 'timeout' s3://my-logs -g '*.gz' -C2 --since 6h
 
 [Installation](#installation) •
 [Usage](#usage) •
-[How it works](#how-it-works) •
 [Performance](#performance) •
 [Architecture](ARCHITECTURE.md) •
 [Changelog](CHANGELOG.md)
@@ -184,46 +183,8 @@ decoded. Expansion is capped at 64 GiB per physical source, 100,000 archive
 members, and four nested format layers; oversized decoded output spills to
 private temporary files instead of memory.
 
-## How it works
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/how-it-works-dark.svg">
-  <img alt="How seagrep works: the index pipeline decodes objects and writes a trigram index plus content snapshot to S3; the search pipeline plans grams, fetches posting and pack ranges, and verifies with a real regex" src=".github/assets/how-it-works-light.svg">
-</picture>
-
-1. The query planner extracts gram constraints from the regex: prefix, suffix,
-   and required inner literals (Cox-style), so `.*ERROR.*` prunes instead of
-   scanning.
-2. The term dictionary (an FST) maps each gram to its postings offset and doc
-   count, so selectivity is known before any fetch. Absent grams answer
-   instantly, and only the rarest grams per AND-group are fetched at all.
-3. Posting blocks are read with coalesced ranged GETs, and candidates are
-   pruned by key scope before any content is fetched.
-4. Candidate bytes come from immutable content-addressed packs: independent
-   128 KiB zstd frames, each SHA-256 verified before decompression. Adjacent
-   frames merge into bounded range GETs, and the final regex runs on a worker
-   pool, printing unordered across objects like rg's parallel mode.
-
-The index itself is a set of immutable, content-addressed segments. Each root
-is a complete snapshot of one generation; the root pointer swap is a
-compare-and-swap via S3 conditional writes, so a racing concurrent index run
-fails loudly instead of corrupting anything. Small segments merge
-automatically, a segment is physically repacked once dead documents or bytes
-reach 25% (or on `--purge-deleted`), and replaced segments are
-garbage-collected. Every blob carries a length and SHA-256 contract, and
-readers reject truncation or corruption before using it.
-
-The root also records the indexed endpoint, bucket, and prefix. A search may
-select a narrower subtree of that source, but a broader or different source
-fails rather than returning an incomplete result. `--rebuild` re-indexes from
-scratch and is required to repurpose an index location. Two gram strategies
-exist: `trigram` for structured content (logs, code, JSON) and `sparse` for
-natural-language prose. A fresh build samples the decoded content and picks
-one automatically; `--strategy` overrides, and switching rebuilds
-automatically.
-
-[ARCHITECTURE.md](ARCHITECTURE.md) covers the crate boundaries, segment
-format, and memory bounds in detail.
+How the index and query pipelines work — crate boundaries, segment format,
+memory bounds — is covered in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Performance
 
@@ -232,7 +193,7 @@ process wall time including credential handling):
 
 | corpus                     | source   | objects | build   | index size   | repeat query |
 | -------------------------- | -------- | ------: | ------- | ------------ | -----------: |
-| Project Gutenberg books    | 10.65 GB |  20,016 | 8.5 min | ≈1.0× source |       0.33 s |
+| Project Gutenberg books    | 10.65 GB |  20,016 | 9.4 min | 0.89× source |       0.31 s |
 | Linux kernel source mirror | 1.56 GB  |  95,843 | 2.2 min | 0.39× source |       0.56 s |
 
 One caveat worth knowing: candidates are whole documents, so a common token

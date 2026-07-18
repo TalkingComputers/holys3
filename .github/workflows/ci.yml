@@ -199,8 +199,7 @@ jobs:
       - name: Check whether the crates are published
         id: published
         # Semver against the registry is meaningless before the first
-        # publish (and impossible across the holys3 -> seagrep rename);
-        # the check re-arms itself the day seagrep lands on crates.io.
+        # publish; the check re-arms itself once seagrep is on crates.io.
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' -A 'seagrep-ci (github.com/TalkingComputers)' https://crates.io/api/v1/crates/seagrep)
           echo "published=$([ "$code" = "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
