@@ -15,7 +15,7 @@ use crate::{
 };
 use anyhow::Result;
 use seagrep_index::SegmentedReader;
-use seagrep_s3::build_index_namespace;
+use seagrep_s3::{build_index_namespace, list_prefix};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -42,10 +42,14 @@ fn read_map() -> BTreeMap<String, RememberedIndex> {
         .unwrap_or_default()
 }
 
-fn source_key(source: &S3Source) -> String {
+/// Map key for one source prefix. Normalized with `list_prefix` like the
+/// source identity, so `logs` and `logs/` name the same source.
+fn source_key(source: &S3Source, prefix: &str) -> String {
     format!(
         "{}\u{0}{}\u{0}{}",
-        source.endpoint, source.bucket, source.prefix
+        source.endpoint,
+        source.bucket,
+        list_prefix(prefix.trim_matches('/'))
     )
 }
 
@@ -61,10 +65,11 @@ pub(crate) fn remember_index(source: &S3Source, index: &IndexArgs) {
         index_endpoint: index.index_endpoint.clone(),
     };
     let mut map = read_map();
-    if map.get(&source_key(source)) == Some(&entry) {
+    let key = source_key(source, &source.prefix);
+    if map.get(&key) == Some(&entry) {
         return;
     }
-    map.insert(source_key(source), entry);
+    map.insert(key, entry);
     let Ok(path) = map_path() else {
         return;
     };
@@ -171,7 +176,13 @@ pub(crate) fn discover_fallback(
             }
         }
     }
-    if let Some(entry) = read_map().remove(&source_key(source)) {
+    // An --index recorded for a parent prefix covers this narrower search
+    // too, so the lookup walks the same chain as the `.seagrep` probes.
+    let map = read_map();
+    let remembered = std::iter::once(source.prefix.clone())
+        .chain(parent_chain(&source.prefix))
+        .find_map(|prefix| map.get(&source_key(source, &prefix)).cloned());
+    if let Some(entry) = remembered {
         // A remembered entry is a hint, never load-bearing: if it is stale,
         // unreachable, or no longer covers this source, fall through so the
         // caller reports the original missing-index error.
