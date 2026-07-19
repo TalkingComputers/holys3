@@ -42,7 +42,7 @@ investigation to minimize fetched bytes, not query count:
 
 ## Flag map (rg-compatible)
 
-```
+```text
 -i / -S            case-insensitive / smart case
 -F                 literal string (no regex)
 -e PAT             multiple patterns (OR); required if PAT starts with -

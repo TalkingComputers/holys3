@@ -34,12 +34,34 @@ fn map_path() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// A missing cache file is the normal first-run state and stays quiet;
+/// an unreadable or corrupt one is reported so the remembered-location
+/// fallback never degrades silently.
 fn read_map() -> BTreeMap<String, RememberedIndex> {
-    map_path()
-        .ok()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    let Ok(path) = map_path() else {
+        return BTreeMap::new();
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(error) => {
+            eprintln!(
+                "note: cannot read remembered-index cache {}: {error}",
+                path.display()
+            );
+            return BTreeMap::new();
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(map) => map,
+        Err(error) => {
+            eprintln!(
+                "note: ignoring corrupt remembered-index cache {}: {error}",
+                path.display()
+            );
+            BTreeMap::new()
+        }
+    }
 }
 
 /// Map key for one source prefix. Normalized with `list_prefix` like the
