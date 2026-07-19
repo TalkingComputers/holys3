@@ -179,13 +179,14 @@ pub(crate) fn discover_fallback(
     // An --index recorded for a parent prefix covers this narrower search
     // too, so the lookup walks the same chain as the `.seagrep` probes.
     let map = read_map();
-    let remembered = std::iter::once(source.prefix.clone())
-        .chain(parent_chain(&source.prefix))
-        .find_map(|prefix| map.get(&source_key(source, &prefix)).cloned());
-    if let Some(entry) = remembered {
+    for prefix in std::iter::once(source.prefix.clone()).chain(parent_chain(&source.prefix)) {
+        let Some(entry) = map.get(&source_key(source, &prefix)).cloned() else {
+            continue;
+        };
         // A remembered entry is a hint, never load-bearing: if it is stale,
-        // unreachable, or no longer covers this source, fall through so the
-        // caller reports the original missing-index error.
+        // unreachable, or no longer covers this source, keep walking the
+        // chain and ultimately fall through so the caller reports the
+        // original missing-index error.
         let args = IndexArgs {
             location: Some(entry.location),
             index_region: entry.index_region,
