@@ -80,7 +80,10 @@ variables, shared profiles, IAM Identity Center (SSO) sessions,
 temporary credentials refresh automatically.
 
 First build the index. It lives in the bucket, under `<prefix>/.seagrep/` by
-default:
+default, and searches find it automatically: at the searched prefix, at any
+parent prefix (an index built at `s3://b/logs` serves a search of
+`s3://b/logs/2026/07`, scoped to that subtree), or at a location remembered
+from an earlier `--index` run on the same machine:
 
 ```sh
 AWS_PROFILE=my-sso seagrep index s3://my-log-bucket/prod --region us-east-2
@@ -106,6 +109,13 @@ Exit codes are rg's: `0` match, `1` no match, `2` error. Patterns are
 line-oriented like rg: `^` and `$` anchor at every line, and a literal `\n` in
 a pattern is an error. To search for a pattern that collides with a subcommand
 name, use `-e`: `seagrep -e index s3://bucket`.
+
+`--files` lists every indexed key without a pattern (honoring the same
+scoping flags), so you can see a corpus's shape before searching it:
+
+```sh
+seagrep --files s3://my-logs -g '*.gz' | head
+```
 
 Searches can be scoped by key or by time:
 

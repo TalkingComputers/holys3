@@ -17,8 +17,8 @@ pub use search::{
     search_collect, search_streaming, DocResult, KeyScope, MatchSink, NullSink, SinkFlow,
 };
 pub use segment::{
-    update_index, CorpusFactory, IndexChanged, SegmentedReader, SourceIdentity, UpdateOptions,
-    UpdateReport,
+    update_index, CorpusFactory, IndexChanged, IndexMissing, SegmentedReader, SourceIdentity,
+    UpdateOptions, UpdateReport,
 };
 
 #[cfg(test)]

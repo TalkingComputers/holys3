@@ -342,6 +342,20 @@ pub struct UpdateOptions {
     pub progress: Option<ProgressSender>,
 }
 
+/// The index location has no index at all (no `segments.bin`). Typed so
+/// callers can distinguish "nothing here" from a broken or foreign index —
+/// e.g. to fall back to discovering the index elsewhere.
+#[derive(Debug)]
+pub struct IndexMissing;
+
+impl std::fmt::Display for IndexMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no index found — run `seagrep index` first")
+    }
+}
+
+impl std::error::Error for IndexMissing {}
+
 #[derive(Debug)]
 pub struct IndexChanged;
 
@@ -1085,7 +1099,7 @@ impl SegmentedReader {
         let (bytes, root_version) = store
             .get_versioned("segments.bin")
             .context("reading segments.bin")?
-            .context("no index found — run `seagrep index` first")?;
+            .ok_or(IndexMissing)?;
         let list = parse_segment_list(&bytes)
             .context("index is not usable as-is; run `seagrep index` to rebuild")?;
         if let Some(source) = source {

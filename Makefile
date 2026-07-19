@@ -25,7 +25,7 @@ package:
 	cargo package --locked -p seagrep-query --config 'patch.crates-io.seagrep-core.path="crates/core"'
 	cargo package --locked -p seagrep-index --config 'patch.crates-io.seagrep-core.path="crates/core"' --config 'patch.crates-io.seagrep-query.path="crates/query"'
 	cargo package --locked -p seagrep-s3 --config 'patch.crates-io.seagrep-core.path="crates/core"'
-	cargo package --locked -p seagrep --config 'patch.crates-io.seagrep-core.path="crates/core"' --config 'patch.crates-io.seagrep-index.path="crates/index"' --config 'patch.crates-io.seagrep-s3.path="crates/s3"'
+	cargo package --locked -p seagrep --config 'patch.crates-io.seagrep-core.path="crates/core"' --config 'patch.crates-io.seagrep-query.path="crates/query"' --config 'patch.crates-io.seagrep-index.path="crates/index"' --config 'patch.crates-io.seagrep-s3.path="crates/s3"'
 	cargo package --locked -p seagrep-bench --config 'patch.crates-io.seagrep-core.path="crates/core"' --config 'patch.crates-io.seagrep-index.path="crates/index"' --config 'patch.crates-io.seagrep-s3.path="crates/s3"'
 
 bench: bench-micro

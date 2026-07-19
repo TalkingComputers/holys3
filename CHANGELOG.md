@@ -6,6 +6,18 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-19
+
+### Added
+
+- Index auto-discovery: a search without `--index` finds the index at the
+  searched prefix, at any parent prefix (scoped to the searched subtree),
+  or at a location remembered from an earlier `--index` run.
+- `--files` lists every indexed key for a target from the index alone,
+  honoring `-g`, `--key-prefix`, `--key-regex`, and `--since`/`--until`.
+- `skills/seagrep/SKILL.md`: an agent-facing skill covering discovery, the
+  cheap-first workflow, the cost model, and turn economy.
+
 ## [0.8.0] - 2026-07-18
 
 ### Changed

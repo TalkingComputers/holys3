@@ -1,3 +1,4 @@
+mod discover;
 mod globs;
 mod index;
 mod json;
@@ -14,8 +15,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use scope::Scope;
 use seagrep_core::{BlobStore, MatchOptions, Strategy};
 use seagrep_index::{
-    search_streaming, update_index, IndexChanged, KeyScope, MatchSink, SearchStats,
-    SegmentedReader, SourceIdentity, UpdateOptions,
+    search_streaming, update_index, IndexChanged, IndexMissing, IndexReader, KeyScope, MatchSink,
+    SearchStats, SegmentedReader, SourceIdentity, UpdateOptions,
 };
 use seagrep_s3::{
     build_fetch_config, build_index_namespace, is_index_key, list_prefix, ObjectMeta, S3BlobStore,
@@ -96,16 +97,16 @@ struct ConnectArgs {
 }
 
 #[derive(clap::Args)]
-struct IndexArgs {
+pub(crate) struct IndexArgs {
     /// Index location (`s3://bucket/prefix`).
     #[arg(long = "index", value_name = "LOCATION")]
-    location: Option<String>,
+    pub(crate) location: Option<String>,
     /// AWS region for an s3:// index location.
     #[arg(long = "index-region", requires = "location")]
-    index_region: Option<String>,
+    pub(crate) index_region: Option<String>,
     /// Custom endpoint for an s3:// index location.
     #[arg(long = "index-endpoint", requires = "location")]
-    index_endpoint: Option<String>,
+    pub(crate) index_endpoint: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -147,6 +148,13 @@ struct SearchArgs {
     /// Print only the keys of matching objects.
     #[arg(short = 'l', long, conflicts_with_all = ["count", "count_matches", "json"])]
     files_with_matches: bool,
+    /// List every indexed object key for TARGET, without a pattern.
+    /// Respects -g, --key-prefix, --key-regex, --since, and --until.
+    #[arg(long, conflicts_with_all = [
+        "regexp", "files_with_matches", "count", "count_matches", "json",
+        "quiet", "max_count", "context", "after_context", "before_context",
+    ])]
+    files: bool,
     /// Print the count of matching lines per object.
     #[arg(
         short = 'c',
@@ -236,19 +244,19 @@ fn parse_s3_target(raw: &str) -> Result<S3Target> {
     })
 }
 
-struct S3Source {
-    client: S3Client,
-    endpoint: String,
-    bucket: String,
-    prefix: String,
+pub(crate) struct S3Source {
+    pub(crate) client: S3Client,
+    pub(crate) endpoint: String,
+    pub(crate) bucket: String,
+    pub(crate) prefix: String,
 }
 
-struct IndexStorage {
-    client: S3Client,
-    endpoint: String,
-    bucket: String,
-    root: String,
-    cache: PathBuf,
+pub(crate) struct IndexStorage {
+    pub(crate) client: S3Client,
+    pub(crate) endpoint: String,
+    pub(crate) bucket: String,
+    pub(crate) root: String,
+    pub(crate) cache: PathBuf,
 }
 
 impl IndexStorage {
@@ -339,7 +347,7 @@ fn is_same_s3_bucket(
     first_endpoint == second_endpoint && first_bucket == second_bucket
 }
 
-fn open_index_storage(
+pub(crate) fn open_index_storage(
     source: &S3Source,
     index: &IndexArgs,
     concurrency: usize,
@@ -423,7 +431,7 @@ fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
     Ok(value)
 }
 
-fn build_source_identity(source: &S3Source) -> SourceIdentity {
+pub(crate) fn build_source_identity(source: &S3Source) -> SourceIdentity {
     SourceIdentity::S3 {
         endpoint: source.endpoint.clone(),
         bucket: source.bucket.clone(),
@@ -620,6 +628,126 @@ fn search_with_reopen(
     }
 }
 
+/// Run the search; when the default index location is empty (and no
+/// --index was given), discover the index at a parent prefix or from the
+/// remembered-locations cache and retry once. Retrying with the same sink
+/// is safe: `IndexMissing` surfaces before any document is reported.
+fn execute_with_discovery(
+    source: &S3Source,
+    index: &mut IndexStorage,
+    index_args: &IndexArgs,
+    concurrency: usize,
+    execution: SearchExecution<'_>,
+    sink: &dyn MatchSink,
+) -> Result<SearchStats> {
+    let explicit_index = index_args.location.is_some();
+    match execute_search(source, index, execution, sink) {
+        Ok(stats) => {
+            if explicit_index {
+                discover::remember_index(source, index_args);
+            }
+            Ok(stats)
+        }
+        Err(error) if !explicit_index && error.is::<IndexMissing>() => {
+            match discover::discover_fallback(source, concurrency)? {
+                Some(found) => {
+                    *index = found;
+                    execute_search(source, index, execution, sink)
+                }
+                None => Err(error),
+            }
+        }
+        result => result,
+    }
+}
+
+/// `--files`: print every indexed key for TARGET, scope-filtered, sorted.
+/// Reads only the doc tables — no snapshot content is fetched.
+fn run_files(args: SearchArgs) -> Result<bool> {
+    let [target_raw] = <[String; 1]>::try_from(args.args)
+        .map_err(|_| anyhow::anyhow!("--files takes exactly one TARGET"))?;
+    let globs = globs::build_glob_filter(&args.glob)?;
+    let scope = Scope::from_args(
+        args.key_prefix,
+        args.key_regex,
+        args.since,
+        args.until,
+        globs,
+    )?;
+    let source = open_source(parse_s3_target(&target_raw)?, &args.connect)?;
+    let mut index = open_index_storage(&source, &args.index, args.connect.concurrency)?;
+    let identity = build_source_identity(&source);
+    let open = |index: &IndexStorage| {
+        SegmentedReader::open(index.store(), index.cache(), &identity).with_context(|| {
+            format!(
+                "index location: {} (default is the .seagrep namespace inside the searched bucket; pass --index if it lives elsewhere)",
+                index.location()
+            )
+        })
+    };
+    let reader = match open(&index) {
+        Err(error) if args.index.location.is_none() && error.is::<IndexMissing>() => {
+            match discover::discover_fallback(&source, args.connect.concurrency)? {
+                Some(found) => {
+                    index = found;
+                    open(&index)?
+                }
+                None => return Err(error),
+            }
+        }
+        result => result?,
+    };
+    let target_prefix = list_prefix(&source.prefix);
+    let candidate_prefix =
+        pick_candidate_prefix(&target_prefix, scope.as_ref().and_then(Scope::key_prefix));
+    // Retrying after a concurrent index publish is safe: no key has been
+    // printed yet. Mirrors search_with_reopen on the search path.
+    let candidates = match reader.candidate_docs(&seagrep_query::Query::All, candidate_prefix) {
+        Err(error) if error.is::<IndexChanged>() => {
+            let reader = open(&index)?;
+            reader.candidate_docs(&seagrep_query::Query::All, candidate_prefix)
+        }
+        result => result,
+    }?;
+    let mut keys: Vec<String> = candidates
+        .into_iter()
+        .map(|doc| doc.display_key)
+        .filter(|key| {
+            // candidate_prefix only prunes segments; enforce it per key,
+            // matching KeyScope::admits in the search path.
+            candidate_prefix.is_none_or(|prefix| key.starts_with(prefix))
+                && match scope.as_ref() {
+                    Some(scope) => {
+                        scope
+                            .key_prefix()
+                            .is_none_or(|prefix| key.starts_with(prefix))
+                            && scope.matches(key)
+                    }
+                    None => true,
+                }
+        })
+        .collect();
+    keys.sort_unstable();
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for key in &keys {
+        if let Err(error) = writeln!(out, "{key}") {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                break;
+            }
+            return Err(error.into());
+        }
+    }
+    if let Some(scope) = &scope {
+        scope.report();
+    }
+    if args.index.location.is_some() {
+        discover::remember_index(&source, &args.index);
+    }
+    Ok(!keys.is_empty())
+}
+
 /// Returns whether anything matched (drives the exit code).
 fn run_search(args: SearchArgs) -> Result<bool> {
     let (patterns, target_raw) = split_pattern_target(args.args, args.regexp)?;
@@ -670,7 +798,8 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     let color = printer::resolve_color(args.color, is_tty);
 
     let source = open_source(parse_s3_target(&target_raw)?, &args.connect)?;
-    let index = open_index_storage(&source, &args.index, args.connect.concurrency)?;
+    let mut index = open_index_storage(&source, &args.index, args.connect.concurrency)?;
+    let concurrency = args.connect.concurrency;
     let stats_line = args.stats && !args.json;
     let execution = SearchExecution {
         pattern: &pattern,
@@ -681,7 +810,14 @@ fn run_search(args: SearchArgs) -> Result<bool> {
 
     if args.quiet {
         let sink = printer::QuietSink::new(!args.stats);
-        let result = execute_search(&source, &index, execution, &sink);
+        let result = execute_with_discovery(
+            &source,
+            &mut index,
+            &args.index,
+            concurrency,
+            execution,
+            &sink,
+        );
         return match result {
             Ok(_) => Ok(sink.matched()),
             // rg's quiet error-mask: a found match wins over later errors
@@ -692,7 +828,14 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     if args.json {
         let started = std::time::Instant::now();
         let sink = json::JsonSink::new();
-        let stats = execute_search(&source, &index, execution, &sink)?;
+        let stats = execute_with_discovery(
+            &source,
+            &mut index,
+            &args.index,
+            concurrency,
+            execution,
+            &sink,
+        )?;
         sink.write_summary(&stats, started.elapsed())?;
         return Ok(stats.hit_count > 0);
     }
@@ -712,7 +855,14 @@ fn run_search(args: SearchArgs) -> Result<bool> {
             color,
         ))
     };
-    let stats = execute_search(&source, &index, execution, sink.as_ref())?;
+    let stats = execute_with_discovery(
+        &source,
+        &mut index,
+        &args.index,
+        concurrency,
+        execution,
+        sink.as_ref(),
+    )?;
     Ok(stats.hit_count > 0)
 }
 
@@ -752,17 +902,23 @@ fn run() -> Result<bool> {
             };
             let show_progress = !json && std::io::stderr().is_terminal();
             index::run_index(config, |cycle_rebuild| {
-                build_s3(
+                let result = build_s3(
                     &source,
                     &storage,
                     strategy,
                     cycle_rebuild,
                     purge_deleted,
                     show_progress,
-                )
+                )?;
+                // Remember per cycle, not after run_index returns: in watch
+                // mode that return only happens on shutdown, and concurrent
+                // searches should see the location once cycle 1 publishes.
+                discover::remember_index(&source, &index);
+                Ok(result)
             })?;
             Ok(true)
         }
+        None if cli.search.files => run_files(cli.search),
         None => run_search(cli.search),
     }
 }
@@ -781,7 +937,11 @@ fn main() -> std::process::ExitCode {
 /// Cache dir per (endpoint, bucket, prefix): readable bucket name plus a
 /// short hash so `a/b` vs `a__b` prefixes (or the same bucket name on two
 /// endpoints) can never share state.
-fn build_cache_dir(endpoint: Option<&str>, bucket: &str, prefix: &str) -> Result<PathBuf> {
+pub(crate) fn build_cache_dir(
+    endpoint: Option<&str>,
+    bucket: &str,
+    prefix: &str,
+) -> Result<PathBuf> {
     let mut path = seagrep_core::cache_home()?;
     path.push("seagrep");
     let scope = format!("{}\0{bucket}\0{prefix}", endpoint.unwrap_or(""));
