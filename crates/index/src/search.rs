@@ -306,10 +306,11 @@ pub fn search_streaming(
             excluded_objects: reader.excluded_objects(),
         });
     }
-    let query = seagrep_query::plan(pattern, reader.strategy())?;
+    let hir = seagrep_core::parse_pattern(pattern)?;
+    let query = seagrep_query::plan_hir(&hir, reader.strategy());
     let re = regex::bytes::Regex::new(pattern)?;
-    let whole_document = can_search_as_document(pattern)?;
-    let bounded_len = bounded_match_len(pattern)?;
+    let whole_document = can_search_as_document(&hir);
+    let bounded_len = bounded_match_len(&hir);
     let mut hits = Vec::new();
     let mut hit_count = 0usize;
     let mut candidates = 0usize;
@@ -441,7 +442,8 @@ mod tests {
         for pattern in ["needle", "missing", "x{16}needle", "", "needle|other"] {
             file.rewind().unwrap();
             let re = regex::bytes::Regex::new(pattern).unwrap();
-            let match_len = bounded_match_len(pattern).unwrap().unwrap();
+            let match_len =
+                bounded_match_len(&seagrep_core::parse_pattern(pattern).unwrap()).unwrap();
             assert_eq!(
                 has_bounded_reader_match(
                     &mut file,

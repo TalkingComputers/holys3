@@ -27,7 +27,8 @@ pub use grams::{
 };
 pub use grep::{
     bounded_match_len, can_search_as_document, grep_bytes, grep_bytes_fast, grep_doc,
-    has_line_match, has_line_match_fast, LineEvent, LineKind, MatchOptions, SubMatch,
+    has_line_match, has_line_match_fast, parse_pattern, LineEvent, LineKind, MatchOptions,
+    SubMatch,
 };
 pub use progress::{ProgressEvent, ProgressSender};
 pub use store::{

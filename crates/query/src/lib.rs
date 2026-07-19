@@ -91,13 +91,14 @@ fn hir_query(hir: &regex_syntax::hir::Hir, strategy: Strategy) -> Query {
 }
 
 pub fn plan(pattern: &str, strategy: Strategy) -> anyhow::Result<Query> {
-    // utf8(false) matches the verifier (regex::bytes): patterns like
-    // (?-u)\xff are valid there and must be plannable, not rejected
-    let hir = regex_syntax::ParserBuilder::new()
-        .utf8(false)
-        .build()
-        .parse(pattern)?;
-    Ok(hir_query(&hir, strategy))
+    Ok(plan_hir(&seagrep_core::parse_pattern(pattern)?, strategy))
+}
+
+/// Plan from an already-parsed pattern; the search path parses once with
+/// `seagrep_core::parse_pattern` and shares the Hir with the grep-mode
+/// analyses.
+pub fn plan_hir(hir: &regex_syntax::hir::Hir, strategy: Strategy) -> Query {
+    hir_query(hir, strategy)
 }
 
 #[cfg(test)]

@@ -185,23 +185,27 @@ pub fn has_line_match_fast(bytes: &[u8], re: &regex::bytes::Regex) -> bool {
         })
 }
 
-pub fn can_search_as_document(pattern: &str) -> anyhow::Result<bool> {
-    let hir = regex_syntax::ParserBuilder::new()
+/// The one place a pattern is parsed. `utf8(false)` matches the verifier
+/// (`regex::bytes`): patterns like `(?-u)\xff` are valid there and must
+/// parse here too, not be rejected. Planning and the grep-mode analyses
+/// below all consume this same Hir, so they can never disagree with each
+/// other about what the pattern means.
+pub fn parse_pattern(pattern: &str) -> anyhow::Result<regex_syntax::hir::Hir> {
+    Ok(regex_syntax::ParserBuilder::new()
         .utf8(false)
         .build()
-        .parse(pattern)?;
-    Ok(!needs_line_isolation(&hir))
+        .parse(pattern)?)
 }
 
-pub fn bounded_match_len(pattern: &str) -> anyhow::Result<Option<usize>> {
-    let hir = regex_syntax::ParserBuilder::new()
-        .utf8(false)
-        .build()
-        .parse(pattern)?;
-    if needs_line_isolation(&hir) || has_look(&hir) {
-        return Ok(None);
+pub fn can_search_as_document(hir: &regex_syntax::hir::Hir) -> bool {
+    !needs_line_isolation(hir)
+}
+
+pub fn bounded_match_len(hir: &regex_syntax::hir::Hir) -> Option<usize> {
+    if needs_line_isolation(hir) || has_look(hir) {
+        return None;
     }
-    Ok(hir.properties().maximum_len())
+    hir.properties().maximum_len()
 }
 
 fn has_look(hir: &regex_syntax::hir::Hir) -> bool {
@@ -407,9 +411,13 @@ mod tests {
 
     #[test]
     fn whole_document_fast_path_is_conservative_and_equivalent() {
-        assert!(can_search_as_document("(?m)^foo.*bar$").unwrap());
-        assert!(!can_search_as_document(r"foo\s+bar").unwrap());
-        assert!(!can_search_as_document(r"\Afoo").unwrap());
+        assert!(can_search_as_document(
+            &parse_pattern("(?m)^foo.*bar$").unwrap()
+        ));
+        assert!(!can_search_as_document(
+            &parse_pattern(r"foo\s+bar").unwrap()
+        ));
+        assert!(!can_search_as_document(&parse_pattern(r"\Afoo").unwrap()));
         for bytes in [
             b"foo\nbar\nfoo bar".as_slice(),
             b"foo\nbar\nfoo bar\n".as_slice(),
@@ -431,11 +439,23 @@ mod tests {
 
     #[test]
     fn bounded_match_lengths_exclude_unbounded_and_contextual_patterns() {
-        assert_eq!(bounded_match_len("needle").unwrap(), Some(6));
-        assert_eq!(bounded_match_len("a{2,5}").unwrap(), Some(5));
-        assert_eq!(bounded_match_len("a+").unwrap(), None);
-        assert_eq!(bounded_match_len(r"\bword\b").unwrap(), None);
-        assert_eq!(bounded_match_len("^word").unwrap(), None);
-        assert_eq!(bounded_match_len("line\\nnext").unwrap(), None);
+        assert_eq!(
+            bounded_match_len(&parse_pattern("needle").unwrap()),
+            Some(6)
+        );
+        assert_eq!(
+            bounded_match_len(&parse_pattern("a{2,5}").unwrap()),
+            Some(5)
+        );
+        assert_eq!(bounded_match_len(&parse_pattern("a+").unwrap()), None);
+        assert_eq!(
+            bounded_match_len(&parse_pattern(r"\bword\b").unwrap()),
+            None
+        );
+        assert_eq!(bounded_match_len(&parse_pattern("^word").unwrap()), None);
+        assert_eq!(
+            bounded_match_len(&parse_pattern("line\\nnext").unwrap()),
+            None
+        );
     }
 }

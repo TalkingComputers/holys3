@@ -6,6 +6,15 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-18
+
+### Changed
+
+- Patterns are parsed once per search: `seagrep_core::parse_pattern` produces
+  the Hir consumed by `seagrep_query::plan_hir`, `can_search_as_document`,
+  and `bounded_match_len` (the latter two now take `&Hir` instead of `&str`),
+  so the planner and the grep-mode analyses cannot disagree about a pattern.
+
 ## [0.7.0] - 2026-07-18
 
 ### Changed
