@@ -92,6 +92,43 @@ pub(crate) struct SegmentList {
     pub segments: Vec<SegmentMeta>,
 }
 
+#[derive(Deserialize)]
+struct SegmentListPayload {
+    source: SourceIdentity,
+    strategy: Strategy,
+    segments: Vec<SegmentMeta>,
+}
+
+#[derive(Debug)]
+struct IndexFormatMismatch {
+    found: u32,
+}
+
+impl std::fmt::Display for IndexFormatMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "index format {}; this seagrep reads format {INDEX_FORMAT}",
+            self.found
+        )?;
+        if self.found > INDEX_FORMAT {
+            write!(
+                formatter,
+                "; built by a newer seagrep; upgrade instead of rebuilding"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for IndexFormatMismatch {}
+
+fn is_newer_format(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<IndexFormatMismatch>()
+        .is_some_and(|mismatch| mismatch.found > INDEX_FORMAT)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceIdentity {
     Local {
@@ -187,12 +224,19 @@ fn pack_blob(hash: &str) -> String {
 }
 
 fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
-    let list: SegmentList = postcard::from_bytes(bytes).context("segments.bin unreadable")?;
-    anyhow::ensure!(
-        list.format == INDEX_FORMAT,
-        "index format {} is not the current {INDEX_FORMAT}",
-        list.format
-    );
+    let (format, rest) =
+        postcard::take_from_bytes::<u32>(bytes).context("segments.bin format unreadable")?;
+    if format != INDEX_FORMAT {
+        return Err(IndexFormatMismatch { found: format }.into());
+    }
+    let payload: SegmentListPayload =
+        postcard::from_bytes(rest).context("segments.bin payload unreadable")?;
+    let list = SegmentList {
+        format,
+        source: payload.source,
+        strategy: payload.strategy,
+        segments: payload.segments,
+    };
     list.source.validate()?;
     let mut segment_ids = std::collections::HashSet::with_capacity(list.segments.len());
     for segment in &list.segments {
@@ -324,6 +368,7 @@ fn load_segment_list(store: &dyn BlobStore) -> Result<(RootState, Option<String>
         None => Ok((RootState::Absent, None)),
         Some((bytes, version)) => match parse_segment_list(&bytes) {
             Ok(list) => Ok((RootState::Loaded(list), Some(version))),
+            Err(error) if is_newer_format(&error) => Err(error),
             Err(err) => Ok((
                 RootState::Unreadable(format!("{err:#}"), bytes),
                 Some(version),
@@ -1342,8 +1387,14 @@ impl SegmentedReader {
             .get_versioned("segments.bin")
             .context("reading segments.bin")?
             .ok_or(IndexMissing)?;
-        let list = parse_segment_list(&bytes)
-            .context("index is not usable as-is; run `seagrep index` to rebuild")?;
+        let list = match parse_segment_list(&bytes) {
+            Err(error) if is_newer_format(&error) => {
+                return Err(error);
+            }
+            result => {
+                result.context("index is not usable as-is; run `seagrep index` to rebuild")?
+            }
+        };
         if let Some(source) = source {
             anyhow::ensure!(
                 list.source.can_search(source),
@@ -2411,8 +2462,10 @@ mod tests {
 
     #[test]
     fn unreadable_root_advises_reindex_only_on_the_search_path() {
-        let parse_error = match parse_segment_list(b"garbage") {
-            Ok(_) => panic!("garbage must not parse"),
+        let mut corrupt = postcard::to_allocvec(&INDEX_FORMAT).unwrap();
+        corrupt.extend_from_slice(b"invalid payload");
+        let parse_error = match parse_segment_list(&corrupt) {
+            Ok(_) => panic!("corrupt payload must not parse"),
             Err(error) => error,
         };
         assert!(
@@ -2422,7 +2475,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = seagrep_core::LocalBlobStore::new(dir.path());
-        store.put("segments.bin", b"garbage").unwrap();
+        store.put("segments.bin", &corrupt).unwrap();
         let open_error = match SegmentedReader::inspect(Box::new(store), dir.path()) {
             Ok(_) => panic!("corrupt root must not open"),
             Err(error) => error,
@@ -2431,6 +2484,61 @@ mod tests {
             format!("{open_error:#}").contains("run `seagrep index` to rebuild"),
             "{open_error:#}"
         );
+    }
+
+    #[test]
+    fn segment_list_reports_format_before_decoding_payload() {
+        let mut newer = postcard::to_allocvec(&(INDEX_FORMAT + 1)).unwrap();
+        newer.extend_from_slice(b"invalid payload");
+        let newer_error = match parse_segment_list(&newer) {
+            Ok(_) => panic!("newer format must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            newer_error.to_string(),
+            format!(
+                "index format {}; this seagrep reads format {INDEX_FORMAT}; built by a newer seagrep; upgrade instead of rebuilding",
+                INDEX_FORMAT + 1
+            )
+        );
+
+        let mut older = postcard::to_allocvec(&(INDEX_FORMAT - 1)).unwrap();
+        older.extend_from_slice(b"invalid payload");
+        let older_error = match parse_segment_list(&older) {
+            Ok(_) => panic!("older format must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            older_error.to_string(),
+            format!(
+                "index format {}; this seagrep reads format {INDEX_FORMAT}",
+                INDEX_FORMAT - 1
+            )
+        );
+    }
+
+    #[test]
+    fn newer_index_advises_upgrade_without_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = seagrep_core::LocalBlobStore::new(dir.path());
+        let mut newer = postcard::to_allocvec(&(INDEX_FORMAT + 1)).unwrap();
+        newer.extend_from_slice(b"invalid payload");
+        store.put("segments.bin", &newer).unwrap();
+
+        let error = match SegmentedReader::inspect(Box::new(store), dir.path()) {
+            Ok(_) => panic!("newer format must not open"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("built by a newer seagrep; upgrade instead of rebuilding"));
+        assert!(!message.contains("run `seagrep index`"), "{message}");
+
+        let store = seagrep_core::LocalBlobStore::new(dir.path());
+        let update_error = match load_segment_list(&store) {
+            Ok(_) => panic!("newer format must not become a rebuildable root"),
+            Err(error) => error,
+        };
+        assert_eq!(update_error.to_string(), message);
     }
 
     #[test]
