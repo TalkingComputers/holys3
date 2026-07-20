@@ -51,6 +51,11 @@ const REPACK_DEAD_FRACTION: usize = 4;
 pub(crate) struct SegmentMeta {
     pub seg_id: String,
     pub doc_count: u32,
+    /// The posting id space. Trigram postings address 128 KiB candidate
+    /// blocks, so this is the segment's total block count; sparse postings
+    /// address documents, so this equals `doc_count`. `blocks_needed`,
+    /// `decode_posting_block`, and complement decoding all use this.
+    pub block_count: u64,
     pub terms_fst_len: u64,
     pub terms_fst_hash: String,
     /// SHA-256 of the sparse table's index+footer tail; empty for trigram.
@@ -935,6 +940,22 @@ fn random_seg_id() -> Result<String> {
     Ok(hex_encode(&bytes))
 }
 
+/// The posting id space for a segment: candidate blocks for trigram
+/// (sum of ceil(decoded_size / BLOCK) over documents), documents for sparse.
+pub(crate) fn segment_block_count(strategy: Strategy, tables: &SegmentTables) -> u64 {
+    match strategy {
+        Strategy::Sparse => tables.documents.len() as u64,
+        Strategy::Trigram => tables
+            .documents
+            .iter()
+            .map(|doc| {
+                doc.decoded_size
+                    .div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64)
+            })
+            .sum(),
+    }
+}
+
 pub(crate) fn merge_and_put_segment(
     store: &dyn BlobStore,
     strategy: Strategy,
@@ -971,6 +992,7 @@ pub(crate) fn merge_and_put_segment(
     }
     let docs_bytes = postcard::to_allocvec(tables)?;
     let docs_hash = sha256_hex(&[&docs_bytes]);
+    let block_count = segment_block_count(strategy, tables);
     let seg_id = random_seg_id()?;
     for pack in packs {
         store.put_file(&pack_blob(pack.hash()), pack.path())?;
@@ -987,7 +1009,7 @@ pub(crate) fn merge_and_put_segment(
         let merged = crate::build::merge_posting_runs(
             runs,
             strategy,
-            u32::try_from(tables.documents.len())?,
+            u32::try_from(block_count).context("segment exceeds the candidate block id space")?,
             terms_sink,
             postings_sink,
         )?;
@@ -1009,6 +1031,7 @@ pub(crate) fn merge_and_put_segment(
     let meta = SegmentMeta {
         seg_id,
         doc_count: u32::try_from(tables.documents.len())?,
+        block_count,
         terms_fst_len: fst.len,
         terms_fst_hash: fst.hash,
         terms_tail_hash,
@@ -2127,6 +2150,7 @@ mod tests {
                 decoded_size: 1,
                 first_block: 0,
                 block_offset: 0,
+                max_line_len: 0,
             }],
             blocks: vec![crate::pack::PackBlock {
                 pack: 0,
@@ -2225,6 +2249,7 @@ mod tests {
                     decoded_size: 1,
                     first_block: 0,
                     block_offset: 0,
+                    max_line_len: 0,
                 }],
                 blocks: vec![crate::pack::PackBlock {
                     pack: 0,

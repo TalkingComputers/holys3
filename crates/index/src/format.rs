@@ -24,6 +24,10 @@ pub(crate) struct DocEntry {
     pub decoded_size: u64,
     pub first_block: u32,
     pub block_offset: u32,
+    /// Longest line of the decoded content, saturated. Drives the reader's
+    /// candidate-block slack for trigram segments; 0 for sparse segments
+    /// (doc-granular postings need no slack) and for empty documents.
+    pub max_line_len: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -278,6 +282,7 @@ mod tests {
                     decoded_size: 1,
                     first_block: 0,
                     block_offset: 0,
+                    max_line_len: 0,
                 },
                 DocEntry {
                     display_key: "a.zip!/b".into(),
@@ -286,6 +291,7 @@ mod tests {
                     decoded_size: 1,
                     first_block: 0,
                     block_offset: 1,
+                    max_line_len: 0,
                 },
                 DocEntry {
                     display_key: "b".into(),
@@ -294,6 +300,7 @@ mod tests {
                     decoded_size: 3,
                     first_block: 0,
                     block_offset: 2,
+                    max_line_len: 0,
                 },
             ],
             blocks: vec![PackBlock {

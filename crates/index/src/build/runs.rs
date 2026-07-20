@@ -390,22 +390,97 @@ impl SparseRunWriter {
 pub(crate) enum IndexedGrams {
     Trigram(Vec<u32>),
     TrigramBitmap(Vec<u64>),
+    /// Distinct (doc-local block, gram) pairs from `pack_trigram_block_grams`.
+    TrigramBlocks(Vec<(u32, u32)>),
+    /// Deferred: streamed through `visit_file_trigram_blocks` at run-write
+    /// time, which also yields the document's longest line.
+    TrigramBlocksFile {
+        file: File,
+        len: u64,
+    },
     Sparse(bytes::Bytes),
     SparseFile(File),
     SparsePath(TempPath),
-    TrigramSpool { offset: u64, len: u64 },
-    SparseSpool { offset: u64, len: u64 },
+    TrigramSpool {
+        offset: u64,
+        len: u64,
+    },
+    SparseSpool {
+        offset: u64,
+        len: u64,
+    },
+}
+
+/// One document's grams heading into posting runs. `base` is the document's
+/// first global candidate-block id (trigram segments post block ids, not doc
+/// ids); sparse documents post `doc_id` and ignore `base`.
+pub(crate) struct GrammedDoc {
+    pub(crate) doc_id: usize,
+    pub(crate) base: u32,
+    pub(crate) grams: IndexedGrams,
+}
+
+/// Accumulates (gram, id) entries and spills sorted, deduplicated posting
+/// runs whenever the in-memory budget fills.
+struct TrigramEntrySink {
+    entries: Vec<u64>,
+    runs: Vec<TempPath>,
+}
+
+impl TrigramEntrySink {
+    const CAP: usize = TRIGRAM_RUN_BUDGET_BYTES / size_of::<u64>();
+
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            runs: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, gram: u32, id: DocId) -> Result<()> {
+        self.entries.push(u64::from(gram) << 32 | u64::from(id));
+        if self.entries.len() >= Self::CAP {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    fn spill(&mut self) -> Result<()> {
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+        radsort::sort(&mut self.entries);
+        self.entries.dedup();
+        let mut file = tempfile::NamedTempFile::new()?;
+        let mut writer = BufWriter::with_capacity(RUN_IO_BUFFER_BYTES, file.as_file_mut());
+        for entry in self.entries.drain(..) {
+            write_posting_record(&mut writer, Strategy::Trigram, entry >> 32, entry as DocId)?;
+        }
+        writer.flush()?;
+        drop(writer);
+        self.runs.push(file.into_temp_path());
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<TempPath>> {
+        self.spill()?;
+        Ok(self.runs)
+    }
 }
 
 pub(crate) fn write_posting_runs(
-    grammed: Vec<(usize, IndexedGrams)>,
+    grammed: Vec<GrammedDoc>,
     strategy: Strategy,
     sparse_run_bytes: usize,
     spool: Option<&File>,
-) -> Result<Vec<TempPath>> {
+) -> Result<(Vec<TempPath>, Vec<(usize, u64)>)> {
     match strategy {
-        Strategy::Trigram => write_trigram_runs(grammed, spool),
+        Strategy::Trigram => write_trigram_block_runs(grammed, spool),
         Strategy::Sparse => {
+            let grammed: Vec<(usize, IndexedGrams)> = grammed
+                .into_iter()
+                .map(|doc| (doc.doc_id, doc.grams))
+                .collect();
             // The run budget is aggregate: rayon workers each hold their own
             // entry set, so the per-writer share shrinks with the pool size
             // to keep peak memory at the serial envelope.
@@ -433,6 +508,8 @@ pub(crate) fn write_posting_runs(
                         )?,
                         IndexedGrams::Trigram(_)
                         | IndexedGrams::TrigramBitmap(_)
+                        | IndexedGrams::TrigramBlocks(_)
+                        | IndexedGrams::TrigramBlocksFile { .. }
                         | IndexedGrams::TrigramSpool { .. } => {
                             anyhow::bail!("mixed gram strategies in build chunk");
                         }
@@ -440,11 +517,71 @@ pub(crate) fn write_posting_runs(
                     writer.finish()
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(runs.into_iter().flatten().collect())
+            Ok((runs.into_iter().flatten().collect(), Vec::new()))
         }
     }
 }
 
+/// Trigram runs in the global block-id space: every record's id is
+/// `doc.base + local_block`. Deferred (file/spool) documents stream through
+/// the windowed visitor, which also yields their longest line — returned so
+/// the builder can patch the doc table.
+fn write_trigram_block_runs(
+    grammed: Vec<GrammedDoc>,
+    spool: Option<&File>,
+) -> Result<(Vec<TempPath>, Vec<(usize, u64)>)> {
+    let mut sink = TrigramEntrySink::new();
+    let mut max_lines = Vec::new();
+    for doc in grammed {
+        let base = doc.base;
+        let mut push_window = |sink: &mut TrigramEntrySink, block: u32, grams: &[u32]| {
+            let id = base
+                .checked_add(block)
+                .context("segment exceeds the candidate block id space")?;
+            for &gram in grams {
+                sink.push(gram, id)?;
+            }
+            Ok(())
+        };
+        match doc.grams {
+            IndexedGrams::TrigramBlocks(pairs) => {
+                for (block, gram) in pairs {
+                    let id = base
+                        .checked_add(block)
+                        .context("segment exceeds the candidate block id space")?;
+                    sink.push(gram, id)?;
+                }
+            }
+            IndexedGrams::TrigramBlocksFile { mut file, len } => {
+                let max_line = visit_file_trigram_blocks(&mut file, 0, len, |block, grams| {
+                    push_window(&mut sink, block, grams)
+                })?;
+                max_lines.push((doc.doc_id, max_line));
+            }
+            IndexedGrams::TrigramSpool { offset, len } => {
+                let mut file = spool
+                    .context("spooled grams have no content spool")?
+                    .try_clone()?;
+                let max_line =
+                    visit_file_trigram_blocks(&mut file, offset, len, |block, grams| {
+                        push_window(&mut sink, block, grams)
+                    })?;
+                max_lines.push((doc.doc_id, max_line));
+            }
+            IndexedGrams::Trigram(_)
+            | IndexedGrams::TrigramBitmap(_)
+            | IndexedGrams::Sparse(_)
+            | IndexedGrams::SparseFile(_)
+            | IndexedGrams::SparsePath(_)
+            | IndexedGrams::SparseSpool { .. } => {
+                anyhow::bail!("non-block gram variant in a trigram block build");
+            }
+        }
+    }
+    Ok((sink.finish()?, max_lines))
+}
+
+#[allow(dead_code)]
 fn write_trigram_runs(
     grammed: Vec<(usize, IndexedGrams)>,
     spool: Option<&File>,
@@ -486,6 +623,8 @@ fn write_trigram_runs(
             IndexedGrams::Sparse(_)
             | IndexedGrams::SparseFile(_)
             | IndexedGrams::SparsePath(_)
+            | IndexedGrams::TrigramBlocks(_)
+            | IndexedGrams::TrigramBlocksFile { .. }
             | IndexedGrams::SparseSpool { .. } => {
                 anyhow::bail!("mixed gram strategies in build chunk");
             }
