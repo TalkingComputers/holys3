@@ -3,8 +3,8 @@ use crate::pack::{PackBuilder, PackFile};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use seagrep_core::{
-    decode_source_body, is_raw_body, pack_trigram_grams, Corpus, DecodeSink, DocumentBody,
-    LogicalDocumentMeta, SourceEncoding, SourceObject, Strategy, DECODE_LIMITS,
+    decode_source_body, is_raw_body, Corpus, DecodeSink, DocumentBody, LogicalDocumentMeta,
+    SourceEncoding, SourceObject, Strategy, DECODE_LIMITS,
 };
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -15,12 +15,12 @@ mod runs;
 
 #[cfg(test)]
 pub(super) use runs::{
-    collapse_posting_runs, pack_file_trigrams, write_trigram_run_merge, write_trigram_run_radix,
-    PostingRun, MAX_OPEN_POSTING_RUNS, SPARSE_FILE_CHUNK,
+    collapse_posting_runs, collect_file_trigrams, pack_file_trigrams, write_trigram_run_merge,
+    write_trigram_run_radix, PostingRun, MAX_OPEN_POSTING_RUNS, SPARSE_FILE_CHUNK,
 };
 pub(super) use runs::{
-    collect_file_trigrams, key_bytes, merge_posting_runs, write_posting_record, write_posting_runs,
-    IndexedGrams, MergedBlob, PostingsTail,
+    key_bytes, merge_posting_runs, track_max_line, write_posting_record, write_posting_runs,
+    GrammedDoc, IndexedGrams, MergedBlob, PostingsTail,
 };
 
 /// Docs are fetched and gram-extracted in chunks bounded BOTH by doc count
@@ -148,6 +148,10 @@ struct BuiltDocument {
     grams: IndexedGrams,
     decoded_size: u64,
     content: BuiltContent,
+    /// Longest decoded line when computed eagerly (in-memory paths); the
+    /// deferred file/spool paths report it from run-writing instead.
+    max_line_len: Option<u64>,
+    block_newlines: Option<Vec<u32>>,
 }
 
 enum IndexOutput {
@@ -291,7 +295,7 @@ impl DecodeSink for IndexDecodeSink {
             None
         } else {
             Some(match self.strategy {
-                Strategy::Trigram => collect_file_trigrams(&mut file, 0, len)?,
+                Strategy::Trigram => IndexedGrams::TrigramBlocksFile { file, len },
                 Strategy::Sparse
                     if self
                         .current_meta
@@ -320,12 +324,12 @@ impl DecodeSink for IndexDecodeSink {
             .take()
             .context("decoder finished without beginning a document")?;
         let output = std::mem::replace(&mut self.current_output, IndexOutput::Bytes(Vec::new()));
-        let (grams, decoded_size, content) = match output {
+        let (grams, decoded_size, content, max_line_len, block_newlines) = match output {
             IndexOutput::File {
                 grams,
                 len,
                 content,
-            } => (grams, len, BuiltContent::File(content)),
+            } => (grams, len, BuiltContent::File(content), None, None),
             IndexOutput::Bytes(mut chunks) => {
                 let bytes = match chunks.len() {
                     0 => bytes::Bytes::new(),
@@ -345,12 +349,36 @@ impl DecodeSink for IndexDecodeSink {
                 let decoded_size = u64::try_from(bytes.len())?;
                 let grams = match (self.spool.is_some(), self.strategy) {
                     (true, _) => None,
-                    (false, Strategy::Trigram) => {
-                        Some(IndexedGrams::Trigram(pack_trigram_grams(&bytes)))
-                    }
+                    (false, Strategy::Trigram) => Some(IndexedGrams::TrigramBlocks(
+                        seagrep_core::pack_trigram_block_grams(&bytes),
+                    )),
                     (false, Strategy::Sparse) => Some(IndexedGrams::Sparse(bytes.clone())),
                 };
-                (grams, decoded_size, BuiltContent::Bytes(bytes))
+                let max_line = match self.strategy {
+                    Strategy::Trigram if self.spool.is_none() => {
+                        let (mut carry, mut max) = (0u64, 0u64);
+                        track_max_line(&bytes, &mut carry, &mut max);
+                        Some(max)
+                    }
+                    _ => None,
+                };
+                let block_newlines = (self.strategy == Strategy::Trigram && self.spool.is_none())
+                    .then(|| {
+                        bytes
+                            .chunks(seagrep_core::CANDIDATE_BLOCK_BYTES)
+                            .map(|block| {
+                                u32::try_from(block.iter().filter(|byte| **byte == b'\n').count())
+                                    .expect("candidate block newline count fits u32")
+                            })
+                            .collect()
+                    });
+                (
+                    grams,
+                    decoded_size,
+                    BuiltContent::Bytes(bytes),
+                    max_line,
+                    block_newlines,
+                )
             }
         };
         let content = self.store_content(content, decoded_size)?;
@@ -373,6 +401,8 @@ impl DecodeSink for IndexDecodeSink {
             grams,
             decoded_size,
             content,
+            max_line_len,
+            block_newlines,
         });
         Ok(())
     }
@@ -455,6 +485,9 @@ struct ChunkIngest<'a> {
     pack_builder: &'a mut PackBuilder,
     failed: &'a mut usize,
     runs: &'a mut Vec<tempfile::TempPath>,
+    /// Running total of candidate blocks across the segment's documents;
+    /// each trigram document's postings are based at this value.
+    next_block_base: &'a mut u64,
 }
 
 impl ChunkIngest<'_> {
@@ -505,12 +538,7 @@ impl ChunkIngest<'_> {
             let source = &sources[chunk_start + offset];
             let expanding = bodies[offset].is_some() && raw[offset].is_none();
             if expanding && !grammed.is_empty() {
-                self.runs.extend(write_posting_runs(
-                    std::mem::take(&mut grammed),
-                    strategy,
-                    SPARSE_RUN_BYTES,
-                    None,
-                )?);
+                self.write_runs(std::mem::take(&mut grammed), None)?;
             }
             let outcome = match (raw[offset].take(), bodies[offset].take()) {
                 (Some(outcome), _) => Some(outcome),
@@ -559,6 +587,28 @@ impl ChunkIngest<'_> {
             if document_cap.is_some_and(|cap| next_document_count > cap) {
                 return Err(anyhow::Error::new(DocumentCapExceeded));
             }
+            // Trigram postings address candidate blocks and pack per-gram id
+            // counts into 24 bits: a gram present in every block posts
+            // `block_count` ids, so the segment's block id space must stay
+            // within `MAX_POSTING_COUNT`. The per-source decode limit keeps
+            // any single source far below it, so splitting always converges.
+            if strategy == Strategy::Trigram {
+                let next_block_count =
+                    documents
+                        .iter()
+                        .try_fold(*self.next_block_base, |total, document| {
+                            total
+                                .checked_add(
+                                    document
+                                        .decoded_size
+                                        .div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64),
+                                )
+                                .context("segment candidate block count overflows")
+                        })?;
+                if next_block_count > crate::eval::MAX_POSTING_COUNT {
+                    return Err(anyhow::Error::new(DocumentCapExceeded));
+                }
+            }
             for document in documents {
                 let doc_id = self.tables.documents.len();
                 let slice = document.content.append(
@@ -566,7 +616,16 @@ impl ChunkIngest<'_> {
                     document.decoded_size,
                     spool.as_mut(),
                 )?;
-                grammed.push((doc_id, document.grams));
+                let base = u32::try_from(*self.next_block_base)
+                    .context("segment exceeds the candidate block id space")?;
+                *self.next_block_base += document
+                    .decoded_size
+                    .div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64);
+                grammed.push(GrammedDoc {
+                    doc_id,
+                    base,
+                    grams: document.grams,
+                });
                 self.tables.documents.push(DocEntry {
                     display_key: document.meta.display_key,
                     source_id,
@@ -574,6 +633,9 @@ impl ChunkIngest<'_> {
                     decoded_size: document.decoded_size,
                     first_block: slice.first_block,
                     block_offset: slice.block_offset,
+                    max_line_len: u32::try_from(document.max_line_len.unwrap_or(0))
+                        .unwrap_or(u32::MAX),
+                    block_newlines: document.block_newlines.unwrap_or_default(),
                 });
             }
             self.tables.sources.push(SourceEntry {
@@ -587,21 +649,30 @@ impl ChunkIngest<'_> {
                 retry,
             });
             if expanding && !grammed.is_empty() {
-                self.runs.extend(write_posting_runs(
-                    std::mem::take(&mut grammed),
-                    strategy,
-                    SPARSE_RUN_BYTES,
-                    spool.as_ref().map(tempfile::NamedTempFile::as_file),
-                )?);
+                let spool_file = spool.as_ref().map(tempfile::NamedTempFile::as_file);
+                self.write_runs(std::mem::take(&mut grammed), spool_file)?;
             }
         }
         if !grammed.is_empty() {
-            self.runs.extend(write_posting_runs(
-                grammed,
-                strategy,
-                SPARSE_RUN_BYTES,
-                None,
-            )?);
+            self.write_runs(grammed, None)?;
+        }
+        Ok(())
+    }
+
+    /// Write posting runs for a batch of grammed documents, then patch the
+    /// longest-line lengths the deferred (file/spool) producers reported.
+    fn write_runs(&mut self, grammed: Vec<GrammedDoc>, spool: Option<&File>) -> Result<()> {
+        let (runs, max_lines) =
+            write_posting_runs(grammed, self.strategy, SPARSE_RUN_BYTES, spool)?;
+        self.runs.extend(runs);
+        for (doc_id, max_line, block_newlines) in max_lines {
+            let entry = self
+                .tables
+                .documents
+                .get_mut(doc_id)
+                .context("deferred max-line for an unknown document")?;
+            entry.max_line_len = u32::try_from(max_line).unwrap_or(u32::MAX);
+            entry.block_newlines = block_newlines;
         }
         Ok(())
     }
@@ -625,6 +696,7 @@ pub(crate) fn build_index_files(
     let mut pack_builder = PackBuilder::production()?;
     let mut failed = 0usize;
     let mut runs = Vec::new();
+    let mut next_block_base = 0u64;
     let chunks: Vec<Range<usize>> = build_chunks(sources).collect();
     let fetch = |chunk: Range<usize>| corpus.fetch_bodies(chunk);
     let prefetchable =
@@ -638,6 +710,7 @@ pub(crate) fn build_index_files(
         pack_builder: &mut pack_builder,
         failed: &mut failed,
         runs: &mut runs,
+        next_block_base: &mut next_block_base,
     };
     drive_prefetched(&chunks, &prefetchable, &fetch, &mut |chunk, fetched| {
         ingest.ingest(chunk, fetched)

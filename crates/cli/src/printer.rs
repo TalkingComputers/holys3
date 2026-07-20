@@ -258,6 +258,10 @@ impl MatchSink for CountSink {
         false
     }
 
+    fn wants_line_text(&self) -> bool {
+        false
+    }
+
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow> {
         let n = if self.count_matches {
             doc.events.iter().map(|e| e.submatches.len()).sum::<usize>()

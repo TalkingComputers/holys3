@@ -266,11 +266,12 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          # Same split as the large-object gate: index paths stream uploads
-          # (measured 115.2 MiB against the old 112 MiB ceiling), searches
-          # stay tight.
+          # Block-granular postings (#85) stream a far larger postings.bin +
+          # terms.fst on the all-trigrams entropy corpus; index peak is the
+          # bounded multipart-upload window (16 MiB x 4 in-flight x 2 sinks),
+          # measured 155.3 MiB on CI. Searches stay tight.
           for name in ("bench-entropy-index.txt", "bench-entropy-search.txt"):
-              limit_kib = (144 if "index" in name else 112) * 1024
+              limit_kib = (180 if "index" in name else 112) * 1024
               lines = Path(name).read_text().splitlines()
               field = next(line for line in lines if "Maximum resident set size" in line)
               peak_kib = int(field.rsplit(":", 1)[1])

@@ -1,6 +1,6 @@
 use crate::segment::cache::{read_verified, write_back};
 use anyhow::{Context, Result};
-use seagrep_core::{BlobStore, DocumentBody, DocumentSpool};
+use seagrep_core::{BlobStore, DocumentBody, DocumentRegion, DocumentSpool, FetchedDocument};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -42,6 +42,26 @@ pub(crate) struct PackRequest {
     pub index: usize,
     pub slice: PackSlice,
     pub decoded_size: u64,
+}
+
+pub(crate) struct PackRegionRequest<'a> {
+    pub slice: PackSlice,
+    pub decoded_size: u64,
+    pub ranges: &'a [Range<u64>],
+    pub block_newlines: &'a [u32],
+}
+
+pub(crate) struct RegionFetchOptions {
+    pub bounded_len: Option<usize>,
+    pub before_context: usize,
+    pub after_context: usize,
+}
+
+struct DocumentBlock {
+    block_id: usize,
+    start: u64,
+    offset: usize,
+    len: usize,
 }
 
 struct PackRun {
@@ -586,6 +606,260 @@ pub(crate) fn fetch_documents(
     Ok(())
 }
 
+fn document_blocks(
+    slice: PackSlice,
+    decoded_size: u64,
+    blocks: &[PackBlock],
+) -> Result<Vec<DocumentBlock>> {
+    let span = block_span(slice, decoded_size, blocks)?;
+    let mut parts = Vec::with_capacity(span.len());
+    let mut remaining = decoded_size;
+    let mut start = 0u64;
+    let mut offset = usize::try_from(slice.block_offset)?;
+    for block_id in span {
+        let block = &blocks[block_id];
+        let len = usize::try_from(remaining.min(u64::from(block.decoded_len) - offset as u64))?;
+        parts.push(DocumentBlock {
+            block_id,
+            start,
+            offset,
+            len,
+        });
+        remaining -= u64::try_from(len)?;
+        start += u64::try_from(len)?;
+        offset = 0;
+    }
+    anyhow::ensure!(remaining == 0, "pack blocks ended before the document");
+    Ok(parts)
+}
+
+fn load_document_block(
+    store: &dyn BlobStore,
+    cache: Option<&PackBlockCache<'_>>,
+    packs: &[PackMeta],
+    blocks: &[PackBlock],
+    block_id: usize,
+    loaded: &mut BTreeMap<usize, bytes::Bytes>,
+) -> Result<()> {
+    if loaded.contains_key(&block_id) {
+        return Ok(());
+    }
+    let runs = block_runs([block_id], blocks)?;
+    visit_blocks(
+        store,
+        cache,
+        packs,
+        blocks,
+        &runs,
+        RANGE_BYTES,
+        &mut |id, bytes| {
+            loaded.insert(id, bytes::Bytes::from(bytes));
+            Ok(())
+        },
+    )
+}
+
+fn read_document_range(
+    store: &dyn BlobStore,
+    cache: Option<&PackBlockCache<'_>>,
+    packs: &[PackMeta],
+    blocks: &[PackBlock],
+    parts: &[DocumentBlock],
+    range: Range<u64>,
+    loaded: &mut BTreeMap<usize, bytes::Bytes>,
+) -> Result<bytes::Bytes> {
+    let mut output = Vec::with_capacity(usize::try_from(range.end - range.start)?);
+    for part in parts {
+        let part_end = part.start + u64::try_from(part.len)?;
+        if part_end <= range.start || part.start >= range.end {
+            continue;
+        }
+        load_document_block(store, cache, packs, blocks, part.block_id, loaded)?;
+        let decoded = loaded
+            .get(&part.block_id)
+            .context("decoded pack block is missing")?;
+        let from = usize::try_from(range.start.max(part.start) - part.start)?;
+        let to = usize::try_from(range.end.min(part_end) - part.start)?;
+        output.extend_from_slice(&decoded[part.offset + from..part.offset + to]);
+    }
+    anyhow::ensure!(
+        output.len() == usize::try_from(range.end - range.start)?,
+        "document range is incomplete"
+    );
+    Ok(bytes::Bytes::from(output))
+}
+
+struct RegionSource<'a, 'b> {
+    store: &'a dyn BlobStore,
+    cache: Option<&'a PackBlockCache<'b>>,
+    packs: &'a [PackMeta],
+    blocks: &'a [PackBlock],
+    parts: &'a [DocumentBlock],
+    loaded: &'a mut BTreeMap<usize, bytes::Bytes>,
+}
+
+impl RegionSource<'_, '_> {
+    fn read(&mut self, range: Range<u64>) -> Result<bytes::Bytes> {
+        read_document_range(
+            self.store,
+            self.cache,
+            self.packs,
+            self.blocks,
+            self.parts,
+            range,
+            self.loaded,
+        )
+    }
+}
+
+fn extend_region(
+    source: &mut RegionSource<'_, '_>,
+    decoded_size: u64,
+    range: Range<u64>,
+    before_context: usize,
+    after_context: usize,
+) -> Result<Range<u64>> {
+    let mut start = range.start;
+    let mut needed = before_context + 1;
+    let mut part_index = source
+        .parts
+        .partition_point(|part| part.start < start)
+        .saturating_sub(1);
+    while start > 0 && needed > 0 {
+        let part_start = source.parts[part_index].start;
+        let bytes = source.read(part_start..start)?;
+        for (at, byte) in bytes.iter().enumerate().rev() {
+            if *byte == b'\n' {
+                needed -= 1;
+                if needed == 0 {
+                    start = part_start + u64::try_from(at + 1)?;
+                    break;
+                }
+            }
+        }
+        if needed > 0 {
+            start = part_start;
+            if part_index == 0 {
+                break;
+            }
+            part_index -= 1;
+        }
+    }
+    if needed > 0 {
+        start = 0;
+    }
+
+    let mut end = range.end;
+    let mut needed = after_context + 1;
+    let mut part_index = source
+        .parts
+        .partition_point(|part| part.start <= end)
+        .saturating_sub(1);
+    while end < decoded_size && needed > 0 {
+        let part = &source.parts[part_index];
+        let part_end = part.start + u64::try_from(part.len)?;
+        let bytes = source.read(end..part_end)?;
+        for (at, byte) in bytes.iter().enumerate() {
+            if *byte == b'\n' {
+                needed -= 1;
+                if needed == 0 {
+                    end += u64::try_from(at + 1)?;
+                    break;
+                }
+            }
+        }
+        if needed > 0 {
+            end = part_end;
+            part_index += 1;
+        }
+    }
+    if needed > 0 {
+        end = decoded_size;
+    }
+    Ok(start..end)
+}
+
+pub(crate) fn fetch_regions(
+    store: &dyn BlobStore,
+    cache: Option<&PackBlockCache<'_>>,
+    packs: &[PackMeta],
+    blocks: &[PackBlock],
+    request: &PackRegionRequest<'_>,
+    options: RegionFetchOptions,
+) -> Result<FetchedDocument> {
+    let parts = document_blocks(request.slice, request.decoded_size, blocks)?;
+    let mut loaded = BTreeMap::new();
+    let mut source = RegionSource {
+        store,
+        cache,
+        packs,
+        blocks,
+        parts: &parts,
+        loaded: &mut loaded,
+    };
+    let mut ranges = match options.bounded_len {
+        Some(bound) => {
+            let overlap = u64::try_from(bound.saturating_sub(1))?;
+            request
+                .ranges
+                .iter()
+                .map(|range| {
+                    range.start.saturating_sub(overlap)
+                        ..range.end.saturating_add(overlap).min(request.decoded_size)
+                })
+                .collect()
+        }
+        None => request
+            .ranges
+            .iter()
+            .cloned()
+            .map(|range| {
+                extend_region(
+                    &mut source,
+                    request.decoded_size,
+                    range,
+                    options.before_context,
+                    options.after_context,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<Range<u64>> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut() {
+            if range.start <= previous.end {
+                previous.end = previous.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    let mut regions = Vec::with_capacity(merged.len());
+    for range in merged {
+        let block = usize::try_from(range.start / seagrep_core::CANDIDATE_BLOCK_BYTES as u64)?;
+        let block_start = u64::try_from(block)? * seagrep_core::CANDIDATE_BLOCK_BYTES as u64;
+        let prefix: u64 = request.block_newlines[..block]
+            .iter()
+            .map(|count| u64::from(*count))
+            .sum();
+        let within = source
+            .read(block_start..range.start)?
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count() as u64;
+        regions.push(DocumentRegion {
+            start: range.start,
+            line: 1 + prefix + within,
+            bytes: source.read(range)?,
+        });
+    }
+    Ok(FetchedDocument::Regions {
+        decoded_size: request.decoded_size,
+        regions,
+    })
+}
+
 pub(crate) fn request_windows(requests: &[PackRequest]) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut start = 0usize;
     std::iter::from_fn(move || {
@@ -676,6 +950,7 @@ impl BuiltPacks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seagrep_core::LocalBlobStore;
     use std::io::Cursor;
 
     #[test]
@@ -735,6 +1010,63 @@ mod tests {
 
         assert_eq!(block_runs([0, 1, 2], &built.blocks).unwrap().len(), 1);
         assert_eq!(block_runs([0, 2], &built.blocks).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn lazy_line_fetch_assembles_a_line_spanning_pack_blocks() {
+        let block = PACK_BLOCK_BYTES;
+        let mut body = vec![b'x'; 3 * block + 6];
+        body[2 * block + 17..2 * block + 23].copy_from_slice(b"needle");
+        body[3 * block] = b'\n';
+        body[3 * block + 1..].copy_from_slice(b"tail\n");
+        let mut builder = PackBuilder::new(block, 8 * block as u64).unwrap();
+        let slice = builder
+            .append(Cursor::new(&body), body.len() as u64)
+            .unwrap();
+        let built = builder.finish().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::new(store_dir.path());
+        for pack in &built.packs {
+            store
+                .put_file(&pack_blob(pack.hash()), pack.path())
+                .unwrap();
+        }
+        let packs = built.packs.iter().map(PackFile::meta).collect::<Vec<_>>();
+        let block_newlines = body
+            .chunks(seagrep_core::CANDIDATE_BLOCK_BYTES)
+            .map(|chunk| chunk.iter().filter(|byte| **byte == b'\n').count() as u32)
+            .collect::<Vec<_>>();
+        let range = (2 * block + 17) as u64..(2 * block + 23) as u64;
+
+        let fetched = fetch_regions(
+            &store,
+            None,
+            &packs,
+            &built.blocks,
+            &PackRegionRequest {
+                slice,
+                decoded_size: body.len() as u64,
+                ranges: std::slice::from_ref(&range),
+                block_newlines: &block_newlines,
+            },
+            RegionFetchOptions {
+                bounded_len: None,
+                before_context: 0,
+                after_context: 0,
+            },
+        )
+        .unwrap();
+
+        let FetchedDocument::Regions { regions, .. } = fetched else {
+            panic!("expected regional line fetch")
+        };
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, 0);
+        assert_eq!(regions[0].line, 1);
+        assert_eq!(
+            regions[0].bytes,
+            bytes::Bytes::copy_from_slice(&body[..=3 * block])
+        );
     }
 
     #[test]

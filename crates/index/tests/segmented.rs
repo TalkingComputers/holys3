@@ -177,8 +177,8 @@ fn progress_receiver_drop_does_not_affect_indexing() -> Result<()> {
 
 struct RangeCountingStore {
     inner: LocalBlobStore,
-    pack_reads: std::cell::Cell<usize>,
-    deleted: std::cell::RefCell<Vec<String>>,
+    pack_reads: AtomicUsize,
+    deleted: std::sync::Mutex<Vec<String>>,
 }
 
 impl BlobStore for RangeCountingStore {
@@ -200,13 +200,13 @@ impl BlobStore for RangeCountingStore {
 
     fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> Result<Vec<Bytes>> {
         if name.starts_with("packs/") {
-            self.pack_reads.set(self.pack_reads.get() + 1);
+            self.pack_reads.fetch_add(1, Ordering::Relaxed);
         }
         self.inner.get_ranges(name, ranges)
     }
 
     fn delete(&self, name: &str) -> Result<()> {
-        self.deleted.borrow_mut().push(name.to_owned());
+        self.deleted.lock().unwrap().push(name.to_owned());
         self.inner.delete(name)
     }
 
@@ -1167,7 +1167,7 @@ fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
     struct RacingStore {
         inner: LocalBlobStore,
         interloper: Vec<u8>,
-        armed: std::cell::Cell<bool>,
+        armed: AtomicBool,
     }
 
     impl BlobStore for RacingStore {
@@ -1190,7 +1190,7 @@ fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
             self.inner.get_versioned(name)
         }
         fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
-            if name == "segments.bin" && self.armed.replace(false) {
+            if name == "segments.bin" && self.armed.swap(false, Ordering::Relaxed) {
                 // B sneaks in first
                 self.inner.put(name, &self.interloper)?;
             }
@@ -1220,7 +1220,7 @@ fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
             altered.push(0xFF);
             altered
         },
-        armed: std::cell::Cell::new(true),
+        armed: AtomicBool::new(true),
     };
     let listing = bucket.listing();
     let err = update_index(
@@ -1438,8 +1438,8 @@ fn same_run_compacted_tombstones_are_garbage_collected_once() -> Result<()> {
     }
     let store = RangeCountingStore {
         inner: LocalBlobStore::new(store_dir.path()),
-        pack_reads: std::cell::Cell::new(0),
-        deleted: std::cell::RefCell::new(Vec::new()),
+        pack_reads: AtomicUsize::new(0),
+        deleted: std::sync::Mutex::new(Vec::new()),
     };
     let report = update_index(
         &store,
@@ -1451,7 +1451,7 @@ fn same_run_compacted_tombstones_are_garbage_collected_once() -> Result<()> {
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
     assert!(report.compacted);
-    let deleted = store.deleted.borrow();
+    let deleted = store.deleted.lock().unwrap();
     let unique: std::collections::HashSet<&str> = deleted.iter().map(String::as_str).collect();
     assert_eq!(deleted.len(), unique.len());
 
@@ -1520,8 +1520,8 @@ fn tombstones_bound_update_work_and_purge_physically() -> Result<()> {
     bucket.delete("doc00");
     let store = RangeCountingStore {
         inner: LocalBlobStore::new(store_dir.path()),
-        pack_reads: std::cell::Cell::new(0),
-        deleted: std::cell::RefCell::new(Vec::new()),
+        pack_reads: AtomicUsize::new(0),
+        deleted: std::sync::Mutex::new(Vec::new()),
     };
     let report = update_index(
         &store,
@@ -1532,7 +1532,7 @@ fn tombstones_bound_update_work_and_purge_physically() -> Result<()> {
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
-    assert_eq!(store.pack_reads.get(), 0);
+    assert_eq!(store.pack_reads.load(Ordering::Relaxed), 0);
     assert!(!report.compacted);
     assert_eq!(names(&store_dir.path().join("packs"))?, original_packs);
     let first_dead = dead_files(store_dir.path())?;
@@ -1551,8 +1551,8 @@ fn tombstones_bound_update_work_and_purge_physically() -> Result<()> {
 
     let store = RangeCountingStore {
         inner: LocalBlobStore::new(store_dir.path()),
-        pack_reads: std::cell::Cell::new(0),
-        deleted: std::cell::RefCell::new(Vec::new()),
+        pack_reads: AtomicUsize::new(0),
+        deleted: std::sync::Mutex::new(Vec::new()),
     };
     let report = update_index(
         &store,
@@ -1566,9 +1566,9 @@ fn tombstones_bound_update_work_and_purge_physically() -> Result<()> {
         },
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
-    assert_eq!(store.pack_reads.get(), 1);
+    assert_eq!(store.pack_reads.load(Ordering::Relaxed), 1);
     assert!(report.compacted);
-    let deleted = store.deleted.borrow();
+    let deleted = store.deleted.lock().unwrap();
     let unique: std::collections::HashSet<&str> = deleted.iter().map(String::as_str).collect();
     assert_eq!(deleted.len(), unique.len());
     assert!(dead_files(store_dir.path())?.is_empty());
@@ -1605,8 +1605,8 @@ fn tombstone_thresholds_repack_by_documents_and_bytes() -> Result<()> {
         }
         let store = RangeCountingStore {
             inner: LocalBlobStore::new(store_dir.path()),
-            pack_reads: std::cell::Cell::new(0),
-            deleted: std::cell::RefCell::new(Vec::new()),
+            pack_reads: AtomicUsize::new(0),
+            deleted: std::sync::Mutex::new(Vec::new()),
         };
         let report = update_index(
             &store,
@@ -1617,7 +1617,7 @@ fn tombstone_thresholds_repack_by_documents_and_bytes() -> Result<()> {
             UpdateOptions::default(),
             &|shard| Ok(Box::new(bucket.corpus_over(shard))),
         )?;
-        assert_eq!(store.pack_reads.get(), 1);
+        assert_eq!(store.pack_reads.load(Ordering::Relaxed), 1);
         assert!(report.compacted);
     }
     Ok(())
@@ -1642,8 +1642,8 @@ fn repack_coalesces_pack_reads_across_sources() -> Result<()> {
     bucket.delete("doc00");
     let store = RangeCountingStore {
         inner: LocalBlobStore::new(store_dir.path()),
-        pack_reads: std::cell::Cell::new(0),
-        deleted: std::cell::RefCell::new(Vec::new()),
+        pack_reads: AtomicUsize::new(0),
+        deleted: std::sync::Mutex::new(Vec::new()),
     };
     update_index(
         &store,
@@ -1657,7 +1657,7 @@ fn repack_coalesces_pack_reads_across_sources() -> Result<()> {
         },
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
-    assert_eq!(store.pack_reads.get(), 1);
+    assert_eq!(store.pack_reads.load(Ordering::Relaxed), 1);
     Ok(())
 }
 
@@ -1681,8 +1681,8 @@ fn repack_fetches_all_window_ranges_in_one_call() -> Result<()> {
     }
     let store = RangeCountingStore {
         inner: LocalBlobStore::new(store_dir.path()),
-        pack_reads: std::cell::Cell::new(0),
-        deleted: std::cell::RefCell::new(Vec::new()),
+        pack_reads: AtomicUsize::new(0),
+        deleted: std::sync::Mutex::new(Vec::new()),
     };
     update_index(
         &store,
@@ -1693,7 +1693,7 @@ fn repack_fetches_all_window_ranges_in_one_call() -> Result<()> {
         UpdateOptions::default(),
         &|shard| Ok(Box::new(bucket.corpus_over(shard))),
     )?;
-    assert_eq!(store.pack_reads.get(), 1);
+    assert_eq!(store.pack_reads.load(Ordering::Relaxed), 1);
     Ok(())
 }
 
@@ -1703,7 +1703,7 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
 
     struct FlakyStore {
         inner: LocalBlobStore,
-        fail_next_root_get: std::cell::Cell<bool>,
+        fail_next_root_get: AtomicBool,
     }
 
     impl BlobStore for FlakyStore {
@@ -1716,7 +1716,7 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
         }
 
         fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
-            if name == "segments.bin" && self.fail_next_root_get.replace(false) {
+            if name == "segments.bin" && self.fail_next_root_get.swap(false, Ordering::Relaxed) {
                 anyhow::bail!("simulated transient outage");
             }
             self.inner.get(name)
@@ -1731,7 +1731,7 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
         }
 
         fn get_versioned(&self, name: &str) -> Result<Option<(Vec<u8>, String)>> {
-            if name == "segments.bin" && self.fail_next_root_get.replace(false) {
+            if name == "segments.bin" && self.fail_next_root_get.swap(false, Ordering::Relaxed) {
                 anyhow::bail!("simulated transient outage");
             }
             self.inner.get_versioned(name)
@@ -1755,7 +1755,7 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
 
     let flaky = FlakyStore {
         inner: LocalBlobStore::new(store_dir.path()),
-        fail_next_root_get: std::cell::Cell::new(true),
+        fail_next_root_get: AtomicBool::new(true),
     };
     let listing = bucket.listing();
     let result = update_index(

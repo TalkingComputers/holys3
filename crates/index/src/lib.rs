@@ -25,7 +25,8 @@ pub use segment::{
 use build::{
     build_chunks, collapse_posting_runs, collect_file_trigrams, merge_posting_runs,
     pack_file_trigrams, write_posting_record, write_posting_runs, write_trigram_run_merge,
-    write_trigram_run_radix, IndexedGrams, PostingRun, MAX_OPEN_POSTING_RUNS, SPARSE_FILE_CHUNK,
+    write_trigram_run_radix, GrammedDoc, IndexedGrams, PostingRun, MAX_OPEN_POSTING_RUNS,
+    SPARSE_FILE_CHUNK,
 };
 pub(crate) use build::{build_index_files, BuiltIndexFiles, DocumentCapExceeded};
 
@@ -45,7 +46,7 @@ use std::fs::File;
 use std::io::Read;
 #[cfg(test)]
 use std::io::{BufReader, Write};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -57,7 +58,7 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older seagrep must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 19;
+const INDEX_FORMAT: u32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -76,6 +77,10 @@ pub struct SearchStats {
     pub candidates: usize,
     pub total_docs: usize,
     pub bytes_fetched: usize,
+    pub regional_docs: usize,
+    pub whole_docs: usize,
+    pub candidate_bytes: usize,
+    pub decoded_bytes: usize,
     /// Source objects the index could not decode at build time: their
     /// contents are not searchable, and results cannot include them.
     pub excluded_objects: usize,
@@ -97,10 +102,12 @@ pub trait IndexReader: DocFetcher {
         &self,
         q: &Query,
         key_prefix: Option<&str>,
+        bounded_len: Option<usize>,
         batch_size: usize,
         visit: &mut dyn FnMut(Vec<seagrep_core::DocAddress>) -> Result<bool>,
     ) -> Result<()> {
         anyhow::ensure!(batch_size > 0, "candidate batch size must be positive");
+        let _ = bounded_len;
         let documents = self.candidate_docs(q, key_prefix)?;
         for chunk in documents.chunks(batch_size) {
             if !visit(chunk.to_vec())? {
@@ -251,21 +258,20 @@ pub(crate) fn decode_posting_block(bytes: &[u8], count: u32, doc_count: u32) -> 
 
 /// Shared candidates pipeline: resolve grams against the term dict (no IO),
 /// fetch every needed posting block via `fetch_blocks`, evaluate purely.
-/// Returns local ids in `0..doc_count`.
+/// Returns local ids in `0..id_space`.
 pub(crate) fn candidates_with(
     get: impl Fn(&[u8]) -> Result<Option<eval::TermValue>>,
-    doc_count: u32,
+    id_space: u32,
+    strategy: Strategy,
     q: &Query,
+    expand: Option<&dyn Fn(DocId) -> RangeInclusive<DocId>>,
     fetch_blocks: impl FnOnce(&BTreeMap<u64, (u32, u64)>) -> Result<BTreeMap<u64, Vec<DocId>>>,
-) -> Result<Vec<DocId>> {
-    let resolved = eval::resolve(q, doc_count, &get)?;
+) -> Result<Selection> {
+    let resolved = eval::resolve(q, id_space, strategy, &get)?;
     let mut needed = BTreeMap::new();
     eval::blocks_needed(&resolved, &mut needed);
     let blocks = fetch_blocks(&needed)?;
-    match eval::eval(&resolved, &blocks)? {
-        Selection::All => Ok((0..doc_count).collect()),
-        Selection::Ids(ids) => Ok(ids),
-    }
+    eval::eval(&resolved, &blocks, expand)
 }
 
 pub struct LocalCorpus {
@@ -838,24 +844,39 @@ mod tests {
         let indexed =
             collect_file_trigrams(&mut file, 0, u64::try_from(bytes.len()).unwrap()).unwrap();
         assert!(matches!(indexed, IndexedGrams::TrigramBitmap(_)));
-        let actual = write_posting_runs(
-            vec![(
-                0,
-                IndexedGrams::TrigramSpool {
+        let (actual, max_lines) = write_posting_runs(
+            vec![GrammedDoc {
+                doc_id: 0,
+                base: 0,
+                grams: IndexedGrams::TrigramSpool {
                     offset: 0,
                     len: u64::try_from(bytes.len()).unwrap(),
                 },
-            )],
+            }],
             Strategy::Trigram,
             1024,
             Some(&file),
         )
         .unwrap();
-        let expected = write_trigram_run_radix(vec![(0, pack_trigram_grams(&bytes))]).unwrap();
-        assert_eq!(
-            std::fs::read(&actual[0]).unwrap(),
-            std::fs::read(expected).unwrap()
-        );
+        assert_eq!(max_lines.len(), 1, "deferred docs report a longest line");
+        let mut entries: Vec<u64> = seagrep_core::pack_trigram_block_grams(&bytes)
+            .into_iter()
+            .map(|(block, gram)| u64::from(gram) << 32 | u64::from(block))
+            .collect();
+        entries.sort_unstable();
+        let expected = write_trigram_run_radix(vec![]).unwrap();
+        let _ = expected;
+        let mut expected_bytes = Vec::new();
+        for entry in entries {
+            write_posting_record(
+                &mut expected_bytes,
+                Strategy::Trigram,
+                entry >> 32,
+                entry as u32,
+            )
+            .unwrap();
+        }
+        assert_eq!(std::fs::read(&actual[0]).unwrap(), expected_bytes);
     }
 
     #[test]
@@ -866,6 +887,14 @@ mod tests {
         builder.insert(&[0xff, 0x05, 0x06], 3, None).unwrap();
         let (bytes, _) = builder.finish().unwrap();
         assert_eq!(&bytes[..8], b"SGTERM01");
+    }
+
+    fn grammed(doc_id: usize, grams: IndexedGrams) -> GrammedDoc {
+        GrammedDoc {
+            doc_id,
+            base: u32::try_from(doc_id).unwrap(),
+            grams,
+        }
     }
 
     /// Merge runs into a scratch store and return (terms bytes, postings
@@ -895,8 +924,16 @@ mod tests {
 
     #[test]
     fn small_trigram_term_map_stays_single() {
-        let runs = write_posting_runs(
-            vec![(0, IndexedGrams::Trigram(vec![0x000102, 0x7f0304, 0xff0506]))],
+        let (runs, _) = write_posting_runs(
+            vec![GrammedDoc {
+                doc_id: 0,
+                base: 0,
+                grams: IndexedGrams::TrigramBlocks(vec![
+                    (0, 0x000102),
+                    (0, 0x7f0304),
+                    (0, 0xff0506),
+                ]),
+            }],
             Strategy::Trigram,
             1024,
             None,
@@ -912,8 +949,12 @@ mod tests {
             .map(|index| ((index * 31 + index / 7) % 251) as u8)
             .collect::<Vec<_>>();
         let expected = seagrep_core::sparse_grams_all_bytes(&text);
-        let runs = write_posting_runs(
-            vec![(0, IndexedGrams::Sparse(text.into()))],
+        let (runs, _) = write_posting_runs(
+            vec![GrammedDoc {
+                doc_id: 0,
+                base: 0,
+                grams: IndexedGrams::Sparse(text.into()),
+            }],
             Strategy::Sparse,
             1024,
             None,
@@ -960,12 +1001,12 @@ mod tests {
                 .collect::<Vec<_>>();
             spool.write_all(&text).unwrap();
             let len = u64::try_from(text.len()).unwrap();
-            memory_docs.push((idx, IndexedGrams::Sparse(text.into())));
-            spooled_docs.push((idx, IndexedGrams::SparseSpool { offset, len }));
+            memory_docs.push(grammed(idx, IndexedGrams::Sparse(text.into())));
+            spooled_docs.push(grammed(idx, IndexedGrams::SparseSpool { offset, len }));
             offset += len;
         }
-        let memory = write_posting_runs(memory_docs, Strategy::Sparse, 1 << 20, None).unwrap();
-        let spooled =
+        let (memory, _) = write_posting_runs(memory_docs, Strategy::Sparse, 1 << 20, None).unwrap();
+        let (spooled, _) =
             write_posting_runs(spooled_docs, Strategy::Sparse, 1 << 20, Some(&spool)).unwrap();
         let (memory_fst, memory_postings, _) = merge_to_store(memory, Strategy::Sparse, 64);
         let (spooled_fst, spooled_postings, _) = merge_to_store(spooled, Strategy::Sparse, 64);
@@ -978,8 +1019,8 @@ mod tests {
         let text = (0..SPARSE_FILE_CHUNK + 17)
             .map(|index| if index % 2 == 0 { b'a' } else { b'b' })
             .collect::<Vec<_>>();
-        let memory = write_posting_runs(
-            vec![(0, IndexedGrams::Sparse(text.clone().into()))],
+        let (memory, _) = write_posting_runs(
+            vec![grammed(0, IndexedGrams::Sparse(text.clone().into()))],
             Strategy::Sparse,
             1024,
             None,
@@ -987,8 +1028,8 @@ mod tests {
         .unwrap();
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&text).unwrap();
-        let streamed = write_posting_runs(
-            vec![(0, IndexedGrams::SparseFile(file))],
+        let (streamed, _) = write_posting_runs(
+            vec![grammed(0, IndexedGrams::SparseFile(file))],
             Strategy::Sparse,
             1024,
             None,
@@ -998,8 +1039,8 @@ mod tests {
         spool.write_all(b"prefix").unwrap();
         spool.write_all(&text).unwrap();
         spool.write_all(b"suffix").unwrap();
-        let spooled = write_posting_runs(
-            vec![(
+        let (spooled, _) = write_posting_runs(
+            vec![grammed(
                 0,
                 IndexedGrams::SparseSpool {
                     offset: 6,
@@ -1057,6 +1098,41 @@ mod tests {
             ids,
             (0..DocId::try_from(MAX_OPEN_POSTING_RUNS * 4).unwrap()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn posting_merge_is_byte_identical_across_run_partitions() {
+        let records = (0..4096usize)
+            .flat_map(|index| {
+                let gram = u64::try_from(index % 257).unwrap();
+                let id = DocId::try_from(index % 1024).unwrap();
+                [(gram, id), (gram, id)]
+            })
+            .collect::<Vec<_>>();
+        let make_runs = |partition_count: usize| {
+            (0..partition_count)
+                .map(|partition| {
+                    let mut partition_records = records
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, record)| {
+                            (index % partition_count == partition).then_some(*record)
+                        })
+                        .collect::<Vec<_>>();
+                    partition_records.sort_unstable();
+                    let mut file = tempfile::NamedTempFile::new().unwrap();
+                    for (gram, id) in partition_records {
+                        write_posting_record(&mut file, Strategy::Trigram, gram, id).unwrap();
+                    }
+                    file.flush().unwrap();
+                    file.into_temp_path()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let single = merge_to_store(make_runs(1), Strategy::Trigram, 1024);
+        let partitioned = merge_to_store(make_runs(128), Strategy::Trigram, 1024);
+        assert_eq!(single, partitioned);
     }
 
     #[test]
@@ -1254,6 +1330,10 @@ mod tests {
         assert_eq!(stats.hits, vec!["logs/a"]);
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.bytes_fetched, b"abc world".len());
+        assert_eq!(stats.regional_docs, 0);
+        assert_eq!(stats.whole_docs, 1);
+        assert_eq!(stats.candidate_bytes, b"abc world".len());
+        assert_eq!(stats.decoded_bytes, b"abc world".len());
     }
 
     #[test]

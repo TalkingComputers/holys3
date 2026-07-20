@@ -18,6 +18,7 @@ pub struct SourceObject {
 pub struct IndexAddress {
     pub segment: u32,
     pub document: u32,
+    pub blocks: Option<Vec<Range<u32>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,40 @@ pub struct DocAddress {
     pub encoding: crate::SourceEncoding,
     pub member_path: Option<String>,
     pub index: Option<IndexAddress>,
+}
+
+#[derive(Debug)]
+pub struct DocumentRegion {
+    pub start: u64,
+    pub line: u64,
+    pub bytes: Bytes,
+}
+
+#[derive(Debug)]
+pub enum FetchedDocument {
+    Whole(DocumentBody),
+    Regions {
+        decoded_size: u64,
+        regions: Vec<DocumentRegion>,
+    },
+}
+
+impl FetchedDocument {
+    pub fn decoded_size(&self) -> u64 {
+        match self {
+            Self::Whole(body) => body.len(),
+            Self::Regions { decoded_size, .. } => *decoded_size,
+        }
+    }
+
+    pub fn fetched_size(&self) -> u64 {
+        match self {
+            Self::Whole(body) => body.len(),
+            Self::Regions { regions, .. } => {
+                regions.iter().map(|region| region.bytes.len() as u64).sum()
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -75,15 +110,45 @@ pub trait Corpus: Sync {
 /// `consume` receives the index into `documents` plus the body, as
 /// fetches complete (order NOT guaranteed). Implementations may fetch
 /// concurrently; the first `consume` error aborts the remaining fetches.
-pub trait DocFetcher {
+pub trait DocFetcher: Sync {
     fn fetch_each(
         &self,
         documents: &[DocAddress],
         consume: &mut dyn FnMut(usize, DocumentBody) -> AnyhowResult<()>,
     ) -> AnyhowResult<()>;
+
+    fn fetch_candidate_each(
+        &self,
+        documents: &[DocAddress],
+        _bounded_len: Option<usize>,
+        _before_context: usize,
+        _after_context: usize,
+        consume: &mut dyn FnMut(usize, FetchedDocument) -> AnyhowResult<()>,
+    ) -> AnyhowResult<()> {
+        self.fetch_each(documents, &mut |index, body| {
+            consume(index, FetchedDocument::Whole(body))
+        })
+    }
+
+    fn fetch_candidate_lines(
+        &self,
+        document: &DocAddress,
+        _matches: &[Range<u64>],
+        _before_context: usize,
+        _after_context: usize,
+    ) -> AnyhowResult<FetchedDocument> {
+        let mut fetched = None;
+        self.fetch_each(std::slice::from_ref(document), &mut |_, body| {
+            fetched = Some(body);
+            Ok(())
+        })?;
+        fetched
+            .map(FetchedDocument::Whole)
+            .ok_or_else(|| anyhow::anyhow!("candidate line fetch returned no document"))
+    }
 }
 
-pub trait BlobStore {
+pub trait BlobStore: Sync {
     /// Every blob name under this store's root, when the backend can
     /// enumerate them. `None` means the capability is unavailable (test
     /// doubles); callers degrade to meta-driven garbage collection.

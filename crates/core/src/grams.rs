@@ -39,6 +39,36 @@ pub fn pack_trigram_grams(data: &[u8]) -> Vec<u32> {
     packed
 }
 
+/// Logical candidate-block size: postings can attribute grams to fixed
+/// 128 KiB windows of a document's decoded content, so verification fetches
+/// blocks instead of whole documents (#85). A trigram straddling a window
+/// boundary is attributed to the window of its FIRST byte; the reader
+/// compensates with per-document line-length slack when intersecting.
+pub const CANDIDATE_BLOCK_BYTES: usize = 128 * 1024;
+
+/// Distinct (block, packed-trigram) pairs of `data`, sorted by block then
+/// gram. Each 128 KiB window is deduplicated independently, so the output
+/// is the block-granular form of `pack_trigram_grams` (whose output equals
+/// the gram set of this function with blocks erased — pinned by test).
+pub fn pack_trigram_block_grams(data: &[u8]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    if data.len() < 3 {
+        return out;
+    }
+    let mut block = 0u32;
+    let mut start = 0usize;
+    while start + 2 < data.len() {
+        // Windows overlap by 2 bytes so straddling trigrams exist exactly
+        // once, attributed to the window containing their first byte.
+        let end = (start + CANDIDATE_BLOCK_BYTES + 2).min(data.len());
+        let grams = pack_trigram_grams(&data[start..end]);
+        out.extend(grams.into_iter().map(|gram| (block, gram)));
+        start += CANDIDATE_BLOCK_BYTES;
+        block += 1;
+    }
+    out
+}
+
 fn sort_packed_grams(grams: &mut Vec<u32>) {
     if grams.len() < RADIX_SORT_MIN {
         grams.sort_unstable();
@@ -285,6 +315,61 @@ mod tests {
             pack_trigram_grams(b"abcab"),
             vec![0x616263, 0x626361, 0x636162]
         );
+    }
+
+    #[test]
+    fn block_grams_erase_to_doc_grams() {
+        // Blocks erased and deduped must equal the doc-level gram set, for
+        // sizes hitting the empty, single-window, exact-boundary,
+        // boundary+straddler, and multi-window cases.
+        for len in [
+            0,
+            2,
+            3,
+            4096,
+            CANDIDATE_BLOCK_BYTES - 1,
+            CANDIDATE_BLOCK_BYTES,
+            CANDIDATE_BLOCK_BYTES + 1,
+            CANDIDATE_BLOCK_BYTES + 2,
+            CANDIDATE_BLOCK_BYTES + 3,
+            3 * CANDIDATE_BLOCK_BYTES + 17,
+        ] {
+            let mut state = 0x9e37_79b9_u32;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state % 7) as u8 + b'a'
+                })
+                .collect();
+            let mut erased: Vec<u32> = pack_trigram_block_grams(&data)
+                .into_iter()
+                .map(|(_, gram)| gram)
+                .collect();
+            erased.sort_unstable();
+            erased.dedup();
+            assert_eq!(erased, pack_trigram_grams(&data), "length {len}");
+        }
+    }
+
+    #[test]
+    fn straddling_trigram_attributed_to_first_byte_block() {
+        // A trigram whose bytes cross the window boundary belongs to the
+        // window of its first byte, and only that window.
+        let mut data = vec![b'a'; CANDIDATE_BLOCK_BYTES + 4];
+        let boundary = CANDIDATE_BLOCK_BYTES;
+        data[boundary - 1] = b'x';
+        data[boundary] = b'y';
+        data[boundary + 1] = b'z';
+        let gram = u32::from(b'x') << 16 | u32::from(b'y') << 8 | u32::from(b'z');
+        let pairs = pack_trigram_block_grams(&data);
+        let hits: Vec<u32> = pairs
+            .iter()
+            .filter(|(_, g)| *g == gram)
+            .map(|(b, _)| *b)
+            .collect();
+        assert_eq!(hits, vec![0], "xyz starts at the last byte of block 0");
     }
 
     #[test]

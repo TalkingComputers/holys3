@@ -9,10 +9,10 @@ use seagrep_index::{
     UpdateOptions,
 };
 use serde::{Deserialize, Serialize};
-use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,31 +31,30 @@ pub(crate) struct ChurnSummary {
 
 struct ChurnStore {
     inner: LocalBlobStore,
-    pack_bytes_written: Cell<u64>,
+    pack_bytes_written: AtomicU64,
 }
 
 impl ChurnStore {
     fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             inner: LocalBlobStore::new(root),
-            pack_bytes_written: Cell::new(0),
+            pack_bytes_written: AtomicU64::new(0),
         }
     }
 
     fn record_pack_write(&self, name: &str, len: u64) -> Result<()> {
         if name.starts_with("packs/") {
-            self.pack_bytes_written.set(
-                self.pack_bytes_written
-                    .get()
-                    .checked_add(len)
-                    .context("churn pack write count overflows")?,
-            );
+            self.pack_bytes_written
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(len)
+                })
+                .map_err(|_| anyhow::anyhow!("churn pack write count overflows"))?;
         }
         Ok(())
     }
 
     fn read_pack_bytes_written(&self) -> u64 {
-        self.pack_bytes_written.get()
+        self.pack_bytes_written.load(Ordering::Relaxed)
     }
 }
 

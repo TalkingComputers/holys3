@@ -31,13 +31,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 pub(crate) mod cache;
 mod compact;
 
-/// Per-segment doc cap: keeps every per-gram posting list far below the
-/// 2^24 `pack_posting` ceiling, and bounds build memory.
+/// Per-segment doc cap: keeps every sparse per-gram posting list far below
+/// the 2^24 `pack_posting` ceiling, and bounds build memory. Trigram
+/// postings address candidate blocks, whose per-segment id space is capped
+/// separately at `eval::MAX_POSTING_COUNT` during ingest and compaction.
 const SEGMENT_DOC_CAP: usize = 4_000_000;
 /// Compact (merge two adjacent segments) when more live segments than this.
 const SEGMENT_COUNT_TARGET: usize = 8;
@@ -51,6 +54,11 @@ const REPACK_DEAD_FRACTION: usize = 4;
 pub(crate) struct SegmentMeta {
     pub seg_id: String,
     pub doc_count: u32,
+    /// The posting id space. Trigram postings address 128 KiB candidate
+    /// blocks, so this is the segment's total block count; sparse postings
+    /// address documents, so this equals `doc_count`. `blocks_needed`,
+    /// `decode_posting_block`, and complement decoding all use this.
+    pub block_count: u64,
     pub terms_fst_len: u64,
     pub terms_fst_hash: String,
     /// SHA-256 of the sparse table's index+footer tail; empty for trigram.
@@ -82,6 +90,43 @@ pub(crate) struct SegmentList {
     pub source: SourceIdentity,
     pub strategy: Strategy,
     pub segments: Vec<SegmentMeta>,
+}
+
+#[derive(Deserialize)]
+struct SegmentListPayload {
+    source: SourceIdentity,
+    strategy: Strategy,
+    segments: Vec<SegmentMeta>,
+}
+
+#[derive(Debug)]
+struct IndexFormatMismatch {
+    found: u32,
+}
+
+impl std::fmt::Display for IndexFormatMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "index format {}; this seagrep reads format {INDEX_FORMAT}",
+            self.found
+        )?;
+        if self.found > INDEX_FORMAT {
+            write!(
+                formatter,
+                "; built by a newer seagrep; upgrade instead of rebuilding"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for IndexFormatMismatch {}
+
+fn is_newer_format(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<IndexFormatMismatch>()
+        .is_some_and(|mismatch| mismatch.found > INDEX_FORMAT)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,12 +224,19 @@ fn pack_blob(hash: &str) -> String {
 }
 
 fn parse_segment_list(bytes: &[u8]) -> Result<SegmentList> {
-    let list: SegmentList = postcard::from_bytes(bytes).context("segments.bin unreadable")?;
-    anyhow::ensure!(
-        list.format == INDEX_FORMAT,
-        "index format {} is not the current {INDEX_FORMAT}",
-        list.format
-    );
+    let (format, rest) =
+        postcard::take_from_bytes::<u32>(bytes).context("segments.bin format unreadable")?;
+    if format != INDEX_FORMAT {
+        return Err(IndexFormatMismatch { found: format }.into());
+    }
+    let payload: SegmentListPayload =
+        postcard::from_bytes(rest).context("segments.bin payload unreadable")?;
+    let list = SegmentList {
+        format,
+        source: payload.source,
+        strategy: payload.strategy,
+        segments: payload.segments,
+    };
     list.source.validate()?;
     let mut segment_ids = std::collections::HashSet::with_capacity(list.segments.len());
     for segment in &list.segments {
@@ -316,6 +368,7 @@ fn load_segment_list(store: &dyn BlobStore) -> Result<(RootState, Option<String>
         None => Ok((RootState::Absent, None)),
         Some((bytes, version)) => match parse_segment_list(&bytes) {
             Ok(list) => Ok((RootState::Loaded(list), Some(version))),
+            Err(error) if is_newer_format(&error) => Err(error),
             Err(err) => Ok((
                 RootState::Unreadable(format!("{err:#}"), bytes),
                 Some(version),
@@ -935,6 +988,132 @@ fn random_seg_id() -> Result<String> {
     Ok(hex_encode(&bytes))
 }
 
+/// The posting id space for a segment: candidate blocks for trigram
+/// (sum of `decoded_size.div_ceil(BLOCK)` over documents), documents for sparse.
+pub(crate) fn segment_block_count(strategy: Strategy, tables: &SegmentTables) -> u64 {
+    match strategy {
+        Strategy::Sparse => tables.documents.len() as u64,
+        Strategy::Trigram => tables
+            .documents
+            .iter()
+            .map(|doc| {
+                doc.decoded_size
+                    .div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64)
+            })
+            .sum(),
+    }
+}
+
+fn build_block_bases(tables: &SegmentTables) -> Result<Vec<u32>> {
+    let mut bases = Vec::with_capacity(tables.documents.len() + 1);
+    let mut next = 0u32;
+    bases.push(next);
+    for document in &tables.documents {
+        let blocks = document
+            .decoded_size
+            .div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64);
+        next = next
+            .checked_add(u32::try_from(blocks)?)
+            .context("segment candidate block count overflows u32")?;
+        bases.push(next);
+    }
+    Ok(bases)
+}
+
+fn block_document(id: u32, bases: &[u32]) -> usize {
+    bases.partition_point(|base| *base <= id) - 1
+}
+
+fn single_range<T>(range: std::ops::Range<T>) -> Vec<std::ops::Range<T>> {
+    std::iter::once(range).collect()
+}
+
+fn expand_block(
+    id: u32,
+    bases: &[u32],
+    tables: &SegmentTables,
+    bounded_len: Option<usize>,
+) -> std::ops::RangeInclusive<u32> {
+    let document = block_document(id, bases);
+    let start = bases[document];
+    let end = bases[document + 1] - 1;
+    let block_bytes = seagrep_core::CANDIDATE_BLOCK_BYTES;
+    let line_slack = match tables.documents[document].max_line_len {
+        u32::MAX => end - start + 1,
+        max_line_len => {
+            1 + max_line_len / u32::try_from(block_bytes).expect("candidate block size fits u32")
+        }
+    };
+    let match_slack = bounded_len
+        .filter(|bound| *bound <= block_bytes)
+        .map(|bound| 1 + bound.saturating_sub(1) / block_bytes)
+        .and_then(|slack| u32::try_from(slack).ok());
+    // Every gram of one bounded match lies within match_slack blocks of a
+    // witness block, so intersecting expanded postings cannot remove a hit.
+    let slack = match_slack.map_or(line_slack, |slack| slack.min(line_slack));
+    id.saturating_sub(slack).max(start)..=id.saturating_add(slack).min(end)
+}
+
+fn blocks_to_doc_ranges(ids: Vec<u32>, bases: &[u32]) -> Vec<(u32, Vec<std::ops::Range<u32>>)> {
+    let mut documents: Vec<(u32, Vec<std::ops::Range<u32>>)> = Vec::new();
+    for id in ids {
+        let document_index = block_document(id, bases);
+        let document = u32::try_from(document_index).expect("document ID fits u32");
+        let local = id - bases[document_index];
+        if documents
+            .last()
+            .is_none_or(|(current, _)| *current != document)
+        {
+            documents.push((document, single_range(local..local + 1)));
+            continue;
+        }
+        let ranges = &mut documents.last_mut().expect("document exists").1;
+        let range = ranges.last_mut().expect("document range exists");
+        if range.end == local {
+            range.end += 1;
+        } else {
+            ranges.push(local..local + 1);
+        }
+    }
+    documents
+}
+
+fn candidate_byte_ranges(
+    decoded_size: u64,
+    blocks: &[std::ops::Range<u32>],
+) -> Option<Vec<std::ops::Range<u64>>> {
+    const GAP_BYTES: u64 = 1024 * 1024;
+    const MAX_RANGES: usize = 512;
+    let block_bytes = seagrep_core::CANDIDATE_BLOCK_BYTES as u64;
+    let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+    for blocks in blocks {
+        let range = u64::from(blocks.start) * block_bytes
+            ..(u64::from(blocks.end) * block_bytes).min(decoded_size);
+        if let Some(previous) = ranges.last_mut() {
+            if range.start.saturating_sub(previous.end) <= GAP_BYTES {
+                previous.end = range.end;
+                continue;
+            }
+        }
+        ranges.push(range);
+    }
+    let covered: u64 = ranges.iter().map(|range| range.end - range.start).sum();
+    (ranges.len() <= MAX_RANGES && covered.saturating_mul(2) <= decoded_size).then_some(ranges)
+}
+
+fn has_complete_block_newlines(decoded_size: u64, block_newlines: &[u32]) -> bool {
+    u64::try_from(block_newlines.len()).is_ok_and(|count| {
+        count == decoded_size.div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64)
+    })
+}
+
+struct RegionFetch {
+    index: usize,
+    segment: usize,
+    document: usize,
+    ranges: Vec<std::ops::Range<u64>>,
+}
+
 pub(crate) fn merge_and_put_segment(
     store: &dyn BlobStore,
     strategy: Strategy,
@@ -971,6 +1150,13 @@ pub(crate) fn merge_and_put_segment(
     }
     let docs_bytes = postcard::to_allocvec(tables)?;
     let docs_hash = sha256_hex(&[&docs_bytes]);
+    let block_count = segment_block_count(strategy, tables);
+    // Backstop for the ingest and compaction caps: a wider id space could
+    // produce per-gram counts that `pack_posting` cannot store.
+    anyhow::ensure!(
+        block_count <= crate::eval::MAX_POSTING_COUNT,
+        "segment posting id space of {block_count} exceeds the 2^24 format limit"
+    );
     let seg_id = random_seg_id()?;
     for pack in packs {
         store.put_file(&pack_blob(pack.hash()), pack.path())?;
@@ -987,7 +1173,7 @@ pub(crate) fn merge_and_put_segment(
         let merged = crate::build::merge_posting_runs(
             runs,
             strategy,
-            u32::try_from(tables.documents.len())?,
+            u32::try_from(block_count).context("segment exceeds the candidate block id space")?,
             terms_sink,
             postings_sink,
         )?;
@@ -1009,6 +1195,7 @@ pub(crate) fn merge_and_put_segment(
     let meta = SegmentMeta {
         seg_id,
         doc_count: u32::try_from(tables.documents.len())?,
+        block_count,
         terms_fst_len: fst.len,
         terms_fst_hash: fst.hash,
         terms_tail_hash,
@@ -1035,6 +1222,7 @@ struct Segment {
     map: TermMap,
     dead: DeadSet,
     tables: OnceLock<SegmentTables>,
+    block_bases: OnceLock<Vec<u32>>,
     postings_table: OnceLock<std::sync::Arc<crate::postings_table::PostingsTableIndex>>,
 }
 
@@ -1052,6 +1240,106 @@ pub struct SegmentedReader {
 }
 
 impl SegmentedReader {
+    fn fetch_region(
+        &self,
+        request: &RegionFetch,
+        bounded_len: Option<usize>,
+        before_context: usize,
+        after_context: usize,
+    ) -> Result<seagrep_core::FetchedDocument> {
+        let segment = &self.segments[request.segment];
+        let tables = self.classify_index_result(self.segment_tables(segment))?;
+        let document = &tables.documents[request.document];
+        let pack_cache = crate::pack::PackBlockCache {
+            cache_dir: &self.cache_dir,
+            seg_id: &segment.meta.seg_id,
+            note_written: &|bytes| self.note_range_written(bytes),
+        };
+        self.classify_index_result(crate::pack::fetch_regions(
+            self.store.as_ref(),
+            self.range_cache().then_some(&pack_cache),
+            &segment.meta.packs,
+            &tables.blocks,
+            &crate::pack::PackRegionRequest {
+                slice: crate::pack::PackSlice {
+                    first_block: document.first_block,
+                    block_offset: document.block_offset,
+                },
+                decoded_size: document.decoded_size,
+                ranges: &request.ranges,
+                block_newlines: &document.block_newlines,
+            },
+            crate::pack::RegionFetchOptions {
+                bounded_len,
+                before_context,
+                after_context,
+            },
+        ))
+    }
+
+    fn fetch_regions_parallel(
+        &self,
+        requests: &[RegionFetch],
+        bounded_len: Option<usize>,
+        before_context: usize,
+        after_context: usize,
+        consume: &mut dyn FnMut(usize, seagrep_core::FetchedDocument) -> Result<()>,
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let workers = std::thread::available_parallelism()?
+            .get()
+            .min(requests.len());
+        let next = AtomicUsize::new(0);
+        let cancelled = AtomicBool::new(false);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<
+            Result<(usize, seagrep_core::FetchedDocument)>,
+        >(workers * 2);
+        let failure = std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let sender = sender.clone();
+                let next = &next;
+                let cancelled = &cancelled;
+                scope.spawn(move || {
+                    while !cancelled.load(Ordering::Relaxed) {
+                        let request_index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(request) = requests.get(request_index) else {
+                            break;
+                        };
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            self.fetch_region(request, bounded_len, before_context, after_context)
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("a region fetch worker panicked")))
+                        .map(|document| (request.index, document));
+                        if result.is_err() {
+                            cancelled.store(true, Ordering::Relaxed);
+                        }
+                        if sender.send(result).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(sender);
+            let mut failure = None;
+            while let Ok(delivery) = receiver.recv() {
+                let result = delivery.and_then(|(index, document)| consume(index, document));
+                if let Err(error) = result {
+                    cancelled.store(true, Ordering::Relaxed);
+                    failure = Some(error);
+                    break;
+                }
+            }
+            drop(receiver);
+            failure
+        });
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn range_cache(&self) -> bool {
         self.range_cache_max > 0
     }
@@ -1060,8 +1348,7 @@ impl SegmentedReader {
     /// it within one long-lived reader by re-sweeping after every quarter
     /// cap of fresh writes.
     fn note_range_written(&self, bytes: u64) {
-        self.range_written
-            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.range_written.fetch_add(bytes, Ordering::Relaxed);
         self.sweep_if_due();
     }
 
@@ -1100,8 +1387,14 @@ impl SegmentedReader {
             .get_versioned("segments.bin")
             .context("reading segments.bin")?
             .ok_or(IndexMissing)?;
-        let list = parse_segment_list(&bytes)
-            .context("index is not usable as-is; run `seagrep index` to rebuild")?;
+        let list = match parse_segment_list(&bytes) {
+            Err(error) if is_newer_format(&error) => {
+                return Err(error);
+            }
+            result => {
+                result.context("index is not usable as-is; run `seagrep index` to rebuild")?
+            }
+        };
         if let Some(source) = source {
             anyhow::ensure!(
                 list.source.can_search(source),
@@ -1167,6 +1460,22 @@ impl SegmentedReader {
         Ok(segment.tables.get_or_init(|| loaded))
     }
 
+    fn segment_block_bases<'a>(&self, segment: &'a Segment) -> Result<&'a [u32]> {
+        if let Some(bases) = segment.block_bases.get() {
+            return Ok(bases);
+        }
+        let bases = build_block_bases(self.segment_tables(segment)?)?;
+        anyhow::ensure!(
+            bases.last().copied().unwrap_or(0) as u64 == segment.meta.block_count,
+            "segment candidate block count differs from its document table"
+        );
+        segment.block_bases.set(bases).ok();
+        Ok(segment
+            .block_bases
+            .get()
+            .context("segment block bases were not initialized")?)
+    }
+
     /// Can any key with `prefix` live in this segment's `[min_key, max_key]`?
     fn prefix_overlaps(meta: &SegmentMeta, prefix: &str) -> bool {
         if meta.max_key.as_str() < prefix {
@@ -1213,6 +1522,7 @@ impl SegmentedReader {
         &self,
         q: &Query,
         key_prefix: Option<&str>,
+        bounded_len: Option<usize>,
         batch_size: usize,
         visit: &mut dyn FnMut(Vec<DocAddress>) -> Result<bool>,
     ) -> Result<()> {
@@ -1246,14 +1556,42 @@ impl SegmentedReader {
                     .map(|&(packed, len)| crate::eval::TermValue { packed, len })),
                 None => segment.map.get(gram),
             };
-            let ids = self.classify_index_result(candidates_with(
+            let tables = match self.strategy {
+                Strategy::Trigram => {
+                    Some(self.classify_index_result(self.segment_tables(segment))?)
+                }
+                Strategy::Sparse => None,
+            };
+            let block_bases = match self.strategy {
+                Strategy::Trigram => {
+                    Some(self.classify_index_result(self.segment_block_bases(segment))?)
+                }
+                Strategy::Sparse => None,
+            };
+            let expand_block = |id| {
+                expand_block(
+                    id,
+                    block_bases.expect("trigram block bases are loaded"),
+                    tables.expect("trigram document tables are loaded"),
+                    bounded_len,
+                )
+            };
+            let expand = match self.strategy {
+                Strategy::Trigram => {
+                    Some(&expand_block as &dyn Fn(u32) -> std::ops::RangeInclusive<u32>)
+                }
+                Strategy::Sparse => None,
+            };
+            let id_space = u32::try_from(segment.meta.block_count)?;
+            let selection = self.classify_index_result(candidates_with(
                 lookup,
-                segment.meta.doc_count,
+                id_space,
+                self.strategy,
                 q,
+                expand,
                 |needed| {
-                    let doc_count = segment.meta.doc_count;
                     let table = self.postings_table(segment)?;
-                    let ranges = posting_ranges(needed, doc_count, table.data_len)?;
+                    let ranges = posting_ranges(needed, id_space, table.data_len)?;
                     // Fetch at verification-block granularity: every block
                     // checks against the trusted table before any list is
                     // sliced out. Corruption aborts the query loudly —
@@ -1333,10 +1671,10 @@ impl SegmentedReader {
                             };
                             let decoded = match self.strategy {
                                 Strategy::Sparse => crate::delta_blocks::decode_delta_blocks(
-                                    &bytes, count, doc_count,
+                                    &bytes, count, id_space,
                                 )?,
                                 Strategy::Trigram => {
-                                    crate::decode_posting_block(&bytes, count, doc_count)?
+                                    crate::decode_posting_block(&bytes, count, id_space)?
                                 }
                             };
                             Ok((offset, decoded))
@@ -1344,9 +1682,24 @@ impl SegmentedReader {
                         .collect()
                 },
             ))?;
-            let mut live = ids
+            let documents: Vec<(u32, Option<Vec<std::ops::Range<u32>>>)> = match selection {
+                crate::eval::Selection::All => (0..segment.meta.doc_count)
+                    .map(|document| (document, None))
+                    .collect(),
+                crate::eval::Selection::Ids(ids) => match self.strategy {
+                    Strategy::Trigram => blocks_to_doc_ranges(
+                        ids,
+                        block_bases.expect("trigram block bases are loaded"),
+                    )
+                    .into_iter()
+                    .map(|(document, ranges)| (document, Some(ranges)))
+                    .collect(),
+                    Strategy::Sparse => ids.into_iter().map(|document| (document, None)).collect(),
+                },
+            };
+            let mut live = documents
                 .into_iter()
-                .filter(|id| segment.dead.documents.binary_search(id).is_err())
+                .filter(|(id, _)| segment.dead.documents.binary_search(id).is_err())
                 .peekable();
             if live.peek().is_none() {
                 continue;
@@ -1354,7 +1707,7 @@ impl SegmentedReader {
             let tables = self.classify_index_result(self.segment_tables(segment))?;
             let capacity = batch_size.min(usize::try_from(segment.meta.doc_count)?);
             let mut batch = Vec::with_capacity(capacity);
-            for id in live {
+            for (id, blocks) in live {
                 let document = &tables.documents[id as usize];
                 if batch.len() >= batch_size {
                     if !visit(std::mem::take(&mut batch))? {
@@ -1373,6 +1726,7 @@ impl SegmentedReader {
                     index: Some(IndexAddress {
                         segment: u32::try_from(segment_id)?,
                         document: id,
+                        blocks,
                     }),
                 });
             }
@@ -1385,7 +1739,7 @@ impl SegmentedReader {
 
     fn read_candidate_docs(&self, q: &Query, key_prefix: Option<&str>) -> Result<Vec<DocAddress>> {
         let mut documents = Vec::new();
-        self.read_candidate_batches(q, key_prefix, 16_384, &mut |batch| {
+        self.read_candidate_batches(q, key_prefix, None, 16_384, &mut |batch| {
             documents.extend(batch);
             Ok(true)
         })?;
@@ -1717,6 +2071,7 @@ fn load_segment(
             map: TermMap::SparseRemote { index },
             dead: load_dead(store, cache_dir, meta)?,
             tables: OnceLock::new(),
+            block_bases: OnceLock::new(),
             postings_table: OnceLock::new(),
             meta: meta.clone(),
         });
@@ -1738,6 +2093,7 @@ fn load_segment(
         map,
         dead,
         tables: OnceLock::new(),
+        block_bases: OnceLock::new(),
         postings_table: OnceLock::new(),
         meta: meta.clone(),
     })
@@ -1832,10 +2188,11 @@ impl crate::IndexReader for SegmentedReader {
         &self,
         q: &Query,
         key_prefix: Option<&str>,
+        bounded_len: Option<usize>,
         batch_size: usize,
         visit: &mut dyn FnMut(Vec<DocAddress>) -> Result<bool>,
     ) -> Result<()> {
-        self.read_candidate_batches(q, key_prefix, batch_size, visit)
+        self.read_candidate_batches(q, key_prefix, bounded_len, batch_size, visit)
     }
 
     fn stats(&self) -> crate::IndexStats {
@@ -1908,6 +2265,128 @@ impl seagrep_core::DocFetcher for SegmentedReader {
         }
         Ok(())
     }
+
+    fn fetch_candidate_each(
+        &self,
+        documents: &[DocAddress],
+        bounded_len: Option<usize>,
+        before_context: usize,
+        after_context: usize,
+        consume: &mut dyn FnMut(usize, seagrep_core::FetchedDocument) -> Result<()>,
+    ) -> Result<()> {
+        let mut whole = Vec::new();
+        let mut regional = Vec::new();
+        for (index, address) in documents.iter().enumerate() {
+            let indexed = address
+                .index
+                .as_ref()
+                .context("candidate has no index snapshot address")?;
+            let segment = self
+                .segments
+                .get(usize::try_from(indexed.segment)?)
+                .context("candidate segment is out of bounds")?;
+            let tables = self.classify_index_result(self.segment_tables(segment))?;
+            let document = tables
+                .documents
+                .get(usize::try_from(indexed.document)?)
+                .context("candidate document is out of bounds")?;
+            anyhow::ensure!(
+                document.display_key == address.display_key,
+                "candidate display key differs from its index entry"
+            );
+            if !has_complete_block_newlines(document.decoded_size, &document.block_newlines) {
+                whole.push(index);
+                continue;
+            }
+            debug_assert_eq!(
+                u64::try_from(document.block_newlines.len()).ok(),
+                Some(
+                    document
+                        .decoded_size
+                        .div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64)
+                )
+            );
+            let Some(ranges) = indexed
+                .blocks
+                .as_deref()
+                .and_then(|blocks| candidate_byte_ranges(document.decoded_size, blocks))
+            else {
+                whole.push(index);
+                continue;
+            };
+            regional.push(RegionFetch {
+                index,
+                segment: usize::try_from(indexed.segment)?,
+                document: usize::try_from(indexed.document)?,
+                ranges,
+            });
+        }
+        self.fetch_regions_parallel(
+            &regional,
+            bounded_len,
+            before_context,
+            after_context,
+            consume,
+        )?;
+        if !whole.is_empty() {
+            let selected = whole
+                .iter()
+                .map(|index| documents[*index].clone())
+                .collect::<Vec<_>>();
+            self.fetch_each(&selected, &mut |selected_index, body| {
+                consume(
+                    whole[selected_index],
+                    seagrep_core::FetchedDocument::Whole(body),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn fetch_candidate_lines(
+        &self,
+        address: &DocAddress,
+        matches: &[std::ops::Range<u64>],
+        before_context: usize,
+        after_context: usize,
+    ) -> Result<seagrep_core::FetchedDocument> {
+        let indexed = address
+            .index
+            .as_ref()
+            .context("candidate has no index snapshot address")?;
+        let segment_index = usize::try_from(indexed.segment)?;
+        let document_index = usize::try_from(indexed.document)?;
+        let segment = self
+            .segments
+            .get(segment_index)
+            .context("candidate segment is out of bounds")?;
+        let tables = self.classify_index_result(self.segment_tables(segment))?;
+        let document = tables
+            .documents
+            .get(document_index)
+            .context("candidate document is out of bounds")?;
+        if !has_complete_block_newlines(document.decoded_size, &document.block_newlines) {
+            let mut fetched = None;
+            self.fetch_each(std::slice::from_ref(address), &mut |_, body| {
+                fetched = Some(body);
+                Ok(())
+            })?;
+            return fetched
+                .map(seagrep_core::FetchedDocument::Whole)
+                .context("candidate line fetch returned no document");
+        }
+        self.fetch_region(
+            &RegionFetch {
+                index: 0,
+                segment: segment_index,
+                document: document_index,
+                ranges: matches.to_vec(),
+            },
+            None,
+            before_context,
+            after_context,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1924,6 +2403,7 @@ mod tests {
         SegmentMeta {
             seg_id: "a".repeat(64),
             doc_count: 1,
+            block_count: 1,
             terms_fst_len: 1,
             terms_fst_hash: "b".repeat(64),
             terms_tail_hash: String::new(),
@@ -1982,8 +2462,10 @@ mod tests {
 
     #[test]
     fn unreadable_root_advises_reindex_only_on_the_search_path() {
-        let parse_error = match parse_segment_list(b"garbage") {
-            Ok(_) => panic!("garbage must not parse"),
+        let mut corrupt = postcard::to_allocvec(&INDEX_FORMAT).unwrap();
+        corrupt.extend_from_slice(b"invalid payload");
+        let parse_error = match parse_segment_list(&corrupt) {
+            Ok(_) => panic!("corrupt payload must not parse"),
             Err(error) => error,
         };
         assert!(
@@ -1993,7 +2475,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = seagrep_core::LocalBlobStore::new(dir.path());
-        store.put("segments.bin", b"garbage").unwrap();
+        store.put("segments.bin", &corrupt).unwrap();
         let open_error = match SegmentedReader::inspect(Box::new(store), dir.path()) {
             Ok(_) => panic!("corrupt root must not open"),
             Err(error) => error,
@@ -2002,6 +2484,61 @@ mod tests {
             format!("{open_error:#}").contains("run `seagrep index` to rebuild"),
             "{open_error:#}"
         );
+    }
+
+    #[test]
+    fn segment_list_reports_format_before_decoding_payload() {
+        let mut newer = postcard::to_allocvec(&(INDEX_FORMAT + 1)).unwrap();
+        newer.extend_from_slice(b"invalid payload");
+        let newer_error = match parse_segment_list(&newer) {
+            Ok(_) => panic!("newer format must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            newer_error.to_string(),
+            format!(
+                "index format {}; this seagrep reads format {INDEX_FORMAT}; built by a newer seagrep; upgrade instead of rebuilding",
+                INDEX_FORMAT + 1
+            )
+        );
+
+        let mut older = postcard::to_allocvec(&(INDEX_FORMAT - 1)).unwrap();
+        older.extend_from_slice(b"invalid payload");
+        let older_error = match parse_segment_list(&older) {
+            Ok(_) => panic!("older format must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            older_error.to_string(),
+            format!(
+                "index format {}; this seagrep reads format {INDEX_FORMAT}",
+                INDEX_FORMAT - 1
+            )
+        );
+    }
+
+    #[test]
+    fn newer_index_advises_upgrade_without_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = seagrep_core::LocalBlobStore::new(dir.path());
+        let mut newer = postcard::to_allocvec(&(INDEX_FORMAT + 1)).unwrap();
+        newer.extend_from_slice(b"invalid payload");
+        store.put("segments.bin", &newer).unwrap();
+
+        let error = match SegmentedReader::inspect(Box::new(store), dir.path()) {
+            Ok(_) => panic!("newer format must not open"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("built by a newer seagrep; upgrade instead of rebuilding"));
+        assert!(!message.contains("run `seagrep index`"), "{message}");
+
+        let store = seagrep_core::LocalBlobStore::new(dir.path());
+        let update_error = match load_segment_list(&store) {
+            Ok(_) => panic!("newer format must not become a rebuildable root"),
+            Err(error) => error,
+        };
+        assert_eq!(update_error.to_string(), message);
     }
 
     #[test]
@@ -2127,6 +2664,8 @@ mod tests {
                 decoded_size: 1,
                 first_block: 0,
                 block_offset: 0,
+                max_line_len: 0,
+                block_newlines: Vec::new(),
             }],
             blocks: vec![crate::pack::PackBlock {
                 pack: 0,
@@ -2199,6 +2738,94 @@ mod tests {
     }
 
     #[test]
+    fn saturated_max_line_expands_to_the_whole_document() {
+        let tables = SegmentTables {
+            sources: Vec::new(),
+            documents: vec![DocEntry {
+                display_key: "large".into(),
+                source_id: 0,
+                member_path: None,
+                decoded_size: 4 * seagrep_core::CANDIDATE_BLOCK_BYTES as u64,
+                first_block: 0,
+                block_offset: 0,
+                max_line_len: u32::MAX,
+                block_newlines: Vec::new(),
+            }],
+            blocks: Vec::new(),
+        };
+        let bases = build_block_bases(&tables).unwrap();
+
+        assert_eq!(expand_block(2, &bases, &tables, None), 0..=3);
+        let grouped =
+            blocks_to_doc_ranges(expand_block(2, &bases, &tables, None).collect(), &bases);
+        assert_eq!(grouped, vec![(0, single_range(0..4))]);
+        assert_eq!(
+            candidate_byte_ranges(tables.documents[0].decoded_size, &grouped[0].1),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_match_slack_beats_saturated_line_slack() {
+        let tables = SegmentTables {
+            sources: Vec::new(),
+            documents: vec![DocEntry {
+                display_key: "large".into(),
+                source_id: 0,
+                member_path: None,
+                decoded_size: 8 * seagrep_core::CANDIDATE_BLOCK_BYTES as u64,
+                first_block: 0,
+                block_offset: 0,
+                max_line_len: u32::MAX,
+                block_newlines: Vec::new(),
+            }],
+            blocks: Vec::new(),
+        };
+        let bases = build_block_bases(&tables).unwrap();
+
+        assert_eq!(expand_block(4, &bases, &tables, Some(40)), 3..=5);
+    }
+
+    #[test]
+    fn block_candidates_group_and_merge_per_document() {
+        assert_eq!(
+            blocks_to_doc_ranges(vec![0, 1, 3, 4, 5, 7], &[0, 4, 8]),
+            vec![(0, vec![0..2, 3..4]), (1, vec![0..2, 3..4])]
+        );
+    }
+
+    #[test]
+    fn candidate_ranges_coalesce_and_fall_back_on_majority_coverage() {
+        let block = seagrep_core::CANDIDATE_BLOCK_BYTES as u64;
+        assert_eq!(
+            candidate_byte_ranges(20 * block, &[0..1, 8..9]),
+            Some(single_range(0..9 * block))
+        );
+        assert_eq!(candidate_byte_ranges(4 * block, &single_range(0..3)), None);
+        let fragmented = (0..64)
+            .map(|index| index * 10..index * 10 + 1)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidate_byte_ranges(1000 * block, &fragmented)
+                .expect("64 sparse ranges stay regional")
+                .len(),
+            64
+        );
+    }
+
+    #[test]
+    fn incomplete_block_newlines_force_whole_document_fetch() {
+        let block = seagrep_core::CANDIDATE_BLOCK_BYTES as u64;
+
+        assert!(has_complete_block_newlines(0, &[]));
+        assert!(has_complete_block_newlines(block, &[0]));
+        assert!(has_complete_block_newlines(block + 1, &[0, 0]));
+        assert!(!has_complete_block_newlines(block, &[]));
+        assert!(!has_complete_block_newlines(block + 1, &[0]));
+        assert!(!has_complete_block_newlines(block, &[0, 0]));
+    }
+
+    #[test]
     fn unmergeable_segment_set_converges_without_root_rewrite() {
         let store_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
@@ -2225,6 +2852,8 @@ mod tests {
                     decoded_size: 1,
                     first_block: 0,
                     block_offset: 0,
+                    max_line_len: 0,
+                    block_newlines: Vec::new(),
                 }],
                 blocks: vec![crate::pack::PackBlock {
                     pack: 0,
@@ -2296,6 +2925,26 @@ mod tests {
                 !maybe_compact(&store, cache_dir.path(), Strategy::Trigram, &mut segments).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn compaction_declines_merges_beyond_the_posting_count_ceiling() {
+        // Trigram postings pack per-gram id counts into 24 bits; merging two
+        // segments whose combined candidate-block space exceeds that could
+        // produce unencodable postings, so no victim pair may qualify.
+        let store_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let store = seagrep_core::LocalBlobStore::new(store_dir.path());
+        let mut segments: Vec<(SegmentMeta, DeadSet)> = (0..=SEGMENT_COUNT_TARGET)
+            .map(|_| {
+                let mut meta = segment();
+                meta.block_count = crate::eval::MAX_POSTING_COUNT / 2 + 1;
+                (meta, DeadSet::default())
+            })
+            .collect();
+        assert!(
+            !maybe_compact(&store, cache_dir.path(), Strategy::Trigram, &mut segments).unwrap()
+        );
     }
 
     #[test]

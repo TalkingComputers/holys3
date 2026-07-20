@@ -40,6 +40,15 @@ pub(super) fn maybe_compact(
                     .saturating_add(segments[i + 1].0.docs_len)
                     <= MERGE_DOCS_CAP
                 && live(&segments[i]).saturating_add(live(&segments[i + 1])) <= SEGMENT_DOC_CAP
+                // The merged posting id space (candidate blocks for trigram)
+                // must stay within the 24-bit `pack_posting` count ceiling.
+                // Summing whole-segment block counts overstates the live
+                // total, which only makes this check conservative.
+                && segments[i]
+                    .0
+                    .block_count
+                    .saturating_add(segments[i + 1].0.block_count)
+                    <= crate::eval::MAX_POSTING_COUNT
         })
         .min_by_key(|&i| live(&segments[i]).saturating_add(live(&segments[i + 1])))
     else {
@@ -62,6 +71,8 @@ fn write_compaction_run(
     cache_dir: &Path,
     strategy: Strategy,
     meta: &SegmentMeta,
+    old_tables: &SegmentTables,
+    new_bases: &[u32],
     remap: &[Option<DocId>],
 ) -> Result<tempfile::TempPath> {
     let terms_path = cached_file(
@@ -88,16 +99,30 @@ fn write_compaction_run(
         postings.advise(memmap2::Advice::Sequential)?;
     }
     let map = TermMap::open(terms, strategy)?;
+    let old_bases = match strategy {
+        Strategy::Trigram => {
+            let bases = super::build_block_bases(old_tables)?;
+            anyhow::ensure!(
+                bases.last().copied().unwrap_or(0) as u64 == meta.block_count,
+                "compaction source block count differs from its document table"
+            );
+            bases
+        }
+        Strategy::Sparse => Vec::new(),
+    };
+    let id_space = u32::try_from(meta.block_count)?;
     let mut file = tempfile::NamedTempFile::new()?;
     let mut writer = BufWriter::new(file.as_file_mut());
     map.visit(|gram, packed, len| {
         write_live_entry(
             &mut writer,
             strategy,
-            meta.doc_count,
+            id_space,
             meta.postings_data_len,
             &postings,
             remap,
+            &old_bases,
+            new_bases,
             gram,
             packed,
             len,
@@ -112,10 +137,12 @@ fn write_compaction_run(
 fn write_live_entry(
     writer: &mut impl Write,
     strategy: Strategy,
-    doc_count: u32,
+    id_space: u32,
     postings_len: u64,
     postings: &[u8],
     remap: &[Option<DocId>],
+    old_bases: &[u32],
+    new_bases: &[u32],
     gram: &[u8],
     packed: u64,
     len: Option<u64>,
@@ -130,26 +157,23 @@ fn write_live_entry(
     padded[8 - gram.len()..].copy_from_slice(gram);
     let key = u64::from_be_bytes(padded);
     if count == 1 {
-        // Singleton grams inline their doc id in the offset field; no
+        // Singleton grams inline their posting id in the offset field; no
         // posting block exists to read.
-        let id = u32::try_from(offset).context("singleton doc id overflows u32")?;
-        if let Some(new_id) = remap
-            .get(usize::try_from(id)?)
-            .context("singleton document ID is out of bounds")?
-        {
-            crate::build::write_posting_record(writer, strategy, key, *new_id)?;
+        let id = u32::try_from(offset).context("singleton posting id overflows u32")?;
+        if let Some(new_id) = remap_posting_id(strategy, id, remap, old_bases, new_bases)? {
+            crate::build::write_posting_record(writer, strategy, key, new_id)?;
         }
         return Ok(());
     }
     anyhow::ensure!(
-        count <= doc_count,
-        "term map posting count exceeds its segment document count"
+        count <= id_space,
+        "term map posting count exceeds its segment id space"
     );
     let len = match strategy {
         Strategy::Sparse => len.context("sparse entries must carry a posting length")?,
         Strategy::Trigram => {
             anyhow::ensure!(len.is_none(), "trigram lengths derive from counts");
-            crate::posting_block_len(count, doc_count)
+            crate::posting_block_len(count, id_space)
         }
     };
     let end = offset
@@ -163,16 +187,13 @@ fn write_live_entry(
         .get(usize::try_from(offset)?..usize::try_from(end)?)
         .context("truncated postings.bin during merge")?;
     let decoded = match strategy {
-        Strategy::Sparse => crate::delta_blocks::decode_delta_blocks(block, count, doc_count)?,
-        Strategy::Trigram => crate::decode_posting_block(block, count, doc_count)?,
+        Strategy::Sparse => crate::delta_blocks::decode_delta_blocks(block, count, id_space)?,
+        Strategy::Trigram => crate::decode_posting_block(block, count, id_space)?,
     };
     let mut ids = Vec::new();
     for id in decoded {
-        if let Some(id) = remap
-            .get(usize::try_from(id)?)
-            .context("posting document ID is out of bounds")?
-        {
-            ids.push(*id);
+        if let Some(id) = remap_posting_id(strategy, id, remap, old_bases, new_bases)? {
+            ids.push(id);
         }
     }
     ids.sort_unstable();
@@ -181,6 +202,34 @@ fn write_live_entry(
         crate::build::write_posting_record(writer, strategy, key, id)?;
     }
     Ok(())
+}
+
+fn remap_posting_id(
+    strategy: Strategy,
+    id: u32,
+    remap: &[Option<DocId>],
+    old_bases: &[u32],
+    new_bases: &[u32],
+) -> Result<Option<u32>> {
+    let old_document = match strategy {
+        Strategy::Sparse => usize::try_from(id)?,
+        Strategy::Trigram => super::block_document(id, old_bases),
+    };
+    let Some(new_document) = remap
+        .get(old_document)
+        .context("posting ID is outside its segment")?
+    else {
+        return Ok(None);
+    };
+    match strategy {
+        Strategy::Sparse => Ok(Some(*new_document)),
+        Strategy::Trigram => {
+            let new_base = new_bases
+                .get(usize::try_from(*new_document)?)
+                .context("remapped document ID is out of bounds")?;
+            Ok(Some(new_base + id - old_bases[old_document]))
+        }
+    }
 }
 
 pub(super) fn merge_segments(
@@ -312,10 +361,19 @@ pub(super) fn merge_segments(
     let packed = pack_builder.finish()?;
     tables.blocks = packed.blocks;
     tables.validate()?;
+    let new_bases = match strategy {
+        Strategy::Trigram => super::build_block_bases(&tables)?,
+        Strategy::Sparse => Vec::new(),
+    };
     let runs = victims
         .iter()
+        .zip(&victim_tables)
         .zip(&remaps)
-        .map(|((meta, _), remap)| write_compaction_run(store, cache_dir, strategy, meta, remap))
+        .map(|(((meta, _), old_tables), remap)| {
+            write_compaction_run(
+                store, cache_dir, strategy, meta, old_tables, &new_bases, remap,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     crate::segment::merge_and_put_segment(store, strategy, runs, &tables, &packed.packs)
 }
@@ -338,6 +396,8 @@ mod tests {
             0,
             &[],
             &[Some(0), Some(1), None, Some(2)],
+            &[0, 1, 2, 3, 4],
+            &[0, 1, 2, 3],
             b"ninebytes",
             packed,
             None,
@@ -357,6 +417,8 @@ mod tests {
             0,
             &[],
             &[Some(0), Some(1), None, Some(2)],
+            &[0, 1, 2, 3, 4],
+            &[0, 1, 2, 3],
             b"abc",
             packed,
             None,
@@ -373,10 +435,39 @@ mod tests {
             0,
             &[],
             &[Some(0), Some(1), None, Some(2)],
+            &[0, 1, 2, 3, 4],
+            &[0, 1, 2, 3],
             b"abc",
             out_of_bounds,
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn trigram_block_ids_keep_document_offsets_when_remapped() {
+        let remap = [Some(1), None, Some(0)];
+        let old_bases = [0, 2, 5, 6];
+        let new_bases = [0, 1, 3];
+        assert_eq!(
+            remap_posting_id(Strategy::Trigram, 1, &remap, &old_bases, &new_bases).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            remap_posting_id(Strategy::Trigram, 4, &remap, &old_bases, &new_bases).unwrap(),
+            None
+        );
+        assert_eq!(
+            remap_posting_id(Strategy::Trigram, 5, &remap, &old_bases, &new_bases).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn sparse_ids_remap_without_block_bases() {
+        assert_eq!(
+            remap_posting_id(Strategy::Sparse, 1, &[Some(2), Some(0)], &[], &[]).unwrap(),
+            Some(0)
+        );
     }
 }

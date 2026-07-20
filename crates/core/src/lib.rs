@@ -22,8 +22,9 @@ pub use codec::{
 pub use detect::is_prose_like;
 pub use grams::{
     grams_index, grams_query, hash_ngram, iterate_sparse_gram_ranges, iterate_sparse_grams,
-    pack_trigram_grams, sparse_grams_all_bytes, sparse_grams_covering_bytes,
-    start_sparse_gram_ranges, trigram_grams_bytes, SparseGramRanges, Strategy,
+    pack_trigram_block_grams, pack_trigram_grams, sparse_grams_all_bytes,
+    sparse_grams_covering_bytes, start_sparse_gram_ranges, trigram_grams_bytes, SparseGramRanges,
+    Strategy, CANDIDATE_BLOCK_BYTES,
 };
 pub use grep::{
     bounded_match_len, can_search_as_document, grep_bytes, grep_bytes_fast, grep_doc,
@@ -32,6 +33,6 @@ pub use grep::{
 };
 pub use progress::{ProgressEvent, ProgressSender};
 pub use store::{
-    content_version, scan_matching_docs, BlobStore, Corpus, DocAddress, DocFetcher, IndexAddress,
-    LocalBlobStore, SourceObject, StaleSource, StreamingPut,
+    content_version, scan_matching_docs, BlobStore, Corpus, DocAddress, DocFetcher, DocumentRegion,
+    FetchedDocument, IndexAddress, LocalBlobStore, SourceObject, StaleSource, StreamingPut,
 };

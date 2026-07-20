@@ -7,6 +7,11 @@ mod printer;
 mod progress;
 mod scope;
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
+
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -553,6 +558,19 @@ fn pick_candidate_prefix<'a>(
     }
 }
 
+fn target_admits(target: &str, key: &str) -> bool {
+    if target.is_empty() {
+        return true;
+    }
+    if target.ends_with('/') {
+        return key.starts_with(target);
+    }
+    key == target
+        || key
+            .strip_prefix(target)
+            .is_some_and(|suffix| suffix.starts_with('/') || suffix.starts_with("!/"))
+}
+
 fn execute_search(
     source: &S3Source,
     index: &IndexStorage,
@@ -560,20 +578,19 @@ fn execute_search(
     sink: &dyn MatchSink,
 ) -> Result<SearchStats> {
     let source_identity = build_source_identity(source);
-    let key_filter = execution.scope.map(|scope| {
-        move |key: &str| {
-            scope
-                .key_prefix()
-                .is_none_or(|prefix| key.starts_with(prefix))
-                && scope.matches(key)
-        }
-    });
-    let key_matches = key_filter
-        .as_ref()
-        .map(|filter| filter as &(dyn Fn(&str) -> bool + Sync));
-    let target_prefix = list_prefix(&source.prefix);
+    let key_filter = |key: &str| {
+        target_admits(&source.prefix, key)
+            && execution.scope.is_none_or(|scope| {
+                scope
+                    .key_prefix()
+                    .is_none_or(|prefix| key.starts_with(prefix))
+                    && scope.matches(key)
+            })
+    };
+    let key_matches = Some(&key_filter as &(dyn Fn(&str) -> bool + Sync));
+    let target_prefix = source.prefix.as_str();
     let candidate_prefix =
-        pick_candidate_prefix(&target_prefix, execution.scope.and_then(Scope::key_prefix));
+        pick_candidate_prefix(target_prefix, execution.scope.and_then(Scope::key_prefix));
     let search_stats = search_with_reopen(
         || {
             SegmentedReader::open(index.store(), index.cache(), &source_identity).with_context(
@@ -604,8 +621,14 @@ fn execute_search(
     }
     if execution.stats_line {
         eprintln!(
-            "candidates={} total={} hits={}",
-            search_stats.candidates, search_stats.total_docs, search_stats.hit_count,
+            "candidates={} total={} hits={} regional={} whole={} candidate_bytes={} decoded_bytes={}",
+            search_stats.candidates,
+            search_stats.total_docs,
+            search_stats.hit_count,
+            search_stats.regional_docs,
+            search_stats.whole_docs,
+            search_stats.candidate_bytes,
+            search_stats.decoded_bytes,
         );
     }
     Ok(search_stats)
@@ -697,9 +720,9 @@ fn run_files(args: SearchArgs) -> Result<bool> {
         }
         result => result?,
     };
-    let target_prefix = list_prefix(&source.prefix);
+    let target_prefix = source.prefix.as_str();
     let candidate_prefix =
-        pick_candidate_prefix(&target_prefix, scope.as_ref().and_then(Scope::key_prefix));
+        pick_candidate_prefix(target_prefix, scope.as_ref().and_then(Scope::key_prefix));
     // Retrying after a concurrent index publish is safe: no key has been
     // printed yet. Mirrors search_with_reopen on the search path.
     let candidates = match reader.candidate_docs(&seagrep_query::Query::All, candidate_prefix) {
@@ -713,9 +736,7 @@ fn run_files(args: SearchArgs) -> Result<bool> {
         .into_iter()
         .map(|doc| doc.display_key)
         .filter(|key| {
-            // candidate_prefix only prunes segments; enforce it per key,
-            // matching KeyScope::admits in the search path.
-            candidate_prefix.is_none_or(|prefix| key.starts_with(prefix))
+            target_admits(&source.prefix, key)
                 && match scope.as_ref() {
                     Some(scope) => {
                         scope
@@ -924,6 +945,9 @@ fn run() -> Result<bool> {
 }
 
 fn main() -> std::process::ExitCode {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     match run() {
         Ok(true) => std::process::ExitCode::SUCCESS,
         Ok(false) => std::process::ExitCode::from(1),
@@ -980,6 +1004,29 @@ mod tests {
             pick_candidate_prefix("logs/", Some("metrics/")),
             Some("logs/")
         );
+    }
+
+    #[test]
+    fn target_scope_matches_exact_keys_directories_and_archive_members() {
+        assert!(target_admits("logs/a.json", "logs/a.json"));
+        assert!(!target_admits("logs/a.json", "logs/a.json.bak"));
+
+        assert!(target_admits("logs/", "logs/a.json"));
+        assert!(!target_admits("logs/", "logs2/a.json"));
+
+        assert!(target_admits("logs", "logs"));
+        assert!(target_admits("logs", "logs/a.json"));
+        assert!(!target_admits("logs", "logs2/a.json"));
+
+        assert!(target_admits(
+            "bundle.zip!/logs/a.json",
+            "bundle.zip!/logs/a.json"
+        ));
+        assert!(!target_admits(
+            "bundle.zip!/logs/a.json",
+            "bundle.zip!/logs/a.json.bak"
+        ));
+        assert!(target_admits("bundle.zip", "bundle.zip!/logs/a.json"));
     }
 
     #[test]
