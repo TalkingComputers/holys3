@@ -6,7 +6,7 @@
 //! sorted id vectors.
 
 use anyhow::{Context, Result};
-use seagrep_core::DocId;
+use seagrep_core::{DocId, Strategy};
 use seagrep_query::Query;
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
@@ -15,7 +15,8 @@ use std::ops::RangeInclusive;
 /// grams only narrow an already-small candidate set; dropping them keeps the
 /// result a superset of the true matches, which regex verification filters.
 /// This bounds index round trips per query regardless of literal length.
-const MAX_GRAMS_PER_AND: usize = 8;
+const SPARSE_MAX_GRAMS_PER_AND: usize = 8;
+const BLOCK_MAX_GRAMS_PER_AND: usize = 64;
 
 const OFFSET_BITS: u32 = 40;
 const COUNT_BITS: u32 = 24;
@@ -74,6 +75,7 @@ pub(crate) enum Resolved {
 pub(crate) fn resolve(
     q: &Query,
     id_space: u32,
+    strategy: Strategy,
     lookup: &dyn Fn(&[u8]) -> Result<Option<TermValue>>,
 ) -> Result<Resolved> {
     Ok(match q {
@@ -109,18 +111,18 @@ pub(crate) fn resolve(
         Query::And(subs) => {
             let mut children = Vec::new();
             for sub in subs {
-                match resolve(sub, id_space, lookup)? {
+                match resolve(sub, id_space, strategy, lookup)? {
                     Resolved::None => return Ok(Resolved::None),
                     Resolved::All => {}
                     resolved => children.push(resolved),
                 }
             }
-            prune_and(children)
+            prune_and(children, strategy)
         }
         Query::Or(subs) => {
             let mut children = Vec::new();
             for sub in subs {
-                match resolve(sub, id_space, lookup)? {
+                match resolve(sub, id_space, strategy, lookup)? {
                     Resolved::All => return Ok(Resolved::All),
                     Resolved::None => {}
                     resolved => children.push(resolved),
@@ -137,7 +139,7 @@ pub(crate) fn resolve(
     })
 }
 
-fn prune_and(children: Vec<Resolved>) -> Resolved {
+fn prune_and(children: Vec<Resolved>, strategy: Strategy) -> Resolved {
     // Any singleton child already bounds the AND to (at most) its one
     // document: every gram sibling becomes redundant work, so drop them all
     // and fetch no postings. Multiple singletons intersect for free.
@@ -158,12 +160,16 @@ fn prune_and(children: Vec<Resolved>) -> Resolved {
     let (mut grams, others): (Vec<_>, Vec<_>) = children
         .into_iter()
         .partition(|child| matches!(child, Resolved::Gram { .. }));
-    if grams.len() > MAX_GRAMS_PER_AND {
+    let limit = match strategy {
+        Strategy::Trigram => BLOCK_MAX_GRAMS_PER_AND,
+        Strategy::Sparse => SPARSE_MAX_GRAMS_PER_AND,
+    };
+    if grams.len() > limit {
         grams.sort_by_key(|child| match child {
             Resolved::Gram { count, .. } => *count,
             _ => u32::MAX,
         });
-        grams.truncate(MAX_GRAMS_PER_AND);
+        grams.truncate(limit);
     }
     grams.extend(others);
     if grams.len() == 1 {
@@ -320,17 +326,22 @@ mod tests {
         // count == 1 tags the offset as a doc id; an out-of-range id must
         // error, never silently shrink results.
         let lookup = |_: &[u8]| Ok(Some(tv(pack_posting(500, 1).expect("test setup failed"))));
-        let error = match resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup) {
+        let error = match resolve(
+            &Query::Gram(b"abc".to_vec()),
+            100,
+            Strategy::Sparse,
+            &lookup,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("out-of-range singleton must error"),
         };
         assert!(error.to_string().contains("singleton"), "{error:#}");
         // One-document segments must validate too: count == 1 also satisfies
         // count >= doc_count, and the ALL shortcut must not mask corruption.
-        assert!(resolve(&Query::Gram(b"abc".to_vec()), 1, &lookup).is_err());
+        assert!(resolve(&Query::Gram(b"abc".to_vec()), 1, Strategy::Sparse, &lookup).is_err());
         let valid = |_: &[u8]| Ok(Some(tv(pack_posting(0, 1).expect("test setup failed"))));
         assert!(matches!(
-            resolve(&Query::Gram(b"abc".to_vec()), 1, &valid).expect("resolve"),
+            resolve(&Query::Gram(b"abc".to_vec()), 1, Strategy::Sparse, &valid).expect("resolve"),
             Resolved::Doc(0)
         ));
     }
@@ -341,7 +352,7 @@ mod tests {
             Query::Gram(b"abc".to_vec()),
             Query::Gram(b"zzz".to_vec()),
         ]);
-        let resolved = resolve(&q, 100, &|g: &[u8]| {
+        let resolved = resolve(&q, 100, Strategy::Sparse, &|g: &[u8]| {
             Ok((g == b"abc").then(|| tv(pack_posting(0, 2).expect("test setup failed"))))
         })
         .expect("resolve");
@@ -355,7 +366,13 @@ mod tests {
     fn dense_gram_resolves_to_all_without_fetch() {
         // a gram in every doc constrains nothing: All, no block needed
         let lookup = |_: &[u8]| Ok(Some(tv(pack_posting(64, 100).expect("test setup failed"))));
-        let resolved = resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup).expect("resolve");
+        let resolved = resolve(
+            &Query::Gram(b"abc".to_vec()),
+            100,
+            Strategy::Sparse,
+            &lookup,
+        )
+        .expect("resolve");
         assert!(matches!(resolved, Resolved::All));
         let mut needed = BTreeMap::new();
         blocks_needed(&resolved, &mut needed);
@@ -363,7 +380,13 @@ mod tests {
         // one doc short of dense -> still a real constraint
         let lookup = |_: &[u8]| Ok(Some(tv(pack_posting(64, 99).expect("test setup failed"))));
         assert!(matches!(
-            resolve(&Query::Gram(b"abc".to_vec()), 100, &lookup).expect("resolve"),
+            resolve(
+                &Query::Gram(b"abc".to_vec()),
+                100,
+                Strategy::Sparse,
+                &lookup
+            )
+            .expect("resolve"),
             Resolved::Gram { count: 99, .. }
         ));
     }
@@ -373,13 +396,28 @@ mod tests {
         let children = (0..12u64)
             .map(|i| gram(i * 100, 1000 - i as u32))
             .collect::<Vec<_>>();
-        let Resolved::And(kept) = prune_and(children) else {
+        let Resolved::And(kept) = prune_and(children, Strategy::Sparse) else {
             panic!("expected And");
         };
-        assert_eq!(kept.len(), MAX_GRAMS_PER_AND);
+        assert_eq!(kept.len(), SPARSE_MAX_GRAMS_PER_AND);
         // The rarest grams (highest offsets here) survive.
         assert!(kept.iter().all(|child| match child {
             Resolved::Gram { count, .. } => *count <= 1000 - 4,
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn block_and_keeps_up_to_sixty_four_grams() {
+        let children = (0..80u64)
+            .map(|offset| gram(offset, 1000 - offset as u32))
+            .collect::<Vec<_>>();
+        let Resolved::And(kept) = prune_and(children, Strategy::Trigram) else {
+            panic!("expected And");
+        };
+        assert_eq!(kept.len(), BLOCK_MAX_GRAMS_PER_AND);
+        assert!(kept.iter().all(|child| match child {
+            Resolved::Gram { count, .. } => *count <= 1000 - 16,
             _ => false,
         }));
     }

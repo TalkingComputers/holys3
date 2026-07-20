@@ -160,22 +160,43 @@ impl MatchSink for EventSink {
     }
 }
 
+#[derive(Default)]
+struct CountEventSink {
+    events: Mutex<Vec<LineEvent>>,
+}
+
+impl MatchSink for CountEventSink {
+    fn wants_line_text(&self) -> bool {
+        false
+    }
+
+    fn on_doc(&self, _key: &str, document: &DocResult<'_>) -> anyhow::Result<SinkFlow> {
+        self.events
+            .lock()
+            .unwrap()
+            .extend_from_slice(document.events);
+        Ok(SinkFlow::Continue)
+    }
+}
+
 #[test]
 fn regional_verification_matches_whole_document_scanning() -> anyhow::Result<()> {
     const BLOCK: usize = seagrep_core::CANDIDATE_BLOCK_BYTES;
     let mut body = Vec::new();
-    while body.len() < 20 * BLOCK {
+    while body.len() < 40 * BLOCK {
         body.extend_from_slice(b"ordinary line with padding................................\n");
     }
     body[..10].copy_from_slice(b"FIRSTTOKEN");
-    let boundary = BLOCK - 4;
-    body[boundary..boundary + 13].copy_from_slice(b"BOUNDARYTOKEN");
     let long_start = 2 * BLOCK;
-    let long_end = long_start + 3 * BLOCK;
+    let long_end = 30 * BLOCK;
     body[long_start..long_end].fill(b'x');
-    body[long_start + BLOCK + 17..long_start + BLOCK + 30].copy_from_slice(b"LONGLINETOKEN");
+    let boundary = 12 * BLOCK - 4;
+    body[boundary..boundary + 13].copy_from_slice(b"BOUNDARYTOKEN");
+    body[18 * BLOCK + 17..18 * BLOCK + 30].copy_from_slice(b"LONGLINETOKEN");
+    body[5 * BLOCK + 17..5 * BLOCK + 25].copy_from_slice(b"DUPTOKEN");
+    body[25 * BLOCK + 17..25 * BLOCK + 25].copy_from_slice(b"DUPTOKEN");
     body[long_end] = b'\n';
-    let context_at = 10 * BLOCK + 17;
+    let context_at = 35 * BLOCK + 17;
     body[context_at..context_at + 12].copy_from_slice(b"CONTEXTTOKEN");
     let tail = body.len() - 9;
     body[tail..].copy_from_slice(b"LASTTOKEN");
@@ -222,6 +243,7 @@ fn regional_verification_matches_whole_document_scanning() -> anyhow::Result<()>
         ("FIRSTTOKEN", MatchOptions::default()),
         ("BOUNDARYTOKEN", MatchOptions::default()),
         ("LONGLINETOKEN", MatchOptions::default()),
+        ("DUPTOKEN", MatchOptions::default()),
         (
             "CONTEXTTOKEN",
             MatchOptions {
@@ -251,9 +273,32 @@ fn regional_verification_matches_whole_document_scanning() -> anyhow::Result<()>
         assert_eq!(files.hit_count, usize::from(!expected.is_empty()));
         if pattern == "BOUNDARYTOKEN" {
             assert!(stats.bytes_fetched < body.len());
+            assert_eq!(stats.regional_docs, 1);
+            assert_eq!(stats.whole_docs, 0);
+            assert_eq!(stats.candidate_bytes, stats.bytes_fetched);
+            assert_eq!(stats.decoded_bytes, body.len());
             assert!(files.bytes_fetched < body.len());
         }
     }
+
+    let regex = regex::bytes::Regex::new("DUPTOKEN")?;
+    let expected = grep_doc(&body, &regex, MatchOptions::default());
+    let sink = CountEventSink::default();
+    let stats = search_streaming(
+        &reader,
+        "DUPTOKEN",
+        KeyScope::default(),
+        MatchOptions::default(),
+        &sink,
+    )?;
+    let actual = sink.events.into_inner().unwrap();
+    assert_eq!(actual.len(), 1);
+    assert_eq!(actual[0].line, expected[0].line);
+    assert_eq!(actual[0].submatches.len(), 2);
+    assert!(actual[0].text.is_empty());
+    assert_eq!(stats.regional_docs, 1);
+    assert_eq!(stats.whole_docs, 0);
+    assert!(stats.candidate_bytes < 8 * BLOCK);
     Ok(())
 }
 

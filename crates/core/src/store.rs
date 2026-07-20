@@ -110,7 +110,7 @@ pub trait Corpus: Sync {
 /// `consume` receives the index into `documents` plus the body, as
 /// fetches complete (order NOT guaranteed). Implementations may fetch
 /// concurrently; the first `consume` error aborts the remaining fetches.
-pub trait DocFetcher {
+pub trait DocFetcher: Sync {
     fn fetch_each(
         &self,
         documents: &[DocAddress],
@@ -120,6 +120,7 @@ pub trait DocFetcher {
     fn fetch_candidate_each(
         &self,
         documents: &[DocAddress],
+        _bounded_len: Option<usize>,
         _before_context: usize,
         _after_context: usize,
         consume: &mut dyn FnMut(usize, FetchedDocument) -> AnyhowResult<()>,
@@ -127,6 +128,23 @@ pub trait DocFetcher {
         self.fetch_each(documents, &mut |index, body| {
             consume(index, FetchedDocument::Whole(body))
         })
+    }
+
+    fn fetch_candidate_lines(
+        &self,
+        document: &DocAddress,
+        _matches: &[Range<u64>],
+        _before_context: usize,
+        _after_context: usize,
+    ) -> AnyhowResult<FetchedDocument> {
+        let mut fetched = None;
+        self.fetch_each(std::slice::from_ref(document), &mut |_, body| {
+            fetched = Some(body);
+            Ok(())
+        })?;
+        fetched
+            .map(FetchedDocument::Whole)
+            .ok_or_else(|| anyhow::anyhow!("candidate line fetch returned no document"))
     }
 }
 

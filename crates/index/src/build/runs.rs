@@ -20,7 +20,7 @@ pub(crate) const SPARSE_FILE_CHUNK: usize = 1024 * 1024;
 const SPARSE_TRIGRAM_BITMAP_MIN: usize = 512 * 1024;
 const TRIGRAM_RADIX_ENTRIES_CAP: usize = 4 * 1024 * 1024;
 const TRIGRAM_BITMAP_WORDS: usize = (1 << 24) / 64;
-const TRIGRAM_RUN_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+const TRIGRAM_RUN_BUDGET_BYTES: usize = 1024 * 1024;
 const TRIGRAM_SHARD_RUN_BYTES: u64 = 7 * 1024 * 1024;
 
 type PostingRuns = (Vec<TempPath>, Vec<(usize, u64, Vec<u32>)>);
@@ -1094,7 +1094,7 @@ mod tests {
 
     #[test]
     fn trigram_entry_sink_budget_is_bounded() {
-        assert_eq!(TrigramEntrySink::CAP * size_of::<u64>(), 4 * 1024 * 1024);
+        assert_eq!(TrigramEntrySink::CAP * size_of::<u64>(), 1024 * 1024);
     }
 
     #[test]

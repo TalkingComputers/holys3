@@ -77,6 +77,10 @@ pub struct SearchStats {
     pub candidates: usize,
     pub total_docs: usize,
     pub bytes_fetched: usize,
+    pub regional_docs: usize,
+    pub whole_docs: usize,
+    pub candidate_bytes: usize,
+    pub decoded_bytes: usize,
     /// Source objects the index could not decode at build time: their
     /// contents are not searchable, and results cannot include them.
     pub excluded_objects: usize,
@@ -98,10 +102,12 @@ pub trait IndexReader: DocFetcher {
         &self,
         q: &Query,
         key_prefix: Option<&str>,
+        bounded_len: Option<usize>,
         batch_size: usize,
         visit: &mut dyn FnMut(Vec<seagrep_core::DocAddress>) -> Result<bool>,
     ) -> Result<()> {
         anyhow::ensure!(batch_size > 0, "candidate batch size must be positive");
+        let _ = bounded_len;
         let documents = self.candidate_docs(q, key_prefix)?;
         for chunk in documents.chunks(batch_size) {
             if !visit(chunk.to_vec())? {
@@ -256,11 +262,12 @@ pub(crate) fn decode_posting_block(bytes: &[u8], count: u32, doc_count: u32) -> 
 pub(crate) fn candidates_with(
     get: impl Fn(&[u8]) -> Result<Option<eval::TermValue>>,
     id_space: u32,
+    strategy: Strategy,
     q: &Query,
     expand: Option<&dyn Fn(DocId) -> RangeInclusive<DocId>>,
     fetch_blocks: impl FnOnce(&BTreeMap<u64, (u32, u64)>) -> Result<BTreeMap<u64, Vec<DocId>>>,
 ) -> Result<Selection> {
-    let resolved = eval::resolve(q, id_space, &get)?;
+    let resolved = eval::resolve(q, id_space, strategy, &get)?;
     let mut needed = BTreeMap::new();
     eval::blocks_needed(&resolved, &mut needed);
     let blocks = fetch_blocks(&needed)?;
@@ -1288,6 +1295,10 @@ mod tests {
         assert_eq!(stats.hits, vec!["logs/a"]);
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.bytes_fetched, b"abc world".len());
+        assert_eq!(stats.regional_docs, 0);
+        assert_eq!(stats.whole_docs, 1);
+        assert_eq!(stats.candidate_bytes, b"abc world".len());
+        assert_eq!(stats.decoded_bytes, b"abc world".len());
     }
 
     #[test]

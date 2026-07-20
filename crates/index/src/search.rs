@@ -8,7 +8,8 @@ use rayon::iter::{ParallelBridge, ParallelIterator};
 use seagrep_core::DocumentBody;
 use seagrep_core::{
     bounded_match_len, can_search_as_document, grep_bytes, grep_bytes_fast, has_line_match,
-    has_line_match_fast, DocAddress, DocFetcher, FetchedDocument, LineEvent, MatchOptions,
+    has_line_match_fast, DocAddress, DocFetcher, DocumentRegion, FetchedDocument, LineEvent,
+    MatchOptions,
 };
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,6 +77,10 @@ pub trait MatchSink: Sync {
         true
     }
 
+    fn wants_line_text(&self) -> bool {
+        true
+    }
+
     /// Called once per doc with at least one verified match.
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow>;
 }
@@ -133,6 +138,119 @@ fn has_bounded_reader_match(
     Ok(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegionMatch {
+    start: u64,
+    end: u64,
+    line: u64,
+}
+
+fn find_region_matches(
+    regions: &[DocumentRegion],
+    re: &regex::bytes::Regex,
+    decoded_size: u64,
+    max_count: Option<u64>,
+) -> Vec<RegionMatch> {
+    let mut matches = Vec::new();
+    let mut last_line = None;
+    let mut matched_lines = 0u64;
+    'regions: for region in regions {
+        let mut scanned = 0usize;
+        let mut line = region.line;
+        for matched in re.find_iter(&region.bytes) {
+            line += region.bytes[scanned..matched.start()]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count() as u64;
+            scanned = matched.start();
+            let start = region.start + matched.start() as u64;
+            if start >= decoded_size {
+                continue;
+            }
+            if last_line != Some(line) {
+                if max_count == Some(matched_lines) {
+                    break 'regions;
+                }
+                matched_lines += 1;
+                last_line = Some(line);
+            }
+            matches.push(RegionMatch {
+                start,
+                end: region.start + matched.end() as u64,
+                line,
+            });
+        }
+    }
+    matches
+}
+
+fn match_count_events(matches: &[RegionMatch]) -> Vec<LineEvent> {
+    let mut events: Vec<LineEvent> = Vec::new();
+    for matched in matches {
+        if let Some(event) = events.last_mut().filter(|event| event.line == matched.line) {
+            event
+                .submatches
+                .push(seagrep_core::SubMatch { start: 0, end: 0 });
+            continue;
+        }
+        events.push(LineEvent {
+            line: matched.line,
+            kind: seagrep_core::LineKind::Match,
+            offset: matched.start,
+            text: bytes::Bytes::new(),
+            submatches: vec![seagrep_core::SubMatch { start: 0, end: 0 }],
+        });
+    }
+    events
+}
+
+fn grep_fetched_document(
+    body: FetchedDocument,
+    re: &regex::bytes::Regex,
+    whole_document: bool,
+    options: MatchOptions,
+) -> Result<Vec<LineEvent>> {
+    match body {
+        FetchedDocument::Whole(body) => {
+            let text = body.into_bytes()?;
+            Ok(if whole_document {
+                grep_bytes_fast(text, re, options)
+            } else {
+                grep_bytes(text, re, options)
+            })
+        }
+        FetchedDocument::Regions { regions, .. } => {
+            let mut events = Vec::new();
+            let mut matched = 0u64;
+            for region in regions {
+                let max_count = options.max_count.map(|limit| limit.saturating_sub(matched));
+                if max_count == Some(0) {
+                    break;
+                }
+                let regional = MatchOptions {
+                    max_count,
+                    ..options
+                };
+                let mut found = if whole_document {
+                    grep_bytes_fast(region.bytes, re, regional)
+                } else {
+                    grep_bytes(region.bytes, re, regional)
+                };
+                matched += found
+                    .iter()
+                    .filter(|event| event.kind == seagrep_core::LineKind::Match)
+                    .count() as u64;
+                for event in &mut found {
+                    event.line += region.line - 1;
+                    event.offset += region.start;
+                }
+                events.extend(found);
+            }
+            Ok(events)
+        }
+    }
+}
+
 fn search_batch(
     documents: &[DocAddress],
     fetcher: &dyn DocFetcher,
@@ -141,100 +259,102 @@ fn search_batch(
     bounded_len: Option<usize>,
     options: MatchOptions,
     sink: &dyn MatchSink,
-) -> Result<(Vec<String>, usize, usize, bool)> {
+) -> Result<BatchResult> {
     let workers = std::thread::available_parallelism()?
         .get()
         .min(documents.len());
     let bytes_fetched = AtomicUsize::new(0);
+    let regional_docs = AtomicUsize::new(0);
+    let whole_docs = AtomicUsize::new(0);
+    let decoded_bytes = AtomicUsize::new(0);
     let hit_count = AtomicUsize::new(0);
     let hits: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let wants_matches = sink.wants_matches();
     let wants_hit_keys = sink.wants_hit_keys();
+    let wants_line_text = sink.wants_line_text();
+    let regional_bounded_len =
+        bounded_len.filter(|len| *len <= seagrep_core::CANDIDATE_BLOCK_BYTES);
     let documents_ref = documents;
     let verify = |re: &regex::bytes::Regex, idx: usize, body: FetchedDocument| -> Result<()> {
         let key = &documents_ref[idx].display_key;
         let started = std::time::Instant::now();
         let bytes_searched = body.decoded_size();
-        let events = if wants_matches {
-            let events = match body {
-                FetchedDocument::Whole(body) => {
-                    let text = body.into_bytes()?;
-                    if whole_document {
-                        grep_bytes_fast(text, re, options)
-                    } else {
-                        grep_bytes(text, re, options)
-                    }
+        let events = match body {
+            FetchedDocument::Regions {
+                decoded_size,
+                regions,
+            } if regional_bounded_len.is_some() => {
+                let matches = find_region_matches(&regions, re, decoded_size, options.max_count);
+                if matches.is_empty() {
+                    return Ok(());
                 }
-                FetchedDocument::Regions { regions, .. } => {
-                    let mut events = Vec::new();
-                    let mut matched = 0u64;
-                    for region in regions {
-                        let max_count =
-                            options.max_count.map(|limit| limit.saturating_sub(matched));
-                        if max_count == Some(0) {
-                            break;
-                        }
-                        let regional = MatchOptions {
-                            max_count,
-                            ..options
-                        };
-                        let mut found = if whole_document {
-                            grep_bytes_fast(region.bytes, re, regional)
-                        } else {
-                            grep_bytes(region.bytes, re, regional)
-                        };
-                        matched += found
-                            .iter()
-                            .filter(|event| event.kind == seagrep_core::LineKind::Match)
-                            .count() as u64;
-                        for event in &mut found {
-                            event.line += region.line - 1;
-                            event.offset += region.start;
-                        }
-                        events.extend(found);
+                if !wants_matches {
+                    Vec::new()
+                } else if wants_line_text {
+                    let ranges = matches
+                        .iter()
+                        .map(|matched| matched.start..matched.end)
+                        .collect::<Vec<_>>();
+                    let lines = fetcher.fetch_candidate_lines(
+                        &documents_ref[idx],
+                        &ranges,
+                        options.before_context,
+                        options.after_context,
+                    )?;
+                    bytes_fetched
+                        .fetch_add(usize::try_from(lines.fetched_size())?, Ordering::Relaxed);
+                    let events = grep_fetched_document(lines, re, whole_document, options)?;
+                    if events.is_empty() {
+                        return Ok(());
                     }
                     events
+                } else {
+                    match_count_events(&matches)
                 }
-            };
-            if events.is_empty() {
-                return Ok(());
             }
-            events
-        } else {
-            let matched = match body {
-                FetchedDocument::Whole(body) => {
-                    let can_stream = body.is_file()
-                        && bounded_len.is_some_and(|len| len <= FILE_MATCH_OVERLAP_MAX + 1);
-                    if can_stream {
-                        let len = body.len();
-                        let mut reader = body.into_reader();
-                        has_bounded_reader_match(
-                            &mut reader,
-                            len,
-                            re,
-                            bounded_len.expect("bounded length"),
-                        )?
-                    } else {
-                        let text = body.into_bytes()?;
-                        if whole_document {
-                            has_line_match_fast(&text, re)
+            body if wants_matches => {
+                let events = grep_fetched_document(body, re, whole_document, options)?;
+                if events.is_empty() {
+                    return Ok(());
+                }
+                events
+            }
+            body => {
+                let matched = match body {
+                    FetchedDocument::Whole(body) => {
+                        let can_stream = body.is_file()
+                            && bounded_len.is_some_and(|len| len <= FILE_MATCH_OVERLAP_MAX + 1);
+                        if can_stream {
+                            let len = body.len();
+                            let mut reader = body.into_reader();
+                            has_bounded_reader_match(
+                                &mut reader,
+                                len,
+                                re,
+                                bounded_len.expect("bounded length"),
+                            )?
                         } else {
-                            has_line_match(&text, re)
+                            let text = body.into_bytes()?;
+                            if whole_document {
+                                has_line_match_fast(&text, re)
+                            } else {
+                                has_line_match(&text, re)
+                            }
                         }
                     }
+                    FetchedDocument::Regions { regions, .. } => regions.iter().any(|region| {
+                        if whole_document {
+                            has_line_match_fast(&region.bytes, re)
+                        } else {
+                            has_line_match(&region.bytes, re)
+                        }
+                    }),
+                };
+                if !matched {
+                    return Ok(());
                 }
-                FetchedDocument::Regions { regions, .. } => regions.iter().any(|region| {
-                    if whole_document {
-                        has_line_match_fast(&region.bytes, re)
-                    } else {
-                        has_line_match(&region.bytes, re)
-                    }
-                }),
-            };
-            if !matched {
-                return Ok(());
+                Vec::new()
             }
-            Vec::new()
         };
         hit_count.fetch_add(1, Ordering::Relaxed);
         if wants_hit_keys {
@@ -257,15 +377,29 @@ fn search_batch(
     let fetch = |consume: &mut dyn FnMut(usize, FetchedDocument) -> Result<()>| {
         fetcher.fetch_candidate_each(
             documents_ref,
+            bounded_len.filter(|len| *len <= seagrep_core::CANDIDATE_BLOCK_BYTES),
             options.before_context,
             options.after_context,
             consume,
         )
     };
+    let record_fetch = |body: &FetchedDocument| -> Result<()> {
+        bytes_fetched.fetch_add(usize::try_from(body.fetched_size())?, Ordering::Relaxed);
+        decoded_bytes.fetch_add(usize::try_from(body.decoded_size())?, Ordering::Relaxed);
+        match body {
+            FetchedDocument::Whole(_) => {
+                whole_docs.fetch_add(1, Ordering::Relaxed);
+            }
+            FetchedDocument::Regions { .. } => {
+                regional_docs.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    };
     let (feed_result, verify_result) = if workers == 1 {
         let mut verified = Ok(());
         let feed = fetch(&mut |idx, body| {
-            bytes_fetched.fetch_add(usize::try_from(body.fetched_size())?, Ordering::Relaxed);
+            record_fetch(&body)?;
             match verify_caught(re, idx, body) {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -285,7 +419,7 @@ fn search_batch(
                 )
             });
             let feed = fetch(&mut |idx, body| {
-                bytes_fetched.fetch_add(usize::try_from(body.fetched_size())?, Ordering::Relaxed);
+                record_fetch(&body)?;
                 tx.send((idx, body))
                     .map_err(|_| anyhow::Error::new(StopEarly))
             });
@@ -314,12 +448,26 @@ fn search_batch(
     let hits = hits
         .into_inner()
         .map_err(|_| anyhow::anyhow!("a search worker panicked"))?;
-    Ok((
+    let candidate_bytes = bytes_fetched.into_inner();
+    Ok(BatchResult {
         hits,
-        hit_count.into_inner(),
-        bytes_fetched.into_inner(),
+        hit_count: hit_count.into_inner(),
+        regional_docs: regional_docs.into_inner(),
+        whole_docs: whole_docs.into_inner(),
+        candidate_bytes,
+        decoded_bytes: decoded_bytes.into_inner(),
         stopped,
-    ))
+    })
+}
+
+struct BatchResult {
+    hits: Vec<String>,
+    hit_count: usize,
+    regional_docs: usize,
+    whole_docs: usize,
+    candidate_bytes: usize,
+    decoded_bytes: usize,
+    stopped: bool,
 }
 
 /// Streaming search: candidate docs are fetched concurrently, decompressed
@@ -345,6 +493,10 @@ pub fn search_streaming(
             candidates: 0,
             total_docs,
             bytes_fetched: 0,
+            regional_docs: 0,
+            whole_docs: 0,
+            candidate_bytes: 0,
+            decoded_bytes: 0,
             excluded_objects: reader.excluded_objects(),
         });
     }
@@ -357,9 +509,13 @@ pub fn search_streaming(
     let mut hit_count = 0usize;
     let mut candidates = 0usize;
     let mut bytes_fetched = 0usize;
+    let mut regional_docs = 0usize;
+    let mut whole_docs = 0usize;
+    let mut decoded_bytes = 0usize;
     let visited = reader.visit_candidates(
         &query,
         scope.prefix,
+        bounded_len.filter(|len| *len <= seagrep_core::CANDIDATE_BLOCK_BYTES),
         SEARCH_CANDIDATE_BATCH,
         &mut |mut documents| {
             documents.retain(|document| scope.admits(&document.display_key));
@@ -369,7 +525,7 @@ pub fn search_streaming(
             if documents.is_empty() {
                 return Ok(true);
             }
-            let (batch_hits, batch_count, batch_bytes, stopped) = search_batch(
+            let batch = search_batch(
                 &documents,
                 reader,
                 &re,
@@ -378,14 +534,23 @@ pub fn search_streaming(
                 options,
                 sink,
             )?;
-            hits.extend(batch_hits);
+            hits.extend(batch.hits);
             hit_count = hit_count
-                .checked_add(batch_count)
+                .checked_add(batch.hit_count)
                 .context("hit count overflows usize")?;
             bytes_fetched = bytes_fetched
-                .checked_add(batch_bytes)
+                .checked_add(batch.candidate_bytes)
                 .context("fetched byte count overflows usize")?;
-            Ok(!stopped)
+            regional_docs = regional_docs
+                .checked_add(batch.regional_docs)
+                .context("regional document count overflows usize")?;
+            whole_docs = whole_docs
+                .checked_add(batch.whole_docs)
+                .context("whole document count overflows usize")?;
+            decoded_bytes = decoded_bytes
+                .checked_add(batch.decoded_bytes)
+                .context("decoded byte count overflows usize")?;
+            Ok(!batch.stopped)
         },
     );
     if let Err(error) = visited {
@@ -403,6 +568,10 @@ pub fn search_streaming(
         candidates,
         total_docs,
         bytes_fetched,
+        regional_docs,
+        whole_docs,
+        candidate_bytes: bytes_fetched,
+        decoded_bytes,
         excluded_objects: reader.excluded_objects(),
     })
 }
@@ -470,7 +639,7 @@ pub fn search_collect(
 mod tests {
     use super::*;
     use crate::{IndexReader, IndexStats};
-    use seagrep_core::{DocAddress, SourceEncoding, Strategy};
+    use seagrep_core::{DocAddress, DocumentRegion, SourceEncoding, Strategy};
     use seagrep_query::Query;
 
     #[test]
@@ -498,6 +667,29 @@ mod tests {
                 "{pattern}"
             );
         }
+    }
+
+    #[test]
+    fn regional_matches_share_a_line_across_an_unfetched_zero_newline_gap() {
+        let regions = vec![
+            DocumentRegion {
+                start: 100,
+                line: 7,
+                bytes: bytes::Bytes::from_static(b"needle-left"),
+            },
+            DocumentRegion {
+                start: 1_000,
+                line: 7,
+                bytes: bytes::Bytes::from_static(b"right-needle\n"),
+            },
+        ];
+        let re = regex::bytes::Regex::new("needle").unwrap();
+
+        let matches = find_region_matches(&regions, &re, 1_013, None);
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].line, 7);
+        assert_eq!(matches[1].line, 7);
     }
 
     struct BatchReader {
@@ -543,6 +735,7 @@ mod tests {
             &self,
             _query: &Query,
             _key_prefix: Option<&str>,
+            _bounded_len: Option<usize>,
             _batch_size: usize,
             visit: &mut dyn FnMut(Vec<DocAddress>) -> Result<bool>,
         ) -> Result<()> {
@@ -613,7 +806,7 @@ mod tests {
             largest: AtomicUsize::new(0),
         };
         let re = regex::bytes::Regex::new("needle").unwrap();
-        let (hits, hit_count, bytes, stopped) = search_batch(
+        let batch = search_batch(
             &documents,
             &fetcher,
             &re,
@@ -623,10 +816,13 @@ mod tests {
             &NullSink,
         )
         .unwrap();
-        assert_eq!(hits, ["doc"]);
-        assert_eq!(hit_count, 1);
-        assert_eq!(bytes, 7);
-        assert!(!stopped);
+        assert_eq!(batch.hits, ["doc"]);
+        assert_eq!(batch.hit_count, 1);
+        assert_eq!(batch.candidate_bytes, 7);
+        assert_eq!(batch.decoded_bytes, 7);
+        assert_eq!(batch.whole_docs, 1);
+        assert_eq!(batch.regional_docs, 0);
+        assert!(!batch.stopped);
         rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build_global()
@@ -703,6 +899,7 @@ mod tests {
             &self,
             _query: &Query,
             _key_prefix: Option<&str>,
+            _bounded_len: Option<usize>,
             _batch_size: usize,
             visit: &mut dyn FnMut(Vec<DocAddress>) -> Result<bool>,
         ) -> Result<()> {

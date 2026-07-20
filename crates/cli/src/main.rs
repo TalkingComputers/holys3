@@ -604,8 +604,14 @@ fn execute_search(
     }
     if execution.stats_line {
         eprintln!(
-            "candidates={} total={} hits={}",
-            search_stats.candidates, search_stats.total_docs, search_stats.hit_count,
+            "candidates={} total={} hits={} regional={} whole={} candidate_bytes={} decoded_bytes={}",
+            search_stats.candidates,
+            search_stats.total_docs,
+            search_stats.hit_count,
+            search_stats.regional_docs,
+            search_stats.whole_docs,
+            search_stats.candidate_bytes,
+            search_stats.decoded_bytes,
         );
     }
     Ok(search_stats)

@@ -51,6 +51,12 @@ pub(crate) struct PackRegionRequest<'a> {
     pub block_newlines: &'a [u32],
 }
 
+pub(crate) struct RegionFetchOptions {
+    pub bounded_len: Option<usize>,
+    pub before_context: usize,
+    pub after_context: usize,
+}
+
 struct DocumentBlock {
     block_id: usize,
     start: u64,
@@ -779,8 +785,7 @@ pub(crate) fn fetch_regions(
     packs: &[PackMeta],
     blocks: &[PackBlock],
     request: &PackRegionRequest<'_>,
-    before_context: usize,
-    after_context: usize,
+    options: RegionFetchOptions,
 ) -> Result<FetchedDocument> {
     let parts = document_blocks(request.slice, request.decoded_size, blocks)?;
     let mut loaded = BTreeMap::new();
@@ -792,20 +797,33 @@ pub(crate) fn fetch_regions(
         parts: &parts,
         loaded: &mut loaded,
     };
-    let mut ranges = request
-        .ranges
-        .iter()
-        .cloned()
-        .map(|range| {
-            extend_region(
-                &mut source,
-                request.decoded_size,
-                range,
-                before_context,
-                after_context,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut ranges = match options.bounded_len {
+        Some(bound) => {
+            let overlap = u64::try_from(bound.saturating_sub(1))?;
+            request
+                .ranges
+                .iter()
+                .map(|range| {
+                    range.start.saturating_sub(overlap)
+                        ..range.end.saturating_add(overlap).min(request.decoded_size)
+                })
+                .collect()
+        }
+        None => request
+            .ranges
+            .iter()
+            .cloned()
+            .map(|range| {
+                extend_region(
+                    &mut source,
+                    request.decoded_size,
+                    range,
+                    options.before_context,
+                    options.after_context,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
     ranges.sort_unstable_by_key(|range| range.start);
     let mut merged: Vec<Range<u64>> = Vec::new();
     for range in ranges {
@@ -932,6 +950,7 @@ impl BuiltPacks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seagrep_core::LocalBlobStore;
     use std::io::Cursor;
 
     #[test]
@@ -991,6 +1010,63 @@ mod tests {
 
         assert_eq!(block_runs([0, 1, 2], &built.blocks).unwrap().len(), 1);
         assert_eq!(block_runs([0, 2], &built.blocks).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn lazy_line_fetch_assembles_a_line_spanning_pack_blocks() {
+        let block = PACK_BLOCK_BYTES;
+        let mut body = vec![b'x'; 3 * block + 6];
+        body[2 * block + 17..2 * block + 23].copy_from_slice(b"needle");
+        body[3 * block] = b'\n';
+        body[3 * block + 1..].copy_from_slice(b"tail\n");
+        let mut builder = PackBuilder::new(block, 8 * block as u64).unwrap();
+        let slice = builder
+            .append(Cursor::new(&body), body.len() as u64)
+            .unwrap();
+        let built = builder.finish().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::new(store_dir.path());
+        for pack in &built.packs {
+            store
+                .put_file(&pack_blob(pack.hash()), pack.path())
+                .unwrap();
+        }
+        let packs = built.packs.iter().map(PackFile::meta).collect::<Vec<_>>();
+        let block_newlines = body
+            .chunks(seagrep_core::CANDIDATE_BLOCK_BYTES)
+            .map(|chunk| chunk.iter().filter(|byte| **byte == b'\n').count() as u32)
+            .collect::<Vec<_>>();
+        let range = (2 * block + 17) as u64..(2 * block + 23) as u64;
+
+        let fetched = fetch_regions(
+            &store,
+            None,
+            &packs,
+            &built.blocks,
+            &PackRegionRequest {
+                slice,
+                decoded_size: body.len() as u64,
+                ranges: std::slice::from_ref(&range),
+                block_newlines: &block_newlines,
+            },
+            RegionFetchOptions {
+                bounded_len: None,
+                before_context: 0,
+                after_context: 0,
+            },
+        )
+        .unwrap();
+
+        let FetchedDocument::Regions { regions, .. } = fetched else {
+            panic!("expected regional line fetch")
+        };
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, 0);
+        assert_eq!(regions[0].line, 1);
+        assert_eq!(
+            regions[0].bytes,
+            bytes::Bytes::copy_from_slice(&body[..=3 * block])
+        );
     }
 
     #[test]
