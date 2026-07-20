@@ -15,12 +15,13 @@ use tempfile::TempPath;
 /// Posting-run temp files are read and written in bulk; the `BufReader` default
 /// of 8 KiB makes buffer refills a measurable share of merge time.
 const RUN_IO_BUFFER_BYTES: usize = 256 * 1024;
+const MERGE_READ_BUFFER_POOL_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) const SPARSE_FILE_CHUNK: usize = 1024 * 1024;
 const SPARSE_TRIGRAM_BITMAP_MIN: usize = 512 * 1024;
 const TRIGRAM_RADIX_ENTRIES_CAP: usize = 4 * 1024 * 1024;
 const TRIGRAM_BITMAP_WORDS: usize = (1 << 24) / 64;
-const TRIGRAM_RUN_BUDGET_BYTES: usize = 1024 * 1024;
+const TRIGRAM_RUN_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 const TRIGRAM_SHARD_RUN_BYTES: u64 = 7 * 1024 * 1024;
 
 type PostingRuns = (Vec<TempPath>, Vec<(usize, u64, Vec<u32>)>);
@@ -689,7 +690,7 @@ pub(crate) fn write_trigram_run_radix(grammed: Vec<(usize, Vec<u32>)>) -> Result
                 .map(|gram| u64::from(gram) << 32 | u64::from(id)),
         );
     }
-    radsort::sort(&mut entries);
+    entries.sort_unstable();
     entries.dedup();
     for entry in entries {
         let id = entry as DocId;
@@ -791,6 +792,10 @@ pub(crate) struct PostingRun {
 
 pub(crate) const MAX_OPEN_POSTING_RUNS: usize = 64;
 
+fn merge_reader_buffer_bytes(run_count: usize) -> usize {
+    RUN_IO_BUFFER_BYTES.min(MERGE_READ_BUFFER_POOL_BYTES / run_count.max(1))
+}
+
 impl PostingRun {
     /// Records carry their key as a u64 — a zero-extended 3-byte gram for
     /// trigram runs, the full hash for sparse runs. Big-endian record bytes
@@ -851,11 +856,12 @@ pub(crate) fn write_posting_record(
 }
 
 fn merge_run_group(paths: Vec<TempPath>, strategy: Strategy) -> Result<TempPath> {
+    let reader_buffer_bytes = merge_reader_buffer_bytes(paths.len());
     let mut runs = paths
         .iter()
         .map(|path| {
             Ok(PostingRun {
-                reader: BufReader::with_capacity(RUN_IO_BUFFER_BYTES, File::open(path)?),
+                reader: BufReader::with_capacity(reader_buffer_bytes, File::open(path)?),
                 strategy,
             })
         })
@@ -954,11 +960,12 @@ pub(crate) fn merge_posting_runs<'a>(
     postings_sink: Box<dyn StreamingPut + 'a>,
 ) -> Result<(MergedBlob, MergedBlob, String, PostingsTail)> {
     let paths = collapse_posting_runs(runs, strategy)?;
+    let reader_buffer_bytes = merge_reader_buffer_bytes(paths.len());
     let mut runs = paths
         .iter()
         .map(|path| {
             Ok(PostingRun {
-                reader: BufReader::with_capacity(RUN_IO_BUFFER_BYTES, File::open(path)?),
+                reader: BufReader::with_capacity(reader_buffer_bytes, File::open(path)?),
                 strategy,
             })
         })
@@ -1093,8 +1100,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trigram_entry_sink_budget_is_bounded() {
-        assert_eq!(TrigramEntrySink::CAP * size_of::<u64>(), 1024 * 1024);
+    fn trigram_entry_sink_budget_balances_run_count() {
+        assert_eq!(TrigramEntrySink::CAP * size_of::<u64>(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn merge_reader_buffers_share_a_bounded_pool() {
+        assert_eq!(merge_reader_buffer_bytes(1), RUN_IO_BUFFER_BYTES);
+        assert_eq!(merge_reader_buffer_bytes(16), RUN_IO_BUFFER_BYTES);
+        assert_eq!(merge_reader_buffer_bytes(64), 64 * 1024);
+        assert!(merge_reader_buffer_bytes(64) * 64 <= MERGE_READ_BUFFER_POOL_BYTES);
     }
 
     #[test]

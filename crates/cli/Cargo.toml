@@ -17,6 +17,9 @@ readme = "../../README.md"
 name = "seagrep"
 path = "src/main.rs"
 
+[features]
+dhat-heap = ["dep:dhat"]
+
 [dependencies]
 seagrep-core = { path = "../core", version = "0.9.0" }
 seagrep-index = { path = "../index", version = "0.9.0" }
@@ -30,6 +33,7 @@ bytes.workspace = true
 clap.workspace = true
 indicatif.workspace = true
 ctrlc = { version = "3.5.2", features = ["termination"] }
+dhat = { version = "0.3.3", optional = true }
 regex.workspace = true
 regex-syntax.workspace = true
 serde.workspace = true

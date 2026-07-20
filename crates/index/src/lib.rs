@@ -1101,6 +1101,41 @@ mod tests {
     }
 
     #[test]
+    fn posting_merge_is_byte_identical_across_run_partitions() {
+        let records = (0..4096usize)
+            .flat_map(|index| {
+                let gram = u64::try_from(index % 257).unwrap();
+                let id = DocId::try_from(index % 1024).unwrap();
+                [(gram, id), (gram, id)]
+            })
+            .collect::<Vec<_>>();
+        let make_runs = |partition_count: usize| {
+            (0..partition_count)
+                .map(|partition| {
+                    let mut partition_records = records
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, record)| {
+                            (index % partition_count == partition).then_some(*record)
+                        })
+                        .collect::<Vec<_>>();
+                    partition_records.sort_unstable();
+                    let mut file = tempfile::NamedTempFile::new().unwrap();
+                    for (gram, id) in partition_records {
+                        write_posting_record(&mut file, Strategy::Trigram, gram, id).unwrap();
+                    }
+                    file.flush().unwrap();
+                    file.into_temp_path()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let single = merge_to_store(make_runs(1), Strategy::Trigram, 1024);
+        let partitioned = merge_to_store(make_runs(128), Strategy::Trigram, 1024);
+        assert_eq!(single, partitioned);
+    }
+
+    #[test]
     fn trigram_run_algorithms_are_byte_identical() {
         let documents = (0..257usize)
             .rev()
