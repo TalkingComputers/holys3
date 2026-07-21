@@ -21,7 +21,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "1.1.2"
 postcard = { version = "1", features = ["use-std"] }
-regex = "1"
+regex = "1.13.1"
+regex-automata = "0.4.16"
 regex-syntax = "0.8"
 sha2 = "0.11"
 hex = "0.4"

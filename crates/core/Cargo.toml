@@ -17,6 +17,7 @@ anyhow.workspace = true
 encoding_rs_io.workspace = true
 serde.workspace = true
 regex.workspace = true
+regex-automata.workspace = true
 regex-syntax.workspace = true
 rapidhash.workspace = true
 memchr = "2.8.1"

@@ -6,6 +6,7 @@ mod codec;
 mod detect;
 mod grams;
 mod grep;
+mod pattern;
 mod progress;
 mod store;
 #[cfg(any(test, feature = "testutil"))]
@@ -28,8 +29,11 @@ pub use grams::{
 };
 pub use grep::{
     bounded_match_len, can_search_as_document, grep_bytes, grep_bytes_fast, grep_doc,
-    has_line_match, has_line_match_fast, parse_pattern, LineEvent, LineKind, MatchOptions,
-    SubMatch,
+    has_line_match, has_line_match_fast, LineEvent, LineKind, MatchOptions, SubMatch,
+};
+pub use pattern::{
+    analyze_patterns, parse_pattern, FallbackExtent, MatchBounds, MatchWitness, PatternCache,
+    PatternMatch, PatternMatches, PatternProgram, ProofDirection, SearchExtent,
 };
 pub use progress::{ProgressEvent, ProgressSender};
 pub use store::{
