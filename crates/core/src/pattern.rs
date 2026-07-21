@@ -362,7 +362,8 @@ fn build_proof_graph_with_limit(
     drop(reverse);
     drop(queue);
     scratch_bytes = count_graph_bytes(&states, &accepting, &edges)?;
-    scratch_bytes = scratch_bytes.checked_add(coaccessible.capacity().div_ceil(8))?;
+    scratch_bytes =
+        scratch_bytes.checked_add(coaccessible.capacity().checked_mul(size_of::<bool>())?)?;
     if scratch_bytes > scratch_limit {
         return None;
     }
@@ -415,13 +416,34 @@ fn reserve_vec<T>(
     scratch_limit: usize,
 ) -> Option<()> {
     let before = values.capacity();
-    values.try_reserve(additional).ok()?;
-    add_capacity_bytes(
+    let target = plan_capacity(
+        values.len(),
+        before,
+        additional,
+        size_of::<T>(),
+        *scratch_bytes,
+        scratch_limit,
+    )?;
+    if target == before {
+        return Some(());
+    }
+    values
+        .try_reserve_exact(target.checked_sub(values.len())?)
+        .ok()?;
+    if add_capacity_bytes(
         scratch_bytes,
-        values.capacity().checked_sub(before)?,
+        before,
+        values.capacity(),
         size_of::<T>(),
         scratch_limit,
     )
+    .is_none()
+    {
+        *values = Vec::new();
+        *scratch_bytes = scratch_bytes.checked_sub(before.checked_mul(size_of::<T>())?)?;
+        return None;
+    }
+    Some(())
 }
 
 fn reserve_bits(
@@ -430,10 +452,7 @@ fn reserve_bits(
     scratch_bytes: &mut usize,
     scratch_limit: usize,
 ) -> Option<()> {
-    let before = values.capacity().div_ceil(8);
-    values.try_reserve(additional).ok()?;
-    let after = values.capacity().div_ceil(8);
-    add_capacity_bytes(scratch_bytes, after.checked_sub(before)?, 1, scratch_limit)
+    reserve_vec(values, additional, scratch_bytes, scratch_limit)
 }
 
 fn reserve_queue<T>(
@@ -443,13 +462,34 @@ fn reserve_queue<T>(
     scratch_limit: usize,
 ) -> Option<()> {
     let before = values.capacity();
-    values.try_reserve(additional).ok()?;
-    add_capacity_bytes(
+    let target = plan_capacity(
+        values.len(),
+        before,
+        additional,
+        size_of::<T>(),
+        *scratch_bytes,
+        scratch_limit,
+    )?;
+    if target == before {
+        return Some(());
+    }
+    values
+        .try_reserve_exact(target.checked_sub(values.len())?)
+        .ok()?;
+    if add_capacity_bytes(
         scratch_bytes,
-        values.capacity().checked_sub(before)?,
+        before,
+        values.capacity(),
         size_of::<T>(),
         scratch_limit,
     )
+    .is_none()
+    {
+        *values = std::collections::VecDeque::new();
+        *scratch_bytes = scratch_bytes.checked_sub(before.checked_mul(size_of::<T>())?)?;
+        return None;
+    }
+    Some(())
 }
 
 fn reserve_indices(
@@ -459,23 +499,72 @@ fn reserve_indices(
     scratch_limit: usize,
 ) -> Option<()> {
     let before = values.capacity();
-    values.try_reserve(additional).ok()?;
-    add_capacity_bytes(
+    let target = plan_capacity(
+        values.len(),
+        before,
+        additional,
+        PROOF_MAP_BUCKET_BYTES,
+        *scratch_bytes,
+        scratch_limit,
+    )?;
+    if target == before {
+        return Some(());
+    }
+    values.try_reserve(target.checked_sub(values.len())?).ok()?;
+    if add_capacity_bytes(
         scratch_bytes,
-        values.capacity().checked_sub(before)?,
+        before,
+        values.capacity(),
         PROOF_MAP_BUCKET_BYTES,
         scratch_limit,
     )
+    .is_none()
+    {
+        *values = std::collections::HashMap::new();
+        *scratch_bytes = scratch_bytes.checked_sub(before.checked_mul(PROOF_MAP_BUCKET_BYTES)?)?;
+        return None;
+    }
+    Some(())
+}
+
+fn plan_capacity(
+    length: usize,
+    capacity: usize,
+    additional: usize,
+    element_bytes: usize,
+    scratch_bytes: usize,
+    scratch_limit: usize,
+) -> Option<usize> {
+    let required = length.checked_add(additional)?;
+    if required <= capacity {
+        return Some(capacity);
+    }
+    let remaining = scratch_limit.checked_sub(scratch_bytes)?;
+    let max_capacity = remaining.checked_div(element_bytes)?;
+    if required > max_capacity {
+        return None;
+    }
+    Some(capacity.saturating_mul(2).max(required).min(max_capacity))
 }
 
 fn add_capacity_bytes(
     scratch_bytes: &mut usize,
-    capacity: usize,
+    before: usize,
+    after: usize,
     element_bytes: usize,
     scratch_limit: usize,
 ) -> Option<()> {
-    *scratch_bytes = scratch_bytes.checked_add(capacity.checked_mul(element_bytes)?)?;
-    (*scratch_bytes <= scratch_limit).then_some(())
+    let remaining = scratch_limit.checked_sub(*scratch_bytes)?;
+    if after.checked_mul(element_bytes)? > remaining {
+        return None;
+    }
+    let growth = after.checked_sub(before)?.checked_mul(element_bytes)?;
+    let next = scratch_bytes.checked_add(growth)?;
+    if next > scratch_limit {
+        return None;
+    }
+    *scratch_bytes = next;
+    Some(())
 }
 
 fn count_graph_bytes(
@@ -486,7 +575,7 @@ fn count_graph_bytes(
     let mut bytes = states
         .capacity()
         .checked_mul(size_of::<regex_automata::util::primitives::StateID>())?;
-    bytes = bytes.checked_add(accepting.capacity().div_ceil(8))?;
+    bytes = bytes.checked_add(accepting.capacity().checked_mul(size_of::<bool>())?)?;
     bytes = bytes.checked_add(edges.capacity().checked_mul(size_of::<Vec<usize>>())?)?;
     for destinations in edges {
         bytes = bytes.checked_add(destinations.capacity().checked_mul(size_of::<usize>())?)?;
@@ -1123,7 +1212,7 @@ mod tests {
             bits.push(value % 2 == 0);
         }
         assert!(bit_growths < 64, "{bit_growths}");
-        assert_eq!(bit_bytes, bits.capacity().div_ceil(8));
+        assert_eq!(bit_bytes, bits.capacity() * size_of::<bool>());
 
         let mut queue = std::collections::VecDeque::new();
         let mut queue_bytes = 0;
@@ -1136,5 +1225,66 @@ mod tests {
         }
         assert!(queue_growths < 64, "{queue_growths}");
         assert_eq!(queue_bytes, queue.capacity() * size_of::<usize>());
+    }
+
+    #[test]
+    fn scratch_preflight_preserves_full_collections() {
+        let mut values = Vec::with_capacity(8);
+        values.resize(values.capacity(), 0u8);
+        let value_capacity = values.capacity();
+        let mut value_bytes = value_capacity;
+        let value_limit = value_bytes * 2;
+        assert!(reserve_vec(&mut values, 1, &mut value_bytes, value_limit).is_none());
+        assert_eq!(values.capacity(), value_capacity);
+        assert_eq!(value_bytes, value_capacity);
+
+        let mut bits = Vec::with_capacity(8);
+        bits.resize(bits.capacity(), false);
+        let bit_capacity = bits.capacity();
+        let mut bit_bytes = bit_capacity * size_of::<bool>();
+        let bit_limit = bit_bytes * 2;
+        assert!(reserve_bits(&mut bits, 1, &mut bit_bytes, bit_limit).is_none());
+        assert_eq!(bits.capacity(), bit_capacity);
+        assert_eq!(bit_bytes, bit_capacity * size_of::<bool>());
+
+        let mut queue = std::collections::VecDeque::with_capacity(8);
+        queue.resize(queue.capacity(), 0u8);
+        let queue_capacity = queue.capacity();
+        let mut queue_bytes = queue_capacity;
+        let queue_limit = queue_bytes * 2;
+        assert!(reserve_queue(&mut queue, 1, &mut queue_bytes, queue_limit).is_none());
+        assert_eq!(queue.capacity(), queue_capacity);
+        assert_eq!(queue_bytes, queue_capacity);
+
+        let mut indices = std::collections::HashMap::with_capacity(8);
+        let index_capacity = indices.capacity();
+        for index in 0..index_capacity {
+            indices.insert(
+                regex_automata::util::primitives::StateID::new(index).unwrap(),
+                index,
+            );
+        }
+        let mut index_bytes = index_capacity * PROOF_MAP_BUCKET_BYTES;
+        let index_limit = index_bytes * 2;
+        assert!(reserve_indices(&mut indices, 1, &mut index_bytes, index_limit).is_none());
+        assert_eq!(indices.capacity(), index_capacity);
+        assert_eq!(index_bytes, index_capacity * PROOF_MAP_BUCKET_BYTES);
+    }
+
+    #[test]
+    fn scratch_postcheck_discards_oversized_indices() {
+        let mut indices = std::collections::HashMap::with_capacity(1);
+        let initial_capacity = indices.capacity();
+        for index in 0..initial_capacity {
+            indices.insert(
+                regex_automata::util::primitives::StateID::new(index).unwrap(),
+                index,
+            );
+        }
+        let mut scratch_bytes = initial_capacity * PROOF_MAP_BUCKET_BYTES;
+        let scratch_limit = initial_capacity * 3 * PROOF_MAP_BUCKET_BYTES;
+        assert!(reserve_indices(&mut indices, 1, &mut scratch_bytes, scratch_limit).is_none());
+        assert_eq!(indices.capacity(), 0);
+        assert_eq!(scratch_bytes, 0);
     }
 }
