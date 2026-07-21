@@ -181,6 +181,51 @@ impl MatchSink for CountEventSink {
     }
 }
 
+fn open_indexed(
+    store_dir: &Path,
+    cache_dir: &Path,
+    keys: Vec<String>,
+    bodies: Vec<Vec<u8>>,
+) -> anyhow::Result<SegmentedReader> {
+    let source = SourceIdentity::Local {
+        prefix: "/test/".into(),
+    };
+    let corpus = MemCorpus::new(keys.clone(), bodies.clone());
+    let listing = corpus
+        .sources()
+        .iter()
+        .map(|source| {
+            (
+                source.key.clone(),
+                source.version.clone(),
+                source.encoded_size,
+            )
+        })
+        .collect::<Vec<_>>();
+    update_index(
+        &LocalBlobStore::new(store_dir),
+        cache_dir,
+        &source,
+        Some(Strategy::Trigram),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| {
+            let selected = shard
+                .iter()
+                .map(|(key, _, _)| keys.iter().position(|candidate| candidate == key).unwrap())
+                .collect::<Vec<_>>();
+            Ok(Box::new(MemCorpus::new(
+                selected.iter().map(|index| keys[*index].clone()).collect(),
+                selected
+                    .iter()
+                    .map(|index| bodies[*index].clone())
+                    .collect(),
+            )))
+        },
+    )?;
+    SegmentedReader::open(Box::new(LocalBlobStore::new(store_dir)), cache_dir, &source)
+}
+
 #[test]
 fn regional_verification_matches_whole_document_scanning() -> anyhow::Result<()> {
     const BLOCK: usize = CANDIDATE_BLOCK_BYTES;
@@ -205,40 +250,11 @@ fn regional_verification_matches_whole_document_scanning() -> anyhow::Result<()>
 
     let store_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-    let store = LocalBlobStore::new(store_dir.path());
-    let source = SourceIdentity::Local {
-        prefix: "/test/".into(),
-    };
-    let corpus = MemCorpus::new(vec!["large.log".into()], vec![body.clone()]);
-    let listing = corpus
-        .sources()
-        .iter()
-        .map(|source| {
-            (
-                source.key.clone(),
-                source.version.clone(),
-                source.encoded_size,
-            )
-        })
-        .collect::<Vec<_>>();
-    update_index(
-        &store,
+    let reader = open_indexed(
+        store_dir.path(),
         cache_dir.path(),
-        &source,
-        Some(Strategy::Trigram),
-        &listing,
-        UpdateOptions::default(),
-        &|_| {
-            Ok(Box::new(MemCorpus::new(
-                vec!["large.log".into()],
-                vec![body.clone()],
-            )))
-        },
-    )?;
-    let reader = SegmentedReader::open(
-        Box::new(LocalBlobStore::new(store_dir.path())),
-        cache_dir.path(),
-        &source,
+        vec!["large.log".into()],
+        vec![body.clone()],
     )?;
 
     for (pattern, options) in [
@@ -471,52 +487,15 @@ fn mixed_patterns_match_whole_document_oracle_on_giant_line() -> anyhow::Result<
 
     let store_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-    let source = SourceIdentity::Local {
-        prefix: "/test/".into(),
-    };
-    let keys = vec!["giant.log".into(), "line.log".into(), "doc.log".into()];
-    let bodies = vec![
-        giant,
-        b"LINEFALLBACK hello world\n".to_vec(),
-        b"DOCFALLBACK anchored body".to_vec(),
-    ];
-    let corpus = MemCorpus::new(keys.clone(), bodies.clone());
-    let listing = corpus
-        .sources()
-        .iter()
-        .map(|source| {
-            (
-                source.key.clone(),
-                source.version.clone(),
-                source.encoded_size,
-            )
-        })
-        .collect::<Vec<_>>();
-    update_index(
-        &LocalBlobStore::new(store_dir.path()),
+    let reader = open_indexed(
+        store_dir.path(),
         cache_dir.path(),
-        &source,
-        Some(Strategy::Trigram),
-        &listing,
-        UpdateOptions::default(),
-        &|shard| {
-            let selected = shard
-                .iter()
-                .map(|(key, _, _)| keys.iter().position(|candidate| candidate == key).unwrap())
-                .collect::<Vec<_>>();
-            Ok(Box::new(MemCorpus::new(
-                selected.iter().map(|index| keys[*index].clone()).collect(),
-                selected
-                    .iter()
-                    .map(|index| bodies[*index].clone())
-                    .collect(),
-            )))
-        },
-    )?;
-    let reader = SegmentedReader::open(
-        Box::new(LocalBlobStore::new(store_dir.path())),
-        cache_dir.path(),
-        &source,
+        vec!["giant.log".into(), "line.log".into(), "doc.log".into()],
+        vec![
+            giant,
+            b"LINEFALLBACK hello world\n".to_vec(),
+            b"DOCFALLBACK anchored body".to_vec(),
+        ],
     )?;
     let whole = WholeReader { reader: &reader };
     let patterns = [
@@ -567,17 +546,6 @@ fn mixed_patterns_match_whole_document_oracle_on_giant_line() -> anyhow::Result<
         let mut oracle_docs = oracle.documents.into_inner().unwrap();
         prod_docs.sort_by(|left, right| left.key.cmp(&right.key));
         oracle_docs.sort_by(|left, right| left.key.cmp(&right.key));
-        for documents in [&mut prod_docs, &mut oracle_docs] {
-            for document in documents.iter_mut() {
-                if let CapturedData::Windows(windows) = &mut document.data {
-                    for window in windows {
-                        for matched in &mut window.matches {
-                            matched.canonical_span_known = true;
-                        }
-                    }
-                }
-            }
-        }
         assert_eq!(prod_docs, oracle_docs, "detail {detail:?}");
         assert_eq!(prod_stats.hits, oracle_stats.hits, "detail {detail:?}");
         assert_eq!(
@@ -632,5 +600,28 @@ fn mixed_patterns_match_whole_document_oracle_on_giant_line() -> anyhow::Result<
         }
     }
     assert!(saw_regional);
+
+    let proof_hir = parse_pattern("BEGIN[A-Z0-9]{20,}")?;
+    let production = CaptureSink {
+        detail: SearchDetail::MatchWindows { max_bytes: 8 },
+        documents: Mutex::new(Vec::new()),
+    };
+    let stats = search_patterns(
+        &reader,
+        std::slice::from_ref(&proof_hir),
+        KeyScope::default(),
+        MatchOptions::default(),
+        &production,
+    )?;
+    assert!(stats.regional_docs > 0);
+    let documents = production.documents.into_inner().unwrap();
+    assert_eq!(documents.len(), 1);
+    let CapturedData::Windows(windows) = &documents[0].data else {
+        panic!("window detail must capture windows");
+    };
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].matches.len(), 1);
+    assert!(!windows[0].matches[0].canonical_span_known);
+    assert!(windows[0].matches[0].right_clipped);
     Ok(())
 }
