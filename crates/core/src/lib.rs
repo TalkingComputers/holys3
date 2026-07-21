@@ -37,6 +37,7 @@ pub use pattern::{
 };
 pub use progress::{ProgressEvent, ProgressSender};
 pub use store::{
-    content_version, scan_matching_docs, BlobStore, Corpus, DocAddress, DocFetcher, DocumentRegion,
-    FetchedDocument, IndexAddress, LocalBlobStore, SourceObject, StaleSource, StreamingPut,
+    content_version, scan_matching_docs, BlobStore, CandidateBatch, CandidateRange, Corpus,
+    DocAddress, DocFetcher, DocumentRegion, FetchedDocument, IndexAddress, LocalBlobStore,
+    RegionProgram, RegionRead, SourceObject, StaleSource, StreamingPut,
 };

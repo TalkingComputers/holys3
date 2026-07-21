@@ -19,6 +19,7 @@ anyhow.workspace = true
 serde.workspace = true
 postcard.workspace = true
 regex.workspace = true
+regex-syntax.workspace = true
 fst = "0.4.7"
 rayon.workspace = true
 sha2.workspace = true

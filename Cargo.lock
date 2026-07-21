@@ -3503,6 +3503,7 @@ dependencies = [
  "rapidhash",
  "rayon",
  "regex",
+ "regex-syntax",
  "seagrep-core",
  "seagrep-query",
  "serde",

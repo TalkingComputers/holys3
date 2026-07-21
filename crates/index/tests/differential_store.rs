@@ -13,15 +13,13 @@ use seagrep_index::{
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-struct ParallelRangeStore {
+struct CountingRangeStore {
     inner: LocalBlobStore,
-    active: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
+    reads: Arc<AtomicUsize>,
 }
 
-impl BlobStore for ParallelRangeStore {
+impl BlobStore for CountingRangeStore {
     fn put(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.inner.put(name, bytes)
     }
@@ -42,12 +40,8 @@ impl BlobStore for ParallelRangeStore {
         if !name.starts_with("packs/") {
             return self.inner.get_ranges(name, ranges);
         }
-        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(active, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(25));
-        let fetched = self.inner.get_ranges(name, ranges);
-        self.active.fetch_sub(1, Ordering::SeqCst);
-        fetched
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_ranges(name, ranges)
     }
 
     fn delete(&self, name: &str) -> anyhow::Result<()> {
@@ -303,14 +297,14 @@ fn regional_verification_matches_whole_document_scanning() -> anyhow::Result<()>
 }
 
 #[test]
-fn regional_fetches_overlap_across_documents() -> anyhow::Result<()> {
+fn candidate_fetches_union_across_documents() -> anyhow::Result<()> {
     const DOCUMENTS: usize = 8;
     const BLOCK: usize = seagrep_core::CANDIDATE_BLOCK_BYTES;
     let mut body = Vec::new();
-    while body.len() < 20 * BLOCK {
+    while body.len() < 4 * BLOCK {
         body.extend_from_slice(b"ordinary line with padding................................\n");
     }
-    let token = 10 * BLOCK + 17;
+    let token = 2 * BLOCK + 17;
     body[token..token + 13].copy_from_slice(b"PARALLELTOKEN");
 
     let store_dir = tempfile::tempdir()?;
@@ -334,7 +328,7 @@ fn regional_fetches_overlap_across_documents() -> anyhow::Result<()> {
             )
         })
         .collect::<Vec<_>>();
-    update_index(
+    let report = update_index(
         &LocalBlobStore::new(store_dir.path()),
         cache_dir.path(),
         &source,
@@ -355,13 +349,12 @@ fn regional_fetches_overlap_across_documents() -> anyhow::Result<()> {
             )))
         },
     )?;
-    let active = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
+    assert_eq!(report.segments, 1);
+    let reads = Arc::new(AtomicUsize::new(0));
     let reader = SegmentedReader::open(
-        Box::new(ParallelRangeStore {
+        Box::new(CountingRangeStore {
             inner: LocalBlobStore::new(store_dir.path()),
-            active,
-            peak: Arc::clone(&peak),
+            reads: Arc::clone(&reads),
         }),
         cache_dir.path(),
         &source,
@@ -370,8 +363,6 @@ fn regional_fetches_overlap_across_documents() -> anyhow::Result<()> {
     let (matches, stats) = search_collect(&reader, "PARALLELTOKEN")?;
     assert_eq!(matches.len(), DOCUMENTS);
     assert_eq!(stats.hits.len(), DOCUMENTS);
-    if std::thread::available_parallelism()?.get() > 1 {
-        assert!(peak.load(Ordering::SeqCst) > 1);
-    }
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
     Ok(())
 }

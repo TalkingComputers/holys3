@@ -58,6 +58,33 @@ pub(crate) struct TermValue {
     pub len: Option<u64>,
 }
 
+pub(crate) fn collect_query_grams(queries: &[&Query]) -> Vec<Vec<u8>> {
+    let mut grams = Vec::new();
+    let mut stack = queries.to_vec();
+    while let Some(query) = stack.pop() {
+        match query {
+            Query::All => {}
+            Query::Gram(gram) => grams.push(gram.clone()),
+            Query::And(children) | Query::Or(children) => stack.extend(children),
+        }
+    }
+    grams.sort_unstable();
+    grams.dedup();
+    grams
+}
+
+pub(crate) fn bind_queries(
+    queries: &[&Query],
+    id_space: u32,
+    strategy: Strategy,
+    lookup: &dyn Fn(&[u8]) -> Result<Option<TermValue>>,
+) -> Result<Vec<Resolved>> {
+    queries
+        .iter()
+        .map(|query| resolve(query, id_space, strategy, lookup))
+        .collect()
+}
+
 /// A query with every gram resolved against the term dictionary.
 pub(crate) enum Resolved {
     All,
@@ -316,6 +343,40 @@ mod tests {
             count,
             len: u64::from(count),
         }
+    }
+
+    #[test]
+    fn query_grams_are_collected_once_in_sorted_order() {
+        let first = Query::And(vec![
+            Query::Gram(b"zed".to_vec()),
+            Query::Or(vec![
+                Query::Gram(b"alpha".to_vec()),
+                Query::Gram(b"zed".to_vec()),
+            ]),
+        ]);
+        let second = Query::Or(vec![Query::All, Query::Gram(b"middle".to_vec())]);
+
+        assert_eq!(
+            collect_query_grams(&[&first, &second]),
+            [b"alpha".to_vec(), b"middle".to_vec(), b"zed".to_vec()]
+        );
+    }
+
+    #[test]
+    fn queries_bind_in_input_order_through_one_lookup() {
+        let first = Query::Gram(b"first".to_vec());
+        let second = Query::Gram(b"second".to_vec());
+        let lookups = std::cell::Cell::new(0usize);
+        let bound = bind_queries(&[&first, &second], 10, Strategy::Sparse, &|gram| {
+            lookups.set(lookups.get() + 1);
+            let id = if gram == b"first" { 1 } else { 2 };
+            Ok(Some(tv(pack_posting(id, 1)?)))
+        })
+        .unwrap();
+
+        assert_eq!(lookups.get(), 2);
+        assert!(matches!(bound[0], Resolved::Doc(1)));
+        assert!(matches!(bound[1], Resolved::Doc(2)));
     }
 
     #[test]

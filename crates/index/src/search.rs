@@ -1,7 +1,7 @@
 //! Streaming search engine: packed snapshot fetch, parallel decompress+verify,
 //! per-doc result sinks. Documents are addressed by key throughout.
 
-use crate::{IndexReader, SearchStats};
+use crate::{CandidateBatchLimits, CandidatePlan, IndexReader, SearchStats};
 use anyhow::{Context, Result};
 use rayon::iter::{ParallelBridge, ParallelIterator};
 #[cfg(test)]
@@ -9,7 +9,7 @@ use seagrep_core::DocumentBody;
 use seagrep_core::{
     bounded_match_len, can_search_as_document, grep_bytes, grep_bytes_fast, has_line_match,
     has_line_match_fast, DocAddress, DocFetcher, DocumentRegion, FetchedDocument, LineEvent,
-    MatchOptions,
+    MatchOptions, RegionRead, SearchExtent,
 };
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -260,6 +260,7 @@ fn search_batch(
     options: MatchOptions,
     sink: &dyn MatchSink,
 ) -> Result<BatchResult> {
+    let batch = fetcher.start_candidate_batch(documents)?;
     let workers = std::thread::available_parallelism()?
         .get()
         .min(documents.len());
@@ -295,11 +296,13 @@ fn search_batch(
                         .iter()
                         .map(|matched| matched.start..matched.end)
                         .collect::<Vec<_>>();
-                    let lines = fetcher.fetch_candidate_lines(
-                        &documents_ref[idx],
+                    let lines = batch.fetch_regions(
+                        idx,
                         &ranges,
-                        options.before_context,
-                        options.after_context,
+                        RegionRead::Lines {
+                            before_context: options.before_context,
+                            after_context: options.after_context,
+                        },
                     )?;
                     bytes_fetched
                         .fetch_add(usize::try_from(lines.fetched_size())?, Ordering::Relaxed);
@@ -375,13 +378,7 @@ fn search_batch(
             .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")))
     };
     let fetch = |consume: &mut dyn FnMut(usize, FetchedDocument) -> Result<()>| {
-        fetcher.fetch_candidate_each(
-            documents_ref,
-            bounded_len.filter(|len| *len <= seagrep_core::CANDIDATE_BLOCK_BYTES),
-            options.before_context,
-            options.after_context,
-            consume,
-        )
+        batch.fetch_initial(consume)
     };
     let record_fetch = |body: &FetchedDocument| -> Result<()> {
         bytes_fetched.fetch_add(usize::try_from(body.fetched_size())?, Ordering::Relaxed);
@@ -505,6 +502,13 @@ pub fn search_streaming(
     let re = regex::bytes::Regex::new(pattern)?;
     let whole_document = can_search_as_document(&hir);
     let bounded_len = bounded_match_len(&hir);
+    let extent = bounded_len
+        .filter(|len| *len > 0 && *len <= seagrep_core::CANDIDATE_BLOCK_BYTES)
+        .map_or(SearchExtent::Lines, |span| SearchExtent::Bytes { span });
+    let plan = CandidatePlan {
+        query: &query,
+        extent,
+    };
     let mut hits = Vec::new();
     let mut hit_count = 0usize;
     let mut candidates = 0usize;
@@ -513,10 +517,12 @@ pub fn search_streaming(
     let mut whole_docs = 0usize;
     let mut decoded_bytes = 0usize;
     let visited = reader.visit_candidates(
-        &query,
+        std::slice::from_ref(&plan),
         scope.prefix,
-        bounded_len.filter(|len| *len <= seagrep_core::CANDIDATE_BLOCK_BYTES),
-        SEARCH_CANDIDATE_BATCH,
+        CandidateBatchLimits {
+            documents: SEARCH_CANDIDATE_BATCH,
+            decoded_bytes: 64 * 1024 * 1024,
+        },
         &mut |mut documents| {
             documents.retain(|document| scope.admits(&document.display_key));
             candidates = candidates
@@ -675,12 +681,16 @@ mod tests {
             DocumentRegion {
                 start: 100,
                 line: 7,
+                line_offset: 80,
                 bytes: bytes::Bytes::from_static(b"needle-left"),
+                program: seagrep_core::RegionProgram::Regional,
             },
             DocumentRegion {
                 start: 1_000,
                 line: 7,
+                line_offset: 80,
                 bytes: bytes::Bytes::from_static(b"right-needle\n"),
+                program: seagrep_core::RegionProgram::Regional,
             },
         ];
         let re = regex::bytes::Regex::new("needle").unwrap();
@@ -733,12 +743,13 @@ mod tests {
 
         fn visit_candidates(
             &self,
-            _query: &Query,
-            _key_prefix: Option<&str>,
-            _bounded_len: Option<usize>,
-            _batch_size: usize,
+            plans: &[CandidatePlan<'_>],
+            key_prefix: Option<&str>,
+            limits: CandidateBatchLimits,
             visit: &mut dyn FnMut(Vec<DocAddress>) -> Result<bool>,
         ) -> Result<()> {
+            anyhow::ensure!(plans.len() == 1, "expected one candidate plan");
+            let _ = (key_prefix, limits);
             for chunk in self.documents.chunks(2) {
                 if !visit(chunk.to_vec())? {
                     break;
@@ -897,12 +908,13 @@ mod tests {
 
         fn visit_candidates(
             &self,
-            _query: &Query,
-            _key_prefix: Option<&str>,
-            _bounded_len: Option<usize>,
-            _batch_size: usize,
+            plans: &[CandidatePlan<'_>],
+            key_prefix: Option<&str>,
+            limits: CandidateBatchLimits,
             visit: &mut dyn FnMut(Vec<DocAddress>) -> Result<bool>,
         ) -> Result<()> {
+            anyhow::ensure!(plans.len() == 1, "expected one candidate plan");
+            let _ = (key_prefix, limits);
             visit(vec![self.document.clone()])?;
             Err(anyhow::Error::new(crate::IndexChanged))
         }

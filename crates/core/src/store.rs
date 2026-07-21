@@ -15,10 +15,16 @@ pub struct SourceObject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateRange {
+    pub blocks: Range<u32>,
+    pub extent: crate::SearchExtent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexAddress {
     pub segment: u32,
     pub document: u32,
-    pub blocks: Option<Vec<Range<u32>>>,
+    pub ranges: Option<Vec<CandidateRange>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,11 +38,19 @@ pub struct DocAddress {
     pub index: Option<IndexAddress>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionProgram {
+    Regional,
+    Full,
+}
+
+#[derive(Debug, Clone)]
 pub struct DocumentRegion {
     pub start: u64,
     pub line: u64,
+    pub line_offset: u64,
     pub bytes: Bytes,
+    pub program: RegionProgram,
 }
 
 #[derive(Debug)]
@@ -110,6 +124,67 @@ pub trait Corpus: Sync {
 /// `consume` receives the index into `documents` plus the body, as
 /// fetches complete (order NOT guaranteed). Implementations may fetch
 /// concurrently; the first `consume` error aborts the remaining fetches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionRead {
+    Bytes,
+    Lines {
+        before_context: usize,
+        after_context: usize,
+    },
+}
+
+pub trait CandidateBatch: Sync {
+    fn fetch_initial(
+        &self,
+        consume: &mut dyn FnMut(usize, FetchedDocument) -> AnyhowResult<()>,
+    ) -> AnyhowResult<()>;
+
+    fn fetch_regions(
+        &self,
+        document: usize,
+        ranges: &[Range<u64>],
+        read: RegionRead,
+    ) -> AnyhowResult<FetchedDocument>;
+}
+
+struct WholeCandidateBatch<'a, F: DocFetcher + ?Sized> {
+    fetcher: &'a F,
+    documents: &'a [DocAddress],
+}
+
+impl<F: DocFetcher + ?Sized> CandidateBatch for WholeCandidateBatch<'_, F> {
+    fn fetch_initial(
+        &self,
+        consume: &mut dyn FnMut(usize, FetchedDocument) -> AnyhowResult<()>,
+    ) -> AnyhowResult<()> {
+        self.fetcher.fetch_each(self.documents, &mut |index, body| {
+            consume(index, FetchedDocument::Whole(body))
+        })
+    }
+
+    fn fetch_regions(
+        &self,
+        document: usize,
+        ranges: &[Range<u64>],
+        read: RegionRead,
+    ) -> AnyhowResult<FetchedDocument> {
+        let Some(address) = self.documents.get(document) else {
+            anyhow::bail!(
+                "candidate document {document} is outside a batch of {}",
+                self.documents.len()
+            );
+        };
+        let _ = (ranges, read);
+        let mut fetched = None;
+        self.fetcher
+            .fetch_each(std::slice::from_ref(address), &mut |_, body| {
+                fetched = Some(FetchedDocument::Whole(body));
+                Ok(())
+            })?;
+        fetched.ok_or_else(|| anyhow::anyhow!("candidate region fetch returned no document"))
+    }
+}
+
 pub trait DocFetcher: Sync {
     fn fetch_each(
         &self,
@@ -117,34 +192,14 @@ pub trait DocFetcher: Sync {
         consume: &mut dyn FnMut(usize, DocumentBody) -> AnyhowResult<()>,
     ) -> AnyhowResult<()>;
 
-    fn fetch_candidate_each(
-        &self,
-        documents: &[DocAddress],
-        _bounded_len: Option<usize>,
-        _before_context: usize,
-        _after_context: usize,
-        consume: &mut dyn FnMut(usize, FetchedDocument) -> AnyhowResult<()>,
-    ) -> AnyhowResult<()> {
-        self.fetch_each(documents, &mut |index, body| {
-            consume(index, FetchedDocument::Whole(body))
-        })
-    }
-
-    fn fetch_candidate_lines(
-        &self,
-        document: &DocAddress,
-        _matches: &[Range<u64>],
-        _before_context: usize,
-        _after_context: usize,
-    ) -> AnyhowResult<FetchedDocument> {
-        let mut fetched = None;
-        self.fetch_each(std::slice::from_ref(document), &mut |_, body| {
-            fetched = Some(body);
-            Ok(())
-        })?;
-        fetched
-            .map(FetchedDocument::Whole)
-            .ok_or_else(|| anyhow::anyhow!("candidate line fetch returned no document"))
+    fn start_candidate_batch<'a>(
+        &'a self,
+        documents: &'a [DocAddress],
+    ) -> AnyhowResult<Box<dyn CandidateBatch + 'a>> {
+        Ok(Box::new(WholeCandidateBatch {
+            fetcher: self,
+            documents,
+        }))
     }
 }
 
@@ -700,6 +755,83 @@ mod tests {
                 (0, Bytes::from_static(b"two")),
                 (1, Bytes::from_static(b"one"))
             ]
+        );
+    }
+
+    #[test]
+    fn default_candidate_batch_degrades_to_whole_documents() {
+        use crate::testutil::MemCorpus;
+        use crate::{DocFetcher, RegionRead};
+        let corpus = MemCorpus::new(vec!["a".into()], vec![b"one\n".to_vec()]);
+        let documents = vec![DocAddress {
+            display_key: "a".into(),
+            source_key: "a".into(),
+            source_version: content_version(b"one\n"),
+            encoded_size: 4,
+            encoding: crate::SourceEncoding::Raw,
+            member_path: None,
+            index: None,
+        }];
+        let fetcher: &dyn DocFetcher = &corpus;
+        let batch = fetcher.start_candidate_batch(&documents).unwrap();
+        let mut initial = None;
+        batch
+            .fetch_initial(&mut |index, document| {
+                assert_eq!(index, 0);
+                initial = Some(document);
+                Ok(())
+            })
+            .unwrap();
+        let FetchedDocument::Whole(body) = initial.unwrap() else {
+            panic!("default initial fetch must return a whole document")
+        };
+        assert_eq!(body.into_bytes().unwrap(), Bytes::from_static(b"one\n"));
+
+        let FetchedDocument::Whole(body) =
+            batch.fetch_regions(0, &[1..2], RegionRead::Bytes).unwrap()
+        else {
+            panic!("default regional fetch must return a whole document")
+        };
+        assert_eq!(body.into_bytes().unwrap(), Bytes::from_static(b"one\n"));
+        let error = batch
+            .fetch_regions(1, &[1..2], RegionRead::Bytes)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "candidate document 1 is outside a batch of 1"
+        );
+    }
+
+    #[test]
+    fn default_candidate_region_requires_a_callback() {
+        struct EmptyFetcher;
+
+        impl DocFetcher for EmptyFetcher {
+            fn fetch_each(
+                &self,
+                documents: &[DocAddress],
+                consume: &mut dyn FnMut(usize, DocumentBody) -> AnyhowResult<()>,
+            ) -> AnyhowResult<()> {
+                let _ = (documents, consume);
+                Ok(())
+            }
+        }
+
+        let documents = vec![DocAddress {
+            display_key: "missing".into(),
+            source_key: "missing".into(),
+            source_version: "v1".into(),
+            encoded_size: 0,
+            encoding: crate::SourceEncoding::Raw,
+            member_path: None,
+            index: None,
+        }];
+        let fetcher: &dyn DocFetcher = &EmptyFetcher;
+        let batch = fetcher.start_candidate_batch(&documents).unwrap();
+        let error = batch.fetch_regions(0, &[], RegionRead::Bytes).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "candidate region fetch returned no document"
         );
     }
 
