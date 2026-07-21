@@ -285,7 +285,7 @@ pub(crate) fn pack_blob(hash: &str) -> String {
     format!("packs/{hash}.pack")
 }
 
-fn block_span(slice: PackSlice, len: u64, blocks: &[PackBlock]) -> Result<Range<usize>> {
+pub(crate) fn block_span(slice: PackSlice, len: u64, blocks: &[PackBlock]) -> Result<Range<usize>> {
     if len == 0 {
         anyhow::ensure!(
             slice.first_block == 0 && slice.block_offset == 0,

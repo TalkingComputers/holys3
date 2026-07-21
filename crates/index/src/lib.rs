@@ -1328,6 +1328,58 @@ mod tests {
     }
 
     #[test]
+    fn batches_interleaved_small_candidates_by_physical_pack_blocks() {
+        let selected_bytes = 4 * 1024;
+        let mut selected = vec![b'x'; selected_bytes];
+        selected[..6].copy_from_slice(b"needle");
+        let filler = vec![b'z'; pack::PACK_BLOCK_BYTES - selected_bytes];
+        let c = MemCorpus::new(
+            vec![
+                "a-selected".into(),
+                "b-filler".into(),
+                "c-selected".into(),
+                "d-filler".into(),
+            ],
+            vec![selected.clone(), filler.clone(), selected, filler],
+        );
+        let (store_guard, cache_guard, reader) = build_tmp(&c, Strategy::Sparse);
+        let query = seagrep_query::plan("needle", Strategy::Sparse).unwrap();
+        let plan = CandidatePlan {
+            query: &query,
+            extent: seagrep_core::SearchExtent::Lines,
+        };
+        let mut batches = Vec::new();
+
+        reader
+            .visit_candidates(
+                std::slice::from_ref(&plan),
+                None,
+                CandidateBatchLimits {
+                    documents: 4,
+                    decoded_bytes: pack::PACK_BLOCK_BYTES as u64,
+                },
+                &mut |documents| {
+                    batches.push(
+                        documents
+                            .into_iter()
+                            .map(|document| document.display_key)
+                            .collect::<Vec<_>>(),
+                    );
+                    Ok(true)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            batches,
+            [vec!["a-selected".to_owned()], vec!["c-selected".to_owned()],]
+        );
+        drop(reader);
+        drop(cache_guard);
+        drop(store_guard);
+    }
+
+    #[test]
     fn search_collect_returns_verified_matches_and_stats() {
         let c = MemCorpus::new(
             vec!["x".into(), "y".into()],

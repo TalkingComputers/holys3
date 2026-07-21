@@ -232,50 +232,6 @@ pub(crate) fn add_candidate_selection(
     Ok(())
 }
 
-pub(crate) fn estimate_candidate_bytes(
-    decoded_size: u64,
-    ranges: Option<&[CandidateRange]>,
-) -> Result<u64> {
-    let Some(ranges) = ranges else {
-        return Ok(decoded_size);
-    };
-    let block_bytes = CANDIDATE_BLOCK_BYTES as u64;
-    let mut bytes = ranges
-        .iter()
-        .map(|range| -> Result<Option<std::ops::Range<u64>>> {
-            let start = u64::from(range.blocks.start)
-                .checked_mul(block_bytes)
-                .context("candidate block byte offset overflows")?
-                .min(decoded_size);
-            let end = u64::from(range.blocks.end)
-                .checked_mul(block_bytes)
-                .context("candidate block byte offset overflows")?
-                .min(decoded_size);
-            Ok((start < end).then_some(start..end))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    bytes.sort_unstable_by_key(|range| (range.start, range.end));
-    let mut merged: Vec<std::ops::Range<u64>> = Vec::with_capacity(bytes.len());
-    for range in bytes {
-        if let Some(previous) = merged
-            .last_mut()
-            .filter(|previous| range.start <= previous.end)
-        {
-            previous.end = previous.end.max(range.end);
-        } else {
-            merged.push(range);
-        }
-    }
-    merged.into_iter().try_fold(0u64, |total, range| {
-        total
-            .checked_add(range.end - range.start)
-            .context("candidate decoded-byte estimate overflows")
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_and_estimates_are_exact() {
+    fn validation_is_exact() {
         let query = Query::All;
         let valid = [CandidatePlan {
             query: &query,
@@ -501,26 +457,5 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "candidate byte span must be positive");
-
-        let block = CANDIDATE_BLOCK_BYTES as u64;
-        let ranges = [
-            CandidateRange {
-                blocks: 0..2,
-                extent: SearchExtent::Lines,
-            },
-            CandidateRange {
-                blocks: 1..3,
-                extent: SearchExtent::Bytes { span: 2 },
-            },
-            CandidateRange {
-                blocks: 5..6,
-                extent: SearchExtent::Bytes { span: 2 },
-            },
-        ];
-        assert_eq!(
-            estimate_candidate_bytes(5 * block + 17, Some(&ranges)).unwrap(),
-            3 * block + 17
-        );
-        assert_eq!(estimate_candidate_bytes(11, None).unwrap(), 11);
     }
 }

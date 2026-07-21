@@ -17,13 +17,13 @@
 //! swap segments.bin.
 
 use crate::candidate::{
-    add_candidate_selection, build_block_bases, estimate_candidate_bytes, expand_candidate_block,
+    add_candidate_selection, build_block_bases, expand_candidate_block,
     get_block_document as block_document, visit_candidate_selections,
 };
 #[cfg(test)]
 use crate::format::DocEntry;
 use crate::format::{parse_dead, parse_tables, DeadSet, SegmentTables, SourceEntry};
-use crate::pack::{PackFile, PackMeta};
+use crate::pack::{block_span, PackFile, PackMeta};
 use crate::terms::TermMap;
 use crate::{CandidateBatchLimits, CandidatePlan, INDEX_FORMAT};
 use anyhow::{Context, Result};
@@ -1523,20 +1523,41 @@ impl SegmentedReader {
                 .min(usize::try_from(segment.meta.doc_count)?);
             let mut batch = Vec::with_capacity(capacity);
             let mut batch_bytes = 0u64;
+            let mut batch_blocks = std::collections::BTreeSet::new();
             for (id, ranges) in live {
                 let document = &tables.documents[usize::try_from(id)?];
-                let candidate_bytes =
-                    estimate_candidate_bytes(document.decoded_size, ranges.as_deref())?;
+                let pack_blocks = block_span(
+                    crate::pack::PackSlice {
+                        first_block: document.first_block,
+                        block_offset: document.block_offset,
+                    },
+                    document.decoded_size,
+                    &tables.blocks,
+                )?;
+                let document_bytes = pack_blocks.clone().try_fold(0u64, |total, block_id| {
+                    total
+                        .checked_add(u64::from(tables.blocks[block_id].decoded_len))
+                        .context("candidate document physical bytes overflow")
+                })?;
+                let added_bytes = pack_blocks
+                    .clone()
+                    .filter(|block_id| !batch_blocks.contains(block_id))
+                    .try_fold(0u64, |total, block_id| {
+                        total
+                            .checked_add(u64::from(tables.blocks[block_id].decoded_len))
+                            .context("candidate batch physical bytes overflow")
+                    })?;
                 let isolated = document.decoded_size >= crate::pack::LARGE_DOCUMENT_BYTES
-                    || candidate_bytes > limits.decoded_bytes;
+                    || document_bytes > limits.decoded_bytes;
                 let exceeds = !batch.is_empty()
                     && (batch.len() >= limits.documents
-                        || candidate_bytes > limits.decoded_bytes - batch_bytes);
+                        || added_bytes > limits.decoded_bytes - batch_bytes);
                 if (isolated || exceeds) && !batch.is_empty() {
                     if !visit(std::mem::take(&mut batch))? {
                         return Ok(());
                     }
                     batch_bytes = 0;
+                    batch_blocks.clear();
                     batch.reserve(capacity);
                 }
                 let source = &tables.sources[usize::try_from(document.source_id)?];
@@ -1553,14 +1574,19 @@ impl SegmentedReader {
                         ranges,
                     }),
                 });
-                batch_bytes = batch_bytes
-                    .checked_add(candidate_bytes)
-                    .context("candidate batch decoded-byte estimate overflows")?;
+                for block_id in pack_blocks {
+                    if batch_blocks.insert(block_id) {
+                        batch_bytes = batch_bytes
+                            .checked_add(u64::from(tables.blocks[block_id].decoded_len))
+                            .context("candidate batch physical bytes overflow")?;
+                    }
+                }
                 if isolated && !visit(std::mem::take(&mut batch))? {
                     return Ok(());
                 }
                 if isolated {
                     batch_bytes = 0;
+                    batch_blocks.clear();
                     batch.reserve(capacity);
                 }
             }
