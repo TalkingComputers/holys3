@@ -91,6 +91,27 @@ struct BlockState {
     entries: BTreeMap<usize, BlockEntry>,
 }
 
+struct LoadingClaims<'a> {
+    state: &'a Mutex<BlockState>,
+    ready: &'a Condvar,
+    block_ids: BTreeSet<usize>,
+}
+
+impl Drop for LoadingClaims<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for block_id in &self.block_ids {
+            if matches!(state.entries.get(block_id), Some(BlockEntry::Loading)) {
+                state.entries.remove(block_id);
+            }
+        }
+        self.ready.notify_all();
+    }
+}
+
 pub(crate) struct PackBatch<'a> {
     store: &'a dyn BlobStore,
     packs: &'a [PackMeta],
@@ -745,50 +766,37 @@ impl<'a> PackBatch<'a> {
                 }
                 break claimed;
             };
-        let loaded = (|| -> Result<()> {
-            let runs = block_runs(claimed.iter().copied(), self.blocks)?;
-            visit_blocks(
-                self.store,
-                cache,
-                self.packs,
-                self.blocks,
-                &runs,
-                RANGE_BYTES,
-                &mut |block_id, decoded| {
-                    let mut state = self.state.lock().unwrap();
-                    if matches!(state.entries.get(&block_id), Some(BlockEntry::Loading)) {
-                        state
-                            .entries
-                            .insert(block_id, BlockEntry::Ready(bytes::Bytes::from(decoded)));
-                    }
-                    Ok(())
-                },
-            )
-        })();
-        if let Err(error) = loaded {
-            let mut state = self.state.lock().unwrap();
-            for block_id in &claimed {
-                if matches!(state.entries.get(block_id), Some(BlockEntry::Loading)) {
-                    state.entries.remove(block_id);
+        let claims = LoadingClaims {
+            state: &self.state,
+            ready: &self.ready,
+            block_ids: claimed,
+        };
+        let runs = block_runs(claims.block_ids.iter().copied(), self.blocks)?;
+        visit_blocks(
+            self.store,
+            cache,
+            self.packs,
+            self.blocks,
+            &runs,
+            RANGE_BYTES,
+            &mut |block_id, decoded| {
+                let mut state = self.state.lock().unwrap();
+                if matches!(state.entries.get(&block_id), Some(BlockEntry::Loading)) {
+                    state
+                        .entries
+                        .insert(block_id, BlockEntry::Ready(bytes::Bytes::from(decoded)));
                 }
-            }
-            self.ready.notify_all();
-            return Err(error);
-        }
-        let mut state = self.state.lock().unwrap();
-        if block_ids
-            .iter()
-            .any(|block_id| !matches!(state.entries.get(block_id), Some(BlockEntry::Ready(_))))
-        {
-            for block_id in &claimed {
-                if matches!(state.entries.get(block_id), Some(BlockEntry::Loading)) {
-                    state.entries.remove(block_id);
-                }
-            }
-            self.ready.notify_all();
-            anyhow::bail!("decoded pack block is missing");
-        }
-        self.ready.notify_all();
+                Ok(())
+            },
+        )?;
+        let complete = {
+            let state = self.state.lock().unwrap();
+            block_ids
+                .iter()
+                .all(|block_id| matches!(state.entries.get(block_id), Some(BlockEntry::Ready(_))))
+        };
+        anyhow::ensure!(complete, "decoded pack block is missing");
+        drop(claims);
         Ok(())
     }
 
@@ -1299,6 +1307,12 @@ mod tests {
         call: usize,
         entered: Arc<Barrier>,
         release: Arc<Barrier>,
+        kind: ReadFaultKind,
+    }
+
+    enum ReadFaultKind {
+        Error,
+        Panic,
     }
 
     #[derive(Debug)]
@@ -1327,6 +1341,19 @@ mod tests {
                 call,
                 entered: entered.clone(),
                 release: release.clone(),
+                kind: ReadFaultKind::Error,
+            });
+            (entered, release)
+        }
+
+        fn panic_read(&self, call: usize) -> (Arc<Barrier>, Arc<Barrier>) {
+            let entered = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            *self.fault.lock().unwrap() = Some(ReadFault {
+                call,
+                entered: entered.clone(),
+                release: release.clone(),
+                kind: ReadFaultKind::Panic,
             });
             (entered, release)
         }
@@ -1370,7 +1397,10 @@ mod tests {
             if let Some(fault) = fault {
                 fault.entered.wait();
                 fault.release.wait();
-                return Err(anyhow::Error::new(InjectedPackRead));
+                match fault.kind {
+                    ReadFaultKind::Error => return Err(anyhow::Error::new(InjectedPackRead)),
+                    ReadFaultKind::Panic => panic!("injected pack read panic"),
+                }
             }
             self.inner.get_ranges(name, ranges)
         }
@@ -1791,6 +1821,85 @@ mod tests {
         assert_eq!(reads.len(), 3, "{reads:?}");
         assert_ne!(reads[0], reads[1], "{reads:?}");
         assert_eq!(reads[1], reads[2], "{reads:?}");
+    }
+
+    #[test]
+    fn panicking_loader_releases_waiting_block_claim() {
+        let body = bytes::Bytes::from_static(b"abcdefgh");
+        let mut builder = PackBuilder::new(8, 1024).unwrap();
+        let slice = builder
+            .append(Cursor::new(&body), body.len() as u64)
+            .unwrap();
+        let built = builder.finish().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = CountingStore {
+            inner: LocalBlobStore::new(store_dir.path()),
+            reads: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+            fault: Mutex::new(None),
+        };
+        for pack in &built.packs {
+            store
+                .put_file(&pack_blob(pack.hash()), pack.path())
+                .unwrap();
+        }
+        let packs = built.packs.iter().map(PackFile::meta).collect::<Vec<_>>();
+        let batch = PackBatch::create(&store, &packs, &built.blocks);
+        let request = PackRequest {
+            index: 0,
+            slice,
+            decoded_size: body.len() as u64,
+        };
+        let (entered, release) = store.panic_read(1);
+
+        std::thread::scope(|scope| {
+            let owner = scope.spawn(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fetch_batch_bytes(&batch, request)
+                }))
+            });
+            entered.wait();
+
+            let (waiting_sender, waiting_receiver) = std::sync::mpsc::channel();
+            let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+            let waiter_batch = &batch;
+            let waiter = scope.spawn(move || {
+                let mut state = waiter_batch.state.lock().unwrap();
+                assert!(matches!(state.entries.get(&0), Some(BlockEntry::Loading)));
+                waiting_sender.send(()).unwrap();
+                while matches!(state.entries.get(&0), Some(BlockEntry::Loading)) {
+                    state = waiter_batch.ready.wait(state).unwrap();
+                }
+                drop(state);
+                finished_sender
+                    .send(fetch_batch_bytes(waiter_batch, request))
+                    .unwrap();
+            });
+            waiting_receiver.recv().unwrap();
+            drop(batch.state.lock().unwrap());
+            release.wait();
+
+            assert!(owner.join().unwrap().is_err());
+            let finished = finished_receiver.recv_timeout(std::time::Duration::from_secs(1));
+            let finished_without_rescue = finished.is_ok();
+            let fetched = match finished {
+                Ok(fetched) => fetched,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let mut state = batch.state.lock().unwrap();
+                    state.entries.remove(&0);
+                    drop(state);
+                    batch.ready.notify_all();
+                    finished_receiver.recv().unwrap()
+                }
+                Err(error) => panic!("waiting caller disconnected: {error}"),
+            };
+            assert!(finished_without_rescue, "waiting caller remained blocked");
+            assert_eq!(fetched.unwrap(), body);
+            waiter.join().unwrap();
+        });
+
+        assert_eq!(fetch_batch_bytes(&batch, request).unwrap(), body);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
