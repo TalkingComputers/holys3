@@ -1711,8 +1711,9 @@ mod tests {
             parquet::arrow::ArrowWriter::try_new(Vec::new(), batch.schema(), None).unwrap();
         writer.write(&batch).unwrap();
         let text = decode_body("k.parquet", writer.into_inner().unwrap()).unwrap();
-        let re = regex::bytes::Regex::new("NEEDLE_utc").unwrap();
-        assert_eq!(grep_doc(&text, &re, MatchOptions::default()).len(), 1);
+        let hir = crate::parse_pattern("NEEDLE_utc").unwrap();
+        let program = crate::PatternProgram::compile(&[hir], &[0]).unwrap();
+        assert_eq!(grep_doc(&text, &program, MatchOptions::default()).len(), 1);
         assert!(
             text.windows(20).any(|w| w == b"2023-11-14T22:13:20."),
             "RFC3339 rendering"

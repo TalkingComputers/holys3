@@ -4,7 +4,7 @@
 use anyhow::Result;
 use base64::Engine;
 use seagrep_core::LineKind;
-use seagrep_index::{DocResult, MatchSink, SinkFlow};
+use seagrep_index::{DocResult, MatchData, MatchSink, SearchDetail, SinkFlow};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::io::Write;
@@ -157,11 +157,18 @@ impl JsonSink {
 }
 
 impl MatchSink for JsonSink {
+    fn detail(&self) -> SearchDetail {
+        SearchDetail::FullLines
+    }
+
     fn wants_hit_keys(&self) -> bool {
         false
     }
 
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow> {
+        let MatchData::Lines(events) = doc.data else {
+            anyhow::bail!("JSON sink requires line data");
+        };
         let path = || data_from(key.as_bytes());
         let mut m_lines = 0u64;
         let mut m_total = 0u64;
@@ -179,7 +186,7 @@ impl MatchSink for JsonSink {
             &mut printed,
             &JsonMsg::Begin(BeginData { path: path() }),
         )?;
-        for event in doc.events {
+        for event in events {
             let line = LineData {
                 path: path(),
                 lines: data_from(&event.text),

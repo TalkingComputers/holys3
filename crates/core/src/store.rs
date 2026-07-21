@@ -1,5 +1,6 @@
 use crate::codec::{decode_source, DecodeSink, DocumentBody, LogicalDocumentMeta, DECODE_LIMITS};
 use crate::grep::has_line_match;
+use crate::{PatternCache, PatternProgram};
 use anyhow::{Context as AnyhowContext, Result as AnyhowResult};
 use bytes::Bytes;
 use fs4::FileExt;
@@ -553,10 +554,11 @@ impl BlobStore for LocalBlobStore {
 /// differential ground truth.
 pub fn scan_matching_docs(
     corpus: &dyn Corpus,
-    re: &regex::bytes::Regex,
+    program: &PatternProgram,
 ) -> AnyhowResult<Vec<String>> {
     struct ScanSink<'a> {
-        re: &'a regex::bytes::Regex,
+        program: &'a PatternProgram,
+        cache: PatternCache,
         key: String,
         bytes: Vec<u8>,
         hits: Vec<String>,
@@ -575,7 +577,7 @@ pub fn scan_matching_docs(
         }
 
         fn finish(&mut self) -> AnyhowResult<()> {
-            if has_line_match(&self.bytes, self.re) {
+            if has_line_match(&self.bytes, self.program, &mut self.cache) {
                 self.hits.push(self.key.clone());
             }
             Ok(())
@@ -583,7 +585,8 @@ pub fn scan_matching_docs(
     }
 
     let mut sink = ScanSink {
-        re,
+        program,
+        cache: program.create_cache(),
         key: String::new(),
         bytes: Vec::new(),
         hits: Vec::new(),
@@ -630,8 +633,12 @@ mod tests {
             vec!["a".into(), "b".into()],
             vec![b"hello world".to_vec(), b"nothing here".to_vec()],
         );
-        let re = regex::bytes::Regex::new("world").unwrap();
-        assert_eq!(scan_matching_docs(&c, &re).unwrap(), vec!["a".to_owned()]);
+        let hir = crate::parse_pattern("world").unwrap();
+        let program = PatternProgram::compile(&[hir], &[0]).unwrap();
+        assert_eq!(
+            scan_matching_docs(&c, &program).unwrap(),
+            vec!["a".to_owned()]
+        );
     }
 
     #[test]
@@ -643,9 +650,10 @@ mod tests {
                 ("b.log", b"nothing"),
             ])],
         );
-        let re = regex::bytes::Regex::new("world").unwrap();
+        let hir = crate::parse_pattern("world").unwrap();
+        let program = PatternProgram::compile(&[hir], &[0]).unwrap();
         assert_eq!(
-            scan_matching_docs(&c, &re).unwrap(),
+            scan_matching_docs(&c, &program).unwrap(),
             vec!["bundle.zip!/a.log".to_owned()]
         );
     }
@@ -787,14 +795,16 @@ mod tests {
         };
         assert_eq!(body.into_bytes().unwrap(), Bytes::from_static(b"one\n"));
 
-        let FetchedDocument::Whole(body) =
-            batch.fetch_regions(0, &[1..2], RegionRead::Bytes).unwrap()
+        let seed = 1..2;
+        let FetchedDocument::Whole(body) = batch
+            .fetch_regions(0, std::slice::from_ref(&seed), RegionRead::Bytes)
+            .unwrap()
         else {
             panic!("default regional fetch must return a whole document")
         };
         assert_eq!(body.into_bytes().unwrap(), Bytes::from_static(b"one\n"));
         let error = batch
-            .fetch_regions(1, &[1..2], RegionRead::Bytes)
+            .fetch_regions(1, std::slice::from_ref(&seed), RegionRead::Bytes)
             .unwrap_err();
         assert_eq!(
             error.to_string(),

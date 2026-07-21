@@ -3502,7 +3502,6 @@ dependencies = [
  "radsort",
  "rapidhash",
  "rayon",
- "regex",
  "regex-syntax",
  "seagrep-core",
  "seagrep-query",

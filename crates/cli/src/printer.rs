@@ -5,7 +5,7 @@
 use crate::ColorArg;
 use anyhow::Result;
 use seagrep_core::{LineKind, SubMatch};
-use seagrep_index::{DocResult, MatchSink, SinkFlow};
+use seagrep_index::{DocResult, MatchData, MatchSink, SearchDetail, SinkFlow};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -144,11 +144,18 @@ impl StandardSink {
 }
 
 impl MatchSink for StandardSink {
+    fn detail(&self) -> SearchDetail {
+        SearchDetail::FullLines
+    }
+
     fn wants_hit_keys(&self) -> bool {
         false
     }
 
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow> {
+        let MatchData::Lines(events) = doc.data else {
+            anyhow::bail!("standard sink requires line data");
+        };
         let mut state = lock(&self.state)?;
         let state = &mut *state;
         let config = &self.config;
@@ -164,7 +171,7 @@ impl MatchSink for StandardSink {
                     wtr.write_all(b"--\n")?;
                 }
                 if !config.text {
-                    if let Some(offset) = binary_nul_offset(doc.events) {
+                    if let Some(offset) = binary_nul_offset(events) {
                         if !config.heading {
                             write_colored(wtr, &path_spec(), key.as_bytes())?;
                             wtr.write_all(b": ")?;
@@ -175,7 +182,7 @@ impl MatchSink for StandardSink {
                     }
                 }
                 let mut prev_line: Option<u64> = None;
-                for event in doc.events {
+                for event in events {
                     // rg emits group separators only when context is enabled
                     if config.context_active && prev_line.is_some_and(|p| event.line > p + 1) {
                         wtr.write_all(b"--\n")?;
@@ -221,12 +228,12 @@ impl PathSink {
 }
 
 impl MatchSink for PathSink {
-    fn wants_hit_keys(&self) -> bool {
-        false
+    fn detail(&self) -> SearchDetail {
+        SearchDetail::Documents
     }
 
-    fn wants_matches(&self) -> bool {
-        false // engine stops at first match per doc (rg -l)
+    fn wants_hit_keys(&self) -> bool {
+        false
     }
 
     fn on_doc(&self, key: &str, _doc: &DocResult<'_>) -> Result<SinkFlow> {
@@ -254,22 +261,26 @@ impl CountSink {
 }
 
 impl MatchSink for CountSink {
+    fn detail(&self) -> SearchDetail {
+        if self.count_matches {
+            SearchDetail::MatchCount
+        } else {
+            SearchDetail::MatchingLines
+        }
+    }
+
     fn wants_hit_keys(&self) -> bool {
         false
     }
 
-    fn wants_line_text(&self) -> bool {
-        false
-    }
-
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow> {
+        let MatchData::Lines(events) = doc.data else {
+            anyhow::bail!("count sink requires line data");
+        };
         let n = if self.count_matches {
-            doc.events.iter().map(|e| e.submatches.len()).sum::<usize>()
+            events.iter().map(|e| e.submatches.len()).sum::<usize>()
         } else {
-            doc.events
-                .iter()
-                .filter(|e| e.kind == LineKind::Match)
-                .count()
+            events.iter().filter(|e| e.kind == LineKind::Match).count()
         };
         let mut wtr = lock(&self.state)?;
         flow_of(
@@ -301,11 +312,11 @@ impl QuietSink {
 }
 
 impl MatchSink for QuietSink {
-    fn wants_hit_keys(&self) -> bool {
-        false
+    fn detail(&self) -> SearchDetail {
+        SearchDetail::Documents
     }
 
-    fn wants_matches(&self) -> bool {
+    fn wants_hit_keys(&self) -> bool {
         false
     }
 

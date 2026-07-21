@@ -16,7 +16,6 @@ categories.workspace = true
 anyhow.workspace = true
 encoding_rs_io.workspace = true
 serde.workspace = true
-regex.workspace = true
 regex-automata.workspace = true
 regex-syntax.workspace = true
 rapidhash.workspace = true
@@ -51,6 +50,9 @@ prost.workspace = true
 arrow-array-58.workspace = true
 arrow-json-58.workspace = true
 radsort.workspace = true
+
+[dev-dependencies]
+regex.workspace = true
 
 [features]
 testutil = []

@@ -16,7 +16,8 @@ mod terms;
 
 pub use candidate::{CandidateBatchLimits, CandidatePlan};
 pub use search::{
-    search_collect, search_streaming, DocResult, KeyScope, MatchSink, NullSink, SinkFlow,
+    search_collect, search_patterns, search_streaming, DocResult, KeyScope, MatchData, MatchSink,
+    MatchWindow, NullSink, SearchDetail, SinkFlow, WindowMatch,
 };
 pub use segment::{
     update_index, CorpusFactory, IndexChanged, IndexMissing, SegmentedReader, SourceIdentity,
@@ -85,6 +86,10 @@ pub struct SearchStats {
     /// Source objects the index could not decode at build time: their
     /// contents are not searchable, and results cannot include them.
     pub excluded_objects: usize,
+    pub patterns: usize,
+    pub exact_patterns: usize,
+    pub proof_patterns: usize,
+    pub fallback_patterns: usize,
 }
 
 pub trait IndexReader: DocFetcher {
@@ -1434,8 +1439,8 @@ mod tests {
     fn count_only_sink_agrees_with_collected_hits() {
         struct CountOnlySink;
         impl MatchSink for CountOnlySink {
-            fn wants_matches(&self) -> bool {
-                false
+            fn detail(&self) -> SearchDetail {
+                SearchDetail::Documents
             }
             fn wants_hit_keys(&self) -> bool {
                 false
@@ -1522,6 +1527,9 @@ mod tests {
         struct StopAfterFirst;
 
         impl MatchSink for StopAfterFirst {
+            fn detail(&self) -> SearchDetail {
+                SearchDetail::Documents
+            }
             fn on_doc(&self, _key: &str, _doc: &DocResult<'_>) -> Result<SinkFlow> {
                 Ok(SinkFlow::Stop)
             }
