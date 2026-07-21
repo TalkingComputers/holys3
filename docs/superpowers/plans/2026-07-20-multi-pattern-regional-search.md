@@ -4,7 +4,7 @@
 
 **Goal:** Make one repeated-`-e` search plan, fetch, verify, and render mixed bounded/unbounded patterns without bound poisoning, repeated index I/O, giant-line materialization in bounded-output mode, or accuracy loss.
 
-**Architecture:** Parse one HIR per user pattern, formally classify each pattern's exact/witness/fallback extent, union all term and posting reads per segment, carry tagged candidate ranges into one batch-scoped pack-block map, and verify with shared immutable multi-pattern programs plus one cache per worker. Default and JSON output still lazily fetch and re-verify complete lines; `--match-window` is the only clipped output mode.
+**Architecture:** Parse one HIR per user pattern, formally classify each pattern's exact/witness/fallback extent, union all term and posting reads per segment, carry tagged candidate ranges into one batch-scoped pack-block map, and verify with ordered whole/line/regional multi-pattern programs plus job-local caches. Default and JSON output still lazily fetch and re-verify complete lines; `--match-window` is the only clipped output mode.
 
 **Tech Stack:** Rust 1.94.1, `regex-syntax` 0.8.11, `regex-automata` 0.4.16, Rayon 1.12, `bytes`, existing S3/blob-store and pack formats, Clap 4, termcolor 1.4.
 
@@ -18,6 +18,10 @@
 - Keep `Query` I/O-free, S3 transport-only, core network-free, and the regex verifier authoritative.
 - Treat every proof construction failure as `MatchWitness=None` plus an exact fallback. Only invalid user HIR/program compilation, corrupt index/pack data, stale snapshots, transport failures, and sink failures are fatal.
 - Preserve leftmost-first, ordered repeated-pattern semantics by compiling the HIRs in original `-e` order and using `WhichCaptures::Implicit`.
+- Choose pattern eligibility before searching: whole documents use all patterns, full-line regions exclude `Document`, and truncated regions include only `Bytes`. Never post-filter a match from a broader program.
+- Use `rayon::current_num_threads()` only to size the bounded search channel. `try_for_each_init` caches are job-local; code and tests make no one-cache-per-thread claim.
+- Delete the duplicate dead `crates/core/src/grep.rs::parse_pattern`; `crates/core/src/pattern.rs::parse_pattern` remains the single parser and `search_streaming` calls it in Task 4.
+- Task 4 must add no Clippy warning. The existing `candidate.rs::single_match` and `pack.rs::{too_many_arguments,single_range_in_vec_init}` warnings are outside this task and must not increase; deleting the duplicate grep parser removes its `dead_code`/`unreachable_pub` warnings.
 - Apply `-m` after union/deduplication by matching line. It must not alter `SearchDetail` or exact `--count-matches` span iteration.
 - Keep existing default text and JSON bytes unchanged. Clipping is opt-in through `--match-window`.
 - Performance gates use the existing pinned app-log inventory and oracle; production code must not contain either hash.
@@ -148,7 +152,7 @@ pub struct PatternMatches<'p, 'c, 'h> {
 }
 ```
 
-`PatternProgram` input schema is an ordered HIR list plus an equally long list of original pattern IDs. Output is one immutable leftmost-first verifier. `PatternCache` is mutable scratch for exactly one worker at a time. Neither exposes the underlying regex/cache.
+`PatternProgram` input schema is an ordered HIR list plus an equally long list of original pattern IDs. Output is one immutable leftmost-first verifier. `PatternCache` is mutable scratch for one sequential verifier or one Rayon job state at a time. Neither exposes the underlying regex/cache.
 
 ### Function contracts in `crates/core/src/pattern.rs`
 
@@ -1038,15 +1042,17 @@ impl IndexReader for ChangingReader {
 
 **Files:**
 
-- Modify `crates/core/src/grep.rs`: line assembly consumes `PatternMatch` spans; remove regex-owned analysis and duplicate fast paths.
+- Modify `crates/core/src/grep.rs`: line assembly consumes `PatternMatch` spans; remove regex-owned analysis, duplicate fast paths, and the duplicate dead `parse_pattern`.
 - Modify `crates/core/src/store.rs`: migrate `scan_matching_docs` to `PatternProgram` and one reusable cache.
 - Modify `crates/core/src/codec.rs`: mechanically update the one grep oracle test.
 - Modify `crates/core/src/lib.rs`: revise grep exports; stop exporting removed bound/isolation functions.
-- Modify `crates/core/Cargo.toml`: remove `regex.workspace = true` after all core regex calls are gone.
-- Modify `crates/index/src/search.rs`: independent plan selection, full/regional programs, worker caches, tagged verification, lazy full lines, bounded windows, deduplication, and compatibility wrapper.
+- Modify `crates/core/Cargo.toml`: move `regex.workspace = true` from production dependencies to dev-dependencies; only the independent witness-oracle assertions in `pattern.rs` retain it.
+- Modify `crates/index/src/search.rs`: independent plan selection, ordered whole/line/regional programs, job-local caches, tagged verification, lazy full lines, bounded windows, deduplication, and compatibility wrapper.
 - Modify `crates/index/src/lib.rs`: re-export typed result/search APIs and add exact/proof/fallback pattern counters to `SearchStats`.
 - Modify `crates/index/Cargo.toml`: remove `regex.workspace = true` after search migration.
 - Modify `crates/index/tests/differential_store.rs` and `crates/index/tests/segmented.rs`: use HIR/program oracles and add the one mixed giant-line differential case.
+- Modify `crates/cli/src/printer.rs`: migrate existing standard/path/count/quiet sinks to typed detail/data without changing rendered bytes; Task 5 adds window rendering.
+- Modify `crates/cli/src/json.rs`: migrate the JSON sink to typed full-line data without changing its wire bytes.
 
 ### Core line assembly contracts
 
@@ -1060,10 +1066,9 @@ pub fn grep_matches(
 ) -> Vec<LineEvent>;
 ```
 
-- Input matches are sorted in leftmost-first non-overlap order and relative to `bytes`; pattern IDs do not change line assembly.
-- Output preserves current line/context ordering, one event per line, submatch offsets relative to line content, trailing newline bytes, before/after context merge, EOF empty-match behavior, and `-m` after-context drain.
-- Invalid/out-of-order spans are debug assertions because only `PatternProgram` constructs them.
-- Transformation: replace the current regex finder with a peekable iterator over supplied spans; retain the current ring/context state machine.
+- Input schema: `bytes` owns the exact decoded byte range whose offsets start at zero; `matches` is required, sorted in leftmost-first non-overlap order, and every `PatternMatch { pattern: usize, start: usize, end: usize }` satisfies `start <= end <= bytes.len()` and stays within one logical line's content because programs compile sanitized HIRs; `options` is exactly `MatchOptions { before_context: usize, after_context: usize, max_count: Option<u64> }`. Pattern IDs do not change line assembly.
+- Output schema: `Vec<LineEvent>` in ascending line order, with at most one event per line. Each event is exactly `LineEvent { line: u64, kind: LineKind, offset: u64, text: bytes::Bytes, submatches: Vec<SubMatch> }`; match-line submatches are line-content-relative half-open offsets, `text` keeps its trailing newline when present, and context merge, EOF empty-match, and `max_count` after-context drain semantics remain byte-for-byte compatible. No runtime errors are returned; invalid/out-of-order spans are debug assertions because only `PatternProgram` constructs them.
+- Transformation: return empty immediately for `max_count=Some(0)`; wrap `matches.iter()` in a peekable iterator; walk `bytes` line-by-line using the current `memchr` boundary logic; consume spans whose start belongs to the current content line, clamp their ends to content, and build `SubMatch`; retain the existing before-context ring, after-context countdown, matching-line counter, and early-stop conditions.
 
 ```rust
 pub fn grep_bytes(
@@ -1074,7 +1079,9 @@ pub fn grep_bytes(
 ) -> Vec<LineEvent>;
 ```
 
-- Collect `program.find_iter(cache, &bytes)` into `Vec<PatternMatch>` and call `grep_matches`.
+- Input schema: `bytes` and `options` have the `grep_matches` schemas; `program` is a required compiled ordered program built from line-sanitized HIRs; `cache` is the exclusive mutable cache created by that same program.
+- Output schema: exactly the `grep_matches` `Vec<LineEvent>` schema; no errors.
+- Transformation: collect `program.find_iter(cache, &bytes)` once into `Vec<PatternMatch>` and pass ownership of `bytes`, the borrowed matches, and `options` to `grep_matches`.
 
 ```rust
 pub fn grep_doc(
@@ -1084,7 +1091,9 @@ pub fn grep_doc(
 ) -> Vec<LineEvent>;
 ```
 
-- Copy bytes once, create one cache, call `grep_bytes`.
+- Input schema: `bytes` is one complete decoded document; `program` is a required compiled ordered program; `options` has the `grep_matches` schema.
+- Output schema: exactly the `grep_matches` `Vec<LineEvent>` schema; no errors.
+- Transformation: copy `bytes` once into `bytes::Bytes`, create exactly one `PatternCache` with `program.create_cache()`, and call `grep_bytes`.
 
 ```rust
 pub fn has_line_match(
@@ -1094,9 +1103,19 @@ pub fn has_line_match(
 ) -> bool;
 ```
 
-- Iterate until a match starts before EOF; an empty document never matches and an empty match at terminal newline belongs to no line, preserving the existing contract.
+- Input schema: `bytes` is one complete decoded document or exact full-line body; `program` is eligibility-correct for that body; `cache` is the exclusive mutable cache created by that program.
+- Output schema: `true` iff `program.find_iter` yields a match whose start belongs to a logical line; otherwise `false`. No errors. An empty document never matches, and an empty match at EOF after a terminal newline belongs to no line.
+- Transformation: return false for empty input; pull matches from one iterator until finding `start < bytes.len()` or `start == bytes.len()` with a non-newline final byte; return false when the iterator is exhausted.
 
-Delete `grep_bytes_fast`, `grep_bytes_inner`, `has_line_match_fast`, `can_search_as_document`, `bounded_match_len`, `has_look`, and `needs_line_isolation`. `parse_pattern` already moved in Task 1.
+Delete `grep_bytes_fast`, `grep_bytes_inner`, `has_line_match_fast`, `can_search_as_document`, `bounded_match_len`, `has_look`, `needs_line_isolation`, and the duplicate `grep.rs::parse_pattern`. Keep only `pattern.rs::parse_pattern`, already re-exported from `crates/core/src/lib.rs`; Task 4's `search_streaming` calls that parser before `search_patterns`, so it is production-used and no `dead_code`/`unreachable_pub` warning remains. Remove the deleted grep symbols from `crates/core/src/lib.rs`; keep the pattern-module `parse_pattern` export unchanged.
+
+Set the grep re-export exactly:
+
+```rust
+pub use grep::{
+    grep_bytes, grep_doc, grep_matches, has_line_match, LineEvent, LineKind, MatchOptions, SubMatch,
+};
+```
 
 Change the oracle:
 
@@ -1107,8 +1126,12 @@ pub fn scan_matching_docs(
 ) -> anyhow::Result<Vec<String>>;
 ```
 
-- Nested `ScanSink` fields become `program: &PatternProgram` and `cache: PatternCache`.
-- Existing `begin(&mut self, document)`, `write(&mut self, bytes)`, and `finish(&mut self)` signatures stay unchanged. `finish` calls `has_line_match(&bytes, program, &mut cache)`; decode/key sorting/errors remain unchanged.
+- Input schema: `corpus` is the required source collection to decode in source order; `program` is the required compiled ordered verifier shared immutably across documents.
+- Output schema: sorted `Vec<String>` containing each decoded logical document key exactly once when any eligible match belongs to a line. Errors preserve `Corpus::fetch` and `decode_source` chains unchanged.
+- Transformation: create one nested `ScanSink { program: &PatternProgram, cache: PatternCache, key: String, bytes: Vec<u8>, hits: Vec<String> }`; reuse its cache sequentially across every decoded document; fetch and decode each corpus source; sort `hits` with `sort_unstable`; return it.
+- `fn begin(&mut self, document: &LogicalDocumentMeta) -> anyhow::Result<()>`: input is the required logical-document metadata; copy `document.display_key` into `key`, clear `bytes`, and return `Ok(())`; no added error.
+- `fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()>`: input is the next decoded chunk; append it to the sink buffer and return `Ok(())`; no added error.
+- `fn finish(&mut self) -> anyhow::Result<()>`: input is the buffered current document in sink state; call `has_line_match(&self.bytes, self.program, &mut self.cache)`, clone `key` into `hits` only on true, and return `Ok(())`; no added error.
 
 ### Public result contracts in `crates/index/src/search.rs`
 
@@ -1149,8 +1172,20 @@ pub trait MatchSink: Sync {
 
 - Remove `wants_matches` and `wants_line_text`.
 - `Documents` never carries fake empty events. `Lines` is used for both matching-line and exact-match counts; `Windows` only for the explicit window detail.
+- `fn detail(&self) -> SearchDetail`: input is the shared sink; output is one immutable detail selection for the entire search; no errors. `search_patterns` reads it once before candidate I/O and passes it unchanged through every batch.
+- `fn wants_hit_keys(&self) -> bool`: input is the shared sink; output `true` means collect matching keys in `SearchStats.hits`, while `false` keeps only `hit_count`; no errors and the default remains `true`.
+- `fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>`: `key` is the required matching display key and `doc` is exactly `DocResult { data: MatchData<'_>, bytes_searched: u64, elapsed: Duration }` for the selected detail. Output `Continue` accepts more results and `Stop` ends successfully; sink-defined errors propagate unchanged. The payload borrows job-owned data only for this call and is never retained by the engine.
 
 Add the shared `MatchWindow` and `WindowMatch` schemas verbatim in this file and re-export them.
+
+Set the search re-export in `crates/index/src/lib.rs` exactly:
+
+```rust
+pub use search::{
+    search_collect, search_patterns, search_streaming, DocResult, KeyScope, MatchData, MatchSink,
+    MatchWindow, NullSink, SearchDetail, SinkFlow, WindowMatch,
+};
+```
 
 Extend `SearchStats` in `crates/index/src/lib.rs` exactly:
 
@@ -1182,14 +1217,24 @@ struct PatternPlan {
 }
 
 struct SearchPrograms {
-    full: PatternProgram,
+    whole: PatternProgram,
+    lines: Option<PatternProgram>,
     regional: Option<PatternProgram>,
-    regional_patterns: Vec<bool>,
 }
 
 struct WorkerCache {
-    full: PatternCache,
+    whole: PatternCache,
+    lines: Option<PatternCache>,
     regional: Option<PatternCache>,
+}
+
+#[derive(Clone, Copy)]
+struct SearchContext<'a> {
+    plans: &'a [PatternPlan],
+    programs: &'a SearchPrograms,
+    stream_overlap: Option<usize>,
+    options: MatchOptions,
+    detail: SearchDetail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1226,6 +1271,10 @@ struct VerifiedDocument {
 
 `OwnedMatchData` owns exactly the payload selected by `SearchDetail`; `VerifiedDocument.extra_fetched_bytes` counts lazy line/window bytes in addition to the initial candidate body's `fetched_size`.
 
+`SearchPrograms.whole` is always present and preserves every original pattern in input order. `lines` preserves the ordered `Bytes`/`Lines` subset and is `None` only when every plan is `Document`. `regional` preserves the ordered `Bytes` subset and is `None` when no finite regional plan exists. `WorkerCache` has exactly the same optional shape; each value is owned by one sequential verifier or one `try_for_each_init` job state.
+
+`SearchContext` is the immutable per-search input passed into batch/document verification. `plans` and `programs` are the exact matching tables compiled by `search_patterns`; `stream_overlap` is computed once from those plans; `options` and `detail` are the one request-wide values. It is `Copy` because it contains only shared references and copyable values. Grouping these fields keeps both verification functions below Clippy's argument-count threshold without an `allow`.
+
 ### Search planning/program functions
 
 ```rust
@@ -1236,12 +1285,14 @@ fn build_plans(
 ) -> anyhow::Result<Vec<PatternPlan>>;
 ```
 
-- Input HIR slice must be non-empty; error `search requires at least one pattern` otherwise. `MatchWindows.max_bytes=0` errors `match window must be greater than 0`.
-- Analyze all HIRs in one call. Query-plan each HIR independently.
+- Input schema: `hirs` is the required non-empty ordered sanitized HIR slice; `strategy` is the reader's exact immutable `Strategy`; `detail` is the one sink-selected result shape. Neither HIRs nor strategy are mutated.
+- Output schema: `Vec<PatternPlan>` of exactly `hirs.len()` entries in input order. Entry `index` is exactly `PatternPlan { id: index, query: Query, bounds: MatchBounds, extent: SearchExtent, kind: PatternKind }`, with positive/capped byte extents and one mutually exclusive kind.
+- Errors: empty input returns exactly `search requires at least one pattern`; `SearchDetail::MatchWindows { max_bytes: 0 }` returns exactly `match window must be greater than 0`; no other new errors.
+- Transformation: validate the two request invariants; call `analyze_patterns(hirs)` once so the retained proof budget spans the whole query; zip HIRs with bounds; call `seagrep_query::plan_hir(hir, strategy)` independently; choose the detail-specific bound; then derive extent/kind by the rules below.
 - Select finite span by detail: witness for `Documents`, `MatchingLines`, `MatchWindows`, and `FullLines`; `exact_bytes` for `MatchCount`.
 - `Query::All` always maps to `Document`. A positive selected bound maps to `Bytes` only when it is at most `CANDIDATE_BLOCK_BYTES`; a larger or absent bound maps through `FallbackExtent::{Lines,Document}`. This cap applies equally to large finite exact matches and finite proofs, so every constructed `SearchExtent::Bytes.span` satisfies its schema invariant.
 - Set `kind=Exact` when the selected in-cap source is `exact_bytes` or `MatchWitness::Exact`, `kind=Proof` when it is `MatchWitness::Proven`, and `kind=Fallback` whenever the final extent is `Lines` or `Document` (including `Query::All` and over-cap finite matches).
-- Output one plan in input order with `id=index`.
+- Move the owned `query` and `bounds` into the output plan; assign `id=index`; collect without reordering.
 
 Keep `FILE_MATCH_CHUNK = 1 MiB` and `FILE_MATCH_OVERLAP_MAX = 1 MiB`. Add:
 
@@ -1262,9 +1313,10 @@ impl SearchPrograms {
 }
 ```
 
-- Full program compiles every HIR with IDs `0..N`.
-- Regional program compiles only plans whose selected extent is `Bytes`; `regional_patterns[id]=true` for those IDs. No finite plans yields `None`.
-- Errors add only query-level context `compiling {N}-pattern verifier` or `compiling {N}-pattern regional verifier`.
+- Input schema: `hirs` is the required non-empty ordered sanitized HIR slice; `plans` is required, has the same length/order, and every `plans[index].id == index`. Each plan supplies `extent: SearchExtent` as the eligibility source. Neither input is mutated.
+- Output schema: `SearchPrograms { whole, lines, regional }`. `whole` compiles every HIR with IDs from `plans`. `lines` compiles the ordered subset where `extent != Document`, or `None` when empty. `regional` compiles the ordered subset where `extent` is `Bytes`, or `None` when empty. Subsets keep original IDs; no local renumbering occurs.
+- Errors: mismatched lengths error `pattern HIR count {HIRS} differs from plan count {PLANS}`. Invalid IDs error `pattern plan {INDEX} carries ID {ID}`. Program compilation preserves the underlying regex error and adds exactly `compiling {N}-pattern whole verifier`, `compiling {N}-pattern line verifier`, or `compiling {N}-pattern regional verifier` for the program being built.
+- Transformation: validate lengths and IDs once; compile `whole` from the borrowed full HIR slice; iterate `hirs.zip(plans)` twice to clone only the line/regional subset HIRs and copy their original IDs; skip compilation for an empty subset; return all three immutable programs. Never compile a broad program and attach an eligibility bitmap for post-filtering.
 
 ```rust
 impl WorkerCache {
@@ -1272,7 +1324,22 @@ impl WorkerCache {
 }
 ```
 
-- Create one full cache and one regional cache iff the regional program exists. No shared mutex/pool.
+- Input schema: `programs` is a required compiled `SearchPrograms` reference and outlives the returned cache's use; it is not mutated.
+- Output schema: `WorkerCache { whole, lines, regional }`, with one cache from `whole.create_cache()` and optional caches present iff their matching optional programs are present. No errors and no shared mutex/pool.
+- Transformation: create the whole cache, then map `lines.as_ref()` and `regional.as_ref()` through `PatternProgram::create_cache`. `search_batch` calls this once for the sequential path or from `try_for_each_init`; Rayon controls job-state cardinality.
+
+```rust
+fn get_region_program<'a>(
+    programs: &'a SearchPrograms,
+    cache: &'a mut WorkerCache,
+    region: RegionProgram,
+) -> anyhow::Result<(&'a PatternProgram, &'a mut PatternCache)>;
+```
+
+- Input schema: `programs` and `cache` are required and must have identical optional shapes; `region=Regional` means a truncated finite region, while `region=Full` means an exact full-line region. `whole` is deliberately not selectable here.
+- Output schema: the immutable eligible program plus its exclusive mutable job-local cache. `Regional` returns the regional pair; `Full` returns the line pair.
+- Errors: `regional verifier is missing`, `regional verifier cache is missing`, `line verifier is missing`, or `line verifier cache is missing`. These indicate an internal program/body invariant violation and retain `anyhow::Error` type.
+- Transformation: match `region`, borrow the corresponding optional program and cache, return the pair without compiling, cloning, filtering, or allocating.
 
 ### Verification functions
 
@@ -1286,20 +1353,21 @@ fn has_stream_match(
 ) -> anyhow::Result<bool>;
 ```
 
-- Used only for `Documents` when every pattern is finite regional and a whole body is file-backed.
-- Read 1 MiB chunks with `overlap=max_span-1`, search each combined carry/chunk, and preserve current `streaming regex overlap exceeds its limit` at 1 MiB. Empty documents return false.
+- Input schema: `reader` is positioned at byte zero of one whole decoded body and yields exactly `len` bytes; `program` is the ordered eligibility-correct program for the complete document; `cache` is its exclusive mutable job-local cache; `overlap` is the exact value returned by `get_stream_overlap(plans)` and is at most `FILE_MATCH_OVERLAP_MAX`.
+- Output schema: `Ok(true)` at the first eligible match in any carry/chunk body, `Ok(false)` after consuming a nonmatching body or immediately for `len=0`. Read/conversion errors preserve their source chain; `overlap > FILE_MATCH_OVERLAP_MAX` returns exactly `streaming regex overlap exceeds its limit`.
+- Transformation: validate the overlap before allocation; allocate one `FILE_MATCH_CHUNK + overlap` buffer; read at most 1 MiB per iteration; search the combined carry plus new chunk once with the passed `program/cache`; retain the last `overlap` bytes with `copy_within`; stop at the first match. The only production caller passes `programs.whole/cache.whole`, and only for `Documents` when every plan is `Bytes` and a whole body is file-backed.
 
 ```rust
 fn find_program_matches(
     bytes: &[u8],
     program: &PatternProgram,
     cache: &mut PatternCache,
-    plans: &[PatternPlan],
-    region_program: RegionProgram,
 ) -> Vec<PatternMatch>;
 ```
 
-- Run the selected program. On partial `Full` line regions, discard patterns whose plan extent is `Document`, preventing artificial `\A`/`\z` boundaries. On whole documents all IDs are accepted. Regional programs already contain only safe IDs.
+- Input schema: `bytes` is the exact searched slice; `program` is already eligibility-correct for that slice; `cache` is its exclusive mutable job-local cache. Pattern IDs inside the program are original `PatternPlan.id` values.
+- Output schema: leftmost-first, non-overlapping `PatternMatch` values relative to `bytes`, preserving program order for equal-start alternatives. Empty input and empty matches retain `PatternProgram::find_iter` semantics. No errors.
+- Transformation: collect `program.find_iter(cache, bytes)` once. Do not inspect plans, filter IDs, merge another program, or rescan per pattern.
 
 ```rust
 fn find_region_matches(
@@ -1312,7 +1380,9 @@ fn find_region_matches(
 ) -> anyhow::Result<Vec<RegionMatch>>;
 ```
 
-- Select regional/full program per `DocumentRegion.program`; find original meta matches; call that pattern's `MatchWitness::find_witness` for regional matches and use the canonical meta span for full matches.
+- Input schema: `regions` contains sorted, disjoint document-relative regions with `program=Regional|Full`; every region starts on one-based `line`, has an exact absolute `line_offset`, and satisfies `region.start + region.bytes.len() <= decoded_size`; `decoded_size` is the complete document length; `plans[id]` exists for every original match ID; `programs/cache` have identical optional shapes; `max_count` limits distinct matching `(line,line_offset)` pairs and `Some(0)` returns empty.
+- Output schema: identity-deduplicated `RegionMatch` values with original pattern IDs, absolute complete witnesses, exact one-based line/line-start metadata, and `canonical_span_known=false` only for `MatchWitness::Proven` on a regional body. Added invariant errors come only from `get_region_program`; proof/body errors preserve their source chain.
+- Select the eligible regional/line pair with `get_region_program` before searching each `DocumentRegion`; call `find_program_matches` once. Call that pattern's `MatchWitness::find_witness` for regional matches and use the canonical meta span for full-line matches. Never run `whole` on a region and never post-filter an ineligible winner.
 - Convert to absolute witness offsets. Compute exact line/line start using region metadata plus newlines before the witness. Drop starts at/after decoded EOF.
 - Sort/dedup first by identity `(pattern, witness.start, witness.end)`. Then sort by `(line, line_offset, witness.start, witness.end, pattern)` and enforce `max_count` on the earliest distinct `(line, line_offset)` values, retaining all accepted patterns/spans on every retained line. Pattern order never decides which lines survive `-m`.
 - `canonical_span_known` is true for exact bounds/full matches and false only for proven regional witnesses.
@@ -1327,7 +1397,9 @@ fn find_whole_matches(
 ) -> Vec<RegionMatch>;
 ```
 
-- Run the full program once over the complete document, so every pattern ID is eligible and absolute anchors see real document boundaries.
+- Input schema: `bytes` is the complete document starting at absolute offset zero; every `plans[id]` exists; `programs.whole` and `cache.whole` are the matching pair; `max_count` limits distinct matching lines and `Some(0)` returns empty.
+- Output schema: identity-deduplicated canonical `RegionMatch` values with original pattern IDs, absolute spans, exact line metadata, and `canonical_span_known=true`. No new errors.
+- Run `find_program_matches(bytes, &programs.whole, &mut cache.whole)` once, so every pattern ID is eligible and absolute anchors see real document boundaries.
 - Walk newlines once while consuming canonical `PatternMatch` spans to populate exact one-based line and absolute line start; mark every span canonical; identity-dedup, line/offset-sort, and apply `max_count` with the same earliest-distinct-line rule as `find_region_matches`.
 
 ```rust
@@ -1337,7 +1409,9 @@ fn build_count_events(
 ) -> Vec<LineEvent>;
 ```
 
-- Group by exact line in order. Matching-line count emits one zero-text event/submatch per line. Exact-match count emits one submatch per canonical match. Proof-only matches never enter exact-match mode because planning falls back first.
+- Input schema: `matches` is the sorted, identity-deduplicated output of `find_region_matches` or `find_whole_matches`; `count_matches=false` requests one matching-line unit per line; `count_matches=true` requires every input to have `canonical_span_known=true` and requests one unit per canonical match.
+- Output schema: ordered zero-text `LineEvent` values grouped by exact `line`. Each event is `LineKind::Match`, has the group's absolute `line_offset` in `offset`, has `Bytes::new()` text, and carries either one zero-width `SubMatch` for matching-line count or one zero-width `SubMatch` per canonical match for exact-match count. Empty input returns empty; no errors.
+- Transformation: iterate already-sorted matches once; start a new event when `line` changes; for `count_matches=false`, keep exactly one submatch on the event; for `count_matches=true`, append one submatch for every match and debug-assert canonical spans. Proof-only matches never enter exact-match mode because `build_plans` selects a fallback extent first.
 
 ```rust
 fn collect_line_events(
@@ -1349,9 +1423,11 @@ fn collect_line_events(
 ) -> anyhow::Result<Vec<LineEvent>>;
 ```
 
-- Whole body: materialize, run full program with all IDs, call `grep_matches`.
-- Regions: run the full program, filter document-fallback IDs on partial regions, call `grep_matches` per region with remaining `max_count`, adjust line/offset, then sort/merge duplicate match/context lines exactly like current regional output.
-- Any no-match result returns an empty vector; body/offset/integrity errors propagate.
+- Input schema: `body` is one owned whole document or sorted tagged regions satisfying the `find_region_matches` metadata/range invariants; `plans` maps every original pattern ID; `programs/cache` have identical optional shapes; `options` carries exact before/after context and matching-line `max_count`.
+- Output schema: ordered `LineEvent` values with exact document-relative offsets, one-based lines, merged context, original line bytes, and line-relative submatches. No match returns an empty vector.
+- Errors: whole-body materialization preserves its source chain; missing eligible region program/cache returns the exact `get_region_program` invariant error; validated region metadata makes line/offset adjustment infallible and adds no arithmetic error.
+- Transformation for `Whole`: materialize once, collect matches with `programs.whole/cache.whole`, call `grep_matches` once.
+- Transformation for `Regions`: call `get_region_program` for each region tag before searching; collect only that ordered eligible program's matches; call `grep_matches` with remaining `max_count`; adjust line/offset; sort and merge duplicate match/context lines exactly like current regional output. Never run `whole` on a partial region and never post-filter IDs.
 
 ```rust
 fn fetch_full_lines(
@@ -1365,7 +1441,10 @@ fn fetch_full_lines(
 ) -> anyhow::Result<Vec<LineEvent>>;
 ```
 
-- Convert witnesses to absolute seed ranges; call the same batch's `fetch_regions(document, seeds, RegionRead::Lines { before_context, after_context })`; re-run `collect_line_events` with the full program. This is mandatory for default/JSON proof hits.
+- Input schema: `batch` is the live candidate batch; `document` indexes its immutable address slice; `matches` contains confirmed absolute witnesses; `plans/programs/cache` are the same query objects used for discovery; `options` carries requested context and `max_count`.
+- Output schema: exact re-verified full-line/context `LineEvent` values. Empty `matches` returns an empty vector without I/O.
+- Errors: candidate-range validation/fetch errors preserve their source chain; missing line verifier/cache is the exact `get_region_program` error reached through `collect_line_events`; `candidate region fetch returned no document` remains unchanged.
+- Transformation: convert every non-empty witness to its unchanged absolute range; convert an empty witness at `start < decoded_size` to `start..start + 1` (all starts at/after EOF were already dropped); call the same batch's `fetch_regions(document, seeds, RegionRead::Lines { before_context, after_context })`; re-run `collect_line_events`, whose `RegionProgram::Full` branch selects the ordered line program. This is mandatory for default/JSON proof hits.
 
 ```rust
 fn build_windows(
@@ -1374,12 +1453,15 @@ fn build_windows(
     matches: &[RegionMatch],
     decoded_size: u64,
     max_bytes: usize,
-    whole: Option<&[u8]>,
+    whole: Option<&bytes::Bytes>,
 ) -> anyhow::Result<Vec<MatchWindow>>;
 ```
 
+- Input schema: `batch` is the live candidate batch; `document` is its valid document index; `matches` is sorted by exact `(line,line_offset,witness)` and contains complete absolute witnesses within `decoded_size`; `decoded_size` is the complete document length; `max_bytes` is required and positive; `whole=Some(Bytes)` contains exactly `decoded_size` bytes, while `None` authorizes bounded lazy reads.
+- Output schema: at most one `MatchWindow` per distinct matching line, in line order. Every `text.len() <= max_bytes`; `window_offset` and `line_offset` are absolute; each `visible` range is the witness/text intersection relative to `text` and may be empty only for a zero-width witness; edge/per-match clip flags are exact.
+- Errors: zero `max_bytes` returns `match window must be greater than 0`; whole-length mismatch returns `whole document length {ACTUAL} differs from decoded size {EXPECTED}`; arithmetic errors use `match window range overflows`; lazy candidate fetch/validation errors preserve their source chain.
 - Group matches by exact line; choose the lowest witness start as the line anchor; emit one window per retained line.
-- When `whole=Some`, slice directly from the complete document. Otherwise fetch at most `max_bytes` before and after the anchor plus at most `max_bytes` of the anchor through `RegionRead::Bytes`; never request the complete witness merely because it is longer than the budget.
+- When `whole=Some`, create `MatchWindow.text` with `whole.slice(start..end)` so ownership and zero-copy slicing survive; never convert the owner to `&[u8]`. Otherwise fetch at most `max_bytes` before and after the anchor plus at most `max_bytes` of the anchor through `RegionRead::Bytes`; never request the complete witness merely because it is longer than the budget.
 - Locate newline/EOF inside fetched bytes, center a window of at most `max_bytes` around the complete witness when it fits, otherwise start at the witness start; shift left when an early line end leaves spare budget.
 - Set exact `window_offset`, `line_offset`, edge clip flags, and one `WindowMatch` for every confirmed witness intersecting text. `visible` is clamped relative to text; per-match left/right flags compare visible absolute endpoints to complete witness endpoints.
 
@@ -1388,33 +1470,33 @@ fn verify_document(
     batch: &dyn CandidateBatch,
     document: usize,
     body: FetchedDocument,
-    plans: &[PatternPlan],
-    programs: &SearchPrograms,
+    context: SearchContext<'_>,
     cache: &mut WorkerCache,
-    stream_overlap: Option<usize>,
-    options: MatchOptions,
-    detail: SearchDetail,
 ) -> anyhow::Result<Option<VerifiedDocument>>;
 ```
 
-- Record decoded/fetched sizes before consuming the body. For `Whole`, stream only `Documents` when `stream_overlap=Some` and the body is file-backed; `has_stream_match` receives that exact overlap. Otherwise materialize once and call `find_whole_matches`/`grep_matches`/direct window slicing according to detail. `None` never enters chunked verification because a line/document extent could cross an arbitrary chunk boundary.
-- For `Regions`, call `find_region_matches`; no matches returns `None`; `Documents` returns owned document data; counts call `build_count_events`; `FullLines` calls `fetch_full_lines`; windows call `build_windows(..., None)`.
+- Input schema: `batch/document` identify the live candidate; `body` is the one initial fetch result; `context` contains the exact plans/programs/precomputed overlap/request options/fixed sink detail; `cache` is the matching exclusive job-local state.
+- Output schema: `None` for no verified match; otherwise `VerifiedDocument { data, bytes_searched, extra_fetched_bytes }`, where `data` has the exact variant required by `context.detail`, `bytes_searched=body.decoded_size()`, and `extra_fetched_bytes` is only lazy line/window bytes beyond `body.fetched_size()`.
+- Errors: proof errors, body materialization, candidate-batch errors, and added exact helper invariant messages propagate unchanged; this function never calls the sink.
+- Record decoded/fetched sizes before consuming the body. For `Whole`, stream only `Documents` when `context.stream_overlap=Some` and the body is file-backed; `has_stream_match` uses `context.programs.whole/cache.whole` and receives that exact overlap. Otherwise materialize once into owned `bytes::Bytes`, call `find_whole_matches`/`grep_matches` according to `context.detail`, and call `build_windows(..., Some(&bytes))` for windows so returned slices retain ownership. `None` never enters chunked verification because a line/document extent could cross an arbitrary chunk boundary.
+- For `Regions`, pass `context.plans/context.programs/context.options.max_count` to `find_region_matches`; no matches returns `None`; `Documents` returns owned document data; counts call `build_count_events`; `FullLines` calls `fetch_full_lines` with context plans/programs/options; windows call `build_windows(..., None)`.
 - Return `None` for no verified hit. Return exact lazy fetched-byte accounting for line/window reads. Propagate verifier proof, body materialization, candidate-batch, and sink-independent errors.
 
 ```rust
 fn search_batch(
     documents: &[DocAddress],
     fetcher: &dyn DocFetcher,
-    plans: &[PatternPlan],
-    programs: &SearchPrograms,
-    stream_overlap: Option<usize>,
-    options: MatchOptions,
+    context: SearchContext<'_>,
     sink: &dyn MatchSink,
 ) -> anyhow::Result<BatchResult>;
 ```
 
-- Start one scoped `CandidateBatch`; `fetch_initial` performs the unioned pack preload.
-- One worker: create one `WorkerCache`. Multiple workers: retain channel/stop/panic protocol and use `par_bridge().try_for_each_init(|| WorkerCache::create(programs), ...)`.
+- Input schema: `documents` is a required non-empty candidate batch in reader order; `fetcher` creates one scoped batch for exactly those addresses; `context` contains the non-empty plans, their compiled programs, their one stream overlap, immutable options, and the single detail value read before candidate I/O; `sink` is safe for concurrent calls.
+- Output schema: `BatchResult { hits: Vec<String>, hit_count: usize, regional_docs: usize, whole_docs: usize, candidate_bytes: usize, decoded_bytes: usize, stopped: bool }`. `hits` contains each verified key iff `sink.wants_hit_keys()`; `hit_count` counts every verified document; regional/whole counts classify every initial body; byte fields sum initial and explicit lazy reads exactly as currently defined; `stopped=true` only after `SinkFlow::Stop`.
+- Errors: `start_candidate_batch`, initial/lazy fetch, verification, and sink errors preserve their source chains; worker or poisoned-result panics map to `a search worker panicked`; internal `StopEarly` remains private and never escapes as a user error. Removing `std::thread::available_parallelism()` removes its possible I/O error from this function.
+- Transformation: start one scoped `CandidateBatch`; `fetch_initial` performs the unioned pack preload; record initial fetched/decoded bytes and body kind before queueing; call `verify_document` with unchanged `context`; borrow its owned payload into the matching `MatchData` variant; invoke the sink exactly once for a verified document; then drop the payload.
+- Compute `let jobs = rayon::current_num_threads().min(documents.len());`. Use `jobs` only to choose the sequential path and size the bounded channel to `jobs * 2`; do not infer cache cardinality from it.
+- When `jobs == 1`, create one `WorkerCache` from `context.programs` and reuse it sequentially. Otherwise retain the current scoped feed/channel/stop/panic protocol and run `rx.into_iter().par_bridge().try_for_each_init(|| WorkerCache::create(context.programs), ...)`; every initializer result is job-local state owned by one sequential Rayon job, and Rayon may create a different number of states than OS or pool threads.
 - Per body/detail:
   - `Documents`: first verified match, no payload;
   - `MatchingLines`: witness/full matches converted to line events;
@@ -1422,7 +1504,7 @@ fn search_batch(
   - `FullLines`: discover, lazily fetch/reverify complete lines/context;
   - `MatchWindows`: build bounded windows from confirmed witnesses.
 - Deduplicate before applying `-m`; collect hit keys only when requested; preserve byte/document counters and `StopEarly` behavior.
-- The worker closure delegates the branch table to `verify_document`, borrows its owned vector into `MatchData`, invokes the sink once, and drops the payload after the sink returns.
+- Merge the feed and verifier results with the existing precedence: a real feed error wins over the stop sentinel, a verifier `StopEarly` produces `stopped=true`, every other verifier error returns, and success requires the feed to succeed. Extract atomics/mutex contents and return the exact `BatchResult` schema.
 
 ### Public search functions
 
@@ -1436,9 +1518,11 @@ pub fn search_patterns(
 ) -> anyhow::Result<SearchStats>;
 ```
 
-- Build plans/programs once. Convert plans to `CandidatePlan`; call `reader.visit_candidates` once with 16,384/64 MiB limits; key-filter each batch; call `search_batch`; preserve stale-root retry error once candidate streaming begins.
-- Populate all existing counters plus: `patterns=plans.len()` and exact/proof/fallback counts from the final mutually exclusive `PatternPlan.kind` values.
-- `max_count=Some(0)` returns zero search counters without candidate I/O but still reports pattern categories after valid compilation.
+- Input schema: `reader` is the immutable index/candidate source; `hirs` is a required non-empty ordered slice with one sanitized HIR per original CLI `-e`; `scope` is exactly `KeyScope { prefix: Option<&str>, matches: Option<&(dyn Fn(&str) -> bool + Sync)> }`; `options` is the request `MatchOptions`; `sink` is the shared result consumer and its `detail()` value is fixed for this call.
+- Output schema: `SearchStats { hits: Vec<String>, hit_count: usize, candidates: usize, total_docs: usize, bytes_fetched: usize, regional_docs: usize, whole_docs: usize, candidate_bytes: usize, decoded_bytes: usize, excluded_objects: usize, patterns: usize, exact_patterns: usize, proof_patterns: usize, fallback_patterns: usize }`. `hits` is globally sorted; category counts derive from mutually exclusive final `PatternPlan.kind` values and sum exactly to `patterns=hirs.len()`; all existing counter meanings remain unchanged.
+- Errors: propagate exact `build_plans`, `SearchPrograms::compile`, candidate-reader, batch, verifier, and sink errors. Preserve counter contexts `candidate count overflows usize`, `hit count overflows usize`, `fetched byte count overflows usize`, `regional document count overflows usize`, `whole document count overflows usize`, and `decoded byte count overflows usize`. If `IndexChanged` arrives after at least one candidate was admitted, replace it with exactly `index changed after candidate batches began; rerun the search to get a clean snapshot`; otherwise preserve it.
+- Transformation: read `detail=sink.detail()` once; build plans and all three programs once; count plan kinds; compute `stream_overlap` once; construct `SearchContext { plans: &plans, programs: &programs, stream_overlap, options, detail }`; if `options.max_count==Some(0)`, return valid pattern/reader metadata with all search-work counters zero before candidate I/O.
+- Convert every plan to a borrowed `CandidatePlan`; call `reader.visit_candidates` once with `CandidateBatchLimits { documents: 16_384, decoded_bytes: 64 * 1024 * 1024 }`; apply `scope.admits` before fetch; skip empty filtered batches; call `search_batch` with the unchanged context; checked-add all counters; stop visits when a batch reports `stopped`; sort hits; construct the exact output.
 
 ```rust
 pub fn search_streaming(
@@ -1450,7 +1534,9 @@ pub fn search_streaming(
 ) -> anyhow::Result<SearchStats>;
 ```
 
-- Retain as source-compatible single-pattern wrapper: parse once and call `search_patterns` with a one-element slice. No joined-pattern logic remains.
+- Input schema: `pattern` is one required already line-sanitized compatibility regex string; `reader`, `scope`, `options`, and `sink` have the exact `search_patterns` schemas.
+- Output schema: exactly the `SearchStats` returned by `search_patterns`, with `patterns=1`; errors are the unchanged `seagrep_core::parse_pattern` syntax error or a downstream `search_patterns` error.
+- Transformation: execute `let hir = seagrep_core::parse_pattern(pattern)?;` and then `search_patterns(reader, std::slice::from_ref(&hir), scope, options, sink)`. This is the CLI's sole per-pattern parser entry. Do not compile `pattern` through `regex`, concatenate it with another expression, or retain a parser in `grep.rs`.
 
 ```rust
 pub fn search_collect(
@@ -1459,7 +1545,9 @@ pub fn search_collect(
 ) -> anyhow::Result<(Vec<(String, LineEvent)>, SearchStats)>;
 ```
 
-- Keep signature and global sort unchanged.
+- Input schema: `reader` is the immutable index source and `pattern` is one required already line-sanitized compatibility regex string.
+- Output schema: `(matches, stats)`, where `matches` owns every full-line event paired with its document key and is globally sorted by `(key, line, first_submatch_start)`; `stats` is the exact `search_streaming` output. Errors preserve parser/search/sink errors, and a poisoned result mutex maps to `a search worker panicked`.
+- Transformation: create `CollectSink::default()`, call `search_streaming` with `KeyScope::default()` and `MatchOptions::default()`, take the sink vector, apply the existing global sort unchanged, and return it with stats.
 
 ### Exact index and test sink migrations
 
@@ -1522,19 +1610,152 @@ impl MatchSink for CountEventSink {
 - `EventSink`: `detail=FullLines`; require `MatchData::Lines` or error `event sink requires line data`; ignore key, lock `events`, clone the slice into it, return `Continue`. Preserve the existing test-only poisoned-lock `unwrap`.
 - `CountEventSink`: `detail=MatchCount`; require `MatchData::Lines` or error `count event sink requires line data`; ignore key, append events exactly as above, return `Continue`. Remove `wants_line_text`.
 
+### Downstream typed sink migration
+
+In `crates/cli/src/printer.rs`, keep every constructor and rendering function signature unchanged in Task 4 and change only these trait methods:
+
+```rust
+impl MatchSink for StandardSink {
+    fn detail(&self) -> SearchDetail;
+
+    fn wants_hit_keys(&self) -> bool;
+
+    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
+}
+
+impl MatchSink for PathSink {
+    fn detail(&self) -> SearchDetail;
+
+    fn wants_hit_keys(&self) -> bool;
+
+    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
+}
+
+impl MatchSink for CountSink {
+    fn detail(&self) -> SearchDetail;
+
+    fn wants_hit_keys(&self) -> bool;
+
+    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
+}
+
+impl MatchSink for QuietSink {
+    fn detail(&self) -> SearchDetail;
+
+    fn wants_hit_keys(&self) -> bool;
+
+    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
+}
+```
+
+- `StandardSink::detail`: no inputs beyond `self`; return `FullLines`; no error. `wants_hit_keys` remains false. `on_doc` requires `doc.data=MatchData::Lines(events)` or errors exactly `standard sink requires line data`; pass `events` to the unchanged binary/heading/context/line renderer, preserve every output byte and lock/I/O/`flow_of` behavior.
+- `PathSink::detail`: no inputs beyond `self`; return `Documents`; no error. `wants_hit_keys` remains false. `on_doc` uses required `key`, deliberately ignores `doc`, and preserves the exact colored-key/newline/flush transformation and existing lock/I/O result.
+- `CountSink::detail`: no inputs beyond `self`; return `MatchCount` iff `self.count_matches`, else `MatchingLines`; no error. `wants_hit_keys` remains false. `on_doc` requires `doc.data=MatchData::Lines(events)` or errors exactly `count sink requires line data`; sum submatch lengths in match-count mode or count `LineKind::Match` events in line-count mode; preserve exact `key:{count}\n`, flush, lock, and `flow_of` behavior.
+- `QuietSink::detail`: no inputs beyond `self`; return `Documents`; no error. `wants_hit_keys` remains false. `on_doc` deliberately ignores required `key/doc`, sets `matched=true`, and returns `Stop` iff `self.stop`, otherwise `Continue`; no new errors. Remove `wants_matches`/`wants_line_text` implementations.
+
+In `crates/cli/src/json.rs`:
+
+```rust
+impl MatchSink for JsonSink {
+    fn detail(&self) -> SearchDetail;
+
+    fn wants_hit_keys(&self) -> bool;
+
+    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
+}
+```
+
+- `detail`: no inputs beyond `self`; return `FullLines`; no error. `wants_hit_keys` remains false.
+- `on_doc`: `key` is the matching display key and `doc` must contain `MatchData::Lines(events)`; otherwise return exactly `JSON sink requires line data`. Replace only `doc.events` reads with `events`; preserve begin/match/context/end order, every JSON field, all counters, buffered single-lock write, newline framing, flush, existing serde/I/O/poison errors, and `Continue` output.
+
+### Differential test-only contracts
+
+Add these narrow types in `crates/index/tests/differential_store.rs`; they support only the one required regional-versus-whole differential and are not a reusable fixture framework:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapturedData {
+    Documents,
+    Lines(Vec<LineEvent>),
+    Windows(Vec<MatchWindow>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedDocument {
+    key: String,
+    data: CapturedData,
+    bytes_searched: u64,
+}
+
+struct CaptureSink {
+    detail: SearchDetail,
+    documents: Mutex<Vec<CapturedDocument>>,
+}
+
+struct WholeReader<'a> {
+    reader: &'a SegmentedReader,
+}
+```
+
+```rust
+impl MatchSink for CaptureSink {
+    fn detail(&self) -> SearchDetail;
+
+    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
+}
+```
+
+- `detail`: input is `self`; output is the stored request detail; no errors.
+- `on_doc`: `key/doc` are one verified result; clone `MatchData::Documents`, `Lines`, or `Windows` into the matching owned `CapturedData`, copy `bytes_searched`, append one `CapturedDocument`, and return `Continue`. The test-only mutex uses `expect("capture sink lock")`; it panics on poison and otherwise returns no error. Elapsed time is deliberately excluded from the comparison.
+
+```rust
+impl DocFetcher for WholeReader<'_> {
+    fn fetch_each(
+        &self,
+        documents: &[DocAddress],
+        consume: &mut dyn FnMut(usize, DocumentBody) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()>;
+}
+
+impl IndexReader for WholeReader<'_> {
+    fn strategy(&self) -> Strategy;
+
+    fn total_docs(&self) -> usize;
+
+    fn candidate_docs(
+        &self,
+        query: &seagrep_query::Query,
+        key_prefix: Option<&str>,
+    ) -> anyhow::Result<Vec<DocAddress>>;
+
+    fn stats(&self) -> IndexStats;
+}
+```
+
+- Every method delegates its exact input/output/error to the wrapped `SegmentedReader`; `fetch_each` forwards bodies and callback results unchanged.
+- Do not override `visit_candidates` or `start_candidate_batch`. The public defaults union the same candidate queries, clear address ranges, and fetch canonical whole bodies, creating an oracle that differs from the production reader only at regional-versus-whole retrieval.
+
 ### Focused verification
 
-- [ ] Convert the existing `grep.rs` `re` helper to parse/compile one HIR and retain all existing line/context/EOF assertions. Existing test function signatures remain unchanged; only fixture type and call arguments change.
-- [ ] Update `store.rs`, the one `codec.rs` test, `differential_store.rs`, and `segmented.rs` to compile a `PatternProgram` for oracle calls; test names and assertions stay unchanged unless listed below.
-- [ ] Add one `search.rs` mixed-region unit test asserting regional/full program selection, absolute witnesses, document-anchor filtering on sliced lines, line deduplication, and one worker-local cache initializer per worker.
-- [ ] Add `fn max_count_keeps_earliest_union_lines_and_caps_large_exact_spans()` in `search.rs`: reverse the pattern order relative to line order and assert `-m 1` keeps the earliest line with every match on it; include a finite exact maximum above `CANDIDATE_BLOCK_BYTES` and assert `kind=Fallback`, a non-`Bytes` extent, and oracle parity.
-- [ ] Add `fn mixed_patterns_match_whole_document_oracle_on_giant_line()` to `differential_store.rs`: multi-megabyte one-line body, bounded pattern, forward proof, reverse proof, line fallback, document fallback, cross-block match, duplicate same-line match, first/last-byte match. Compare Documents, MatchingLines, MatchCount, FullLines, and MatchWindows to a whole-document full-program oracle.
+- [ ] In `grep.rs`, replace `fn re(p: &str) -> regex::bytes::Regex` with `fn compile_program(pattern: &str) -> PatternProgram`. Input is one test-only line-sanitized pattern; output is a one-HIR program with original ID `0`; parse/compile failures panic through `unwrap`. Update `fn match_line_col()`, `fn grep_doc_merges_per_line_and_tracks_lines()`, `fn grep_doc_context_merges_overlaps()`, `fn grep_doc_independent_before_after()`, `fn grep_doc_max_count_caps_but_drains_after_context()`, `fn grep_doc_post_cap_match_in_context_carries_submatches()`, and `fn grep_doc_eof_line_without_newline()`; each has no input, returns `()`, compiles its fixture, and preserves every existing output assertion. Replace `fn regex_matches_cannot_cross_lines()` with `fn line_safe_program_matches_cannot_cross_lines() -> ()`, using `foo[^\n]+bar` so the program satisfies the sanitized-HIR contract while preserving the cross-line/same-line assertions. Delete the two tests for removed legacy functions: `whole_document_fast_path_is_conservative_and_equivalent` and `bounded_match_lengths_exclude_unbounded_and_contextual_patterns`.
+- [ ] In `store.rs`, update `fn scan_finds_matching_docs() -> ()` and `fn scan_finds_archive_members() -> ()`: each has no input/output beyond assertions; parse its existing pattern with the sole core parser, compile one ID-0 program, pass it to `scan_matching_docs`, and keep expected sorted keys unchanged.
+- [ ] In `codec.rs`, update `fn parquet_named_timezone_utc_decodes() -> ()`: no input/output beyond assertions; replace its regex fixture with one parsed ID-0 `PatternProgram`, pass it to `grep_doc`, and keep all decoded timestamp/match assertions unchanged.
+- [ ] In `differential_store.rs`, update `fn store_index_equals_scan_for_many_patterns() -> anyhow::Result<()>` and `fn regional_verification_matches_whole_document_scanning() -> anyhow::Result<()>`: no input; output `Ok(())` after existing assertions; for each existing oracle pattern, parse one HIR, compile one ID-0 program, and pass it to `scan_matching_docs`/`grep_doc` without changing expected events or fetch assertions.
+- [ ] In `segmented.rs`, change only the body of `fn assert_matches_oracle(bucket: &Bucket, store_dir: &Path, cache_dir: &Path, patterns: &[&str], label: &str) -> anyhow::Result<()>`. Inputs retain their current bucket/path/pattern/diagnostic meanings; output remains `Ok(())` or the existing open/decode/search/assertion error. For each pattern, parse one HIR, compile one ID-0 program, and pass it to `scan_matching_docs`; keep all callers and comparison messages unchanged.
+- [ ] Add `fn eligibility_programs_prevent_same_start_masking() -> ()` in `search.rs`. It has no inputs/output beyond assertions and panics on fixture compilation failure. Parse ordered patterns `\Afoo`, `(?m)^foo`, and `foo`; call `build_plans(..., SearchDetail::FullLines)` and assert original IDs `0/1/2` plus extents `Document/Lines/Bytes`; compile `SearchPrograms`; create one `WorkerCache`; search the same `b"foo"` body with `whole`, `lines`, and `regional`; assert the sole winner is respectively original pattern ID `0`, `1`, and `2`. This is the exact regression for leftmost-first same-start masking; do not run a broad program plus an ID filter.
+- [ ] Add `fn max_count_keeps_earliest_union_lines_and_caps_large_exact_spans() -> ()` in `search.rs`. It has no inputs/output beyond assertions. For two small compiled patterns, reverse pattern order relative to line order and assert `max_count=Some(1)` keeps the earliest line and every match on that retained line, matching the whole-document program oracle. Separately parse `a{CANDIDATE_BLOCK_BYTES+1}`, run only `build_plans`, and assert `kind=Fallback` plus a non-`Bytes` extent; do not compile or allocate a body for that 128-KiB repetition.
+- [ ] Migrate `fn bounded_file_search_matches_in_memory_across_chunks() -> ()`, `fn regional_matches_share_a_line_across_an_unfetched_zero_newline_gap() -> ()`, and `fn single_candidate_does_not_start_rayon_pool() -> ()` in `search.rs` to the new programs/caches/detail signatures. They have no inputs/output beyond assertions; preserve the chunk-boundary, absolute-line/dedup, and sequential-path assertions respectively. Do not assert the number of `try_for_each_init` initializations or equate it to Rayon thread count.
+- [ ] Add `fn mixed_patterns_match_whole_document_oracle_on_giant_line() -> anyhow::Result<()>` to `differential_store.rs`. It has no input and returns `Ok(())` after comparisons. Build a corpus with one multi-megabyte single-line `giant.log`, one small line-fallback document, and one small document-fallback document. Use this ordered pattern table: `FIRSTTOKEN`, `CROSSBLOCKTOKEN`, `DUPTOKEN`, `LASTTOKEN`, `BEGIN[A-Z0-9]{20,}`, `[A-Z0-9]{20,}END`, `(?m)^LINEFALLBACK.*$`, `\ADOCFALLBACK.*`. Place `FIRSTTOKEN` at offset zero, start `CROSSBLOCKTOKEN` at `CANDIDATE_BLOCK_BYTES - 4`, place `DUPTOKEN` twice on the giant line, end `LASTTOKEN` at EOF, and place the two proof sequences elsewhere on that line; put only the line/document fallback strings in their small documents so fallback coverage does not force the giant candidate whole. Parse the ordered HIRs once. For each `Documents`, `MatchingLines`, `MatchCount`, `FullLines`, and `MatchWindows { max_bytes: 64 }`, run `search_patterns` against the production reader and `WholeReader` with separate `CaptureSink`s; sort captured documents by key and assert exact payload/`bytes_searched` equality. Compare semantic stats (`hits`, hit/candidate/total/decoded counts, and all pattern-kind counts) while asserting production retrieval includes regional work and window text never exceeds 64 bytes; do not compare intentionally different regional/whole/fetched-byte counters.
+- [ ] Run `rg -n "pub fn parse_pattern" crates/core/src`; require exactly `crates/core/src/pattern.rs`. Run `rg -n "regex::|regex::bytes|bounded_match_len|can_search_as_document|grep_bytes_fast|has_line_match_fast" crates/core/src/grep.rs crates/core/src/lib.rs`; require no matches. Run `rg -n "regex::|regex::bytes" crates/index`; require no matches. Confirm the only remaining core `regex` dependency is under `[dev-dependencies]` for `pattern.rs` witness-oracle tests.
 - [ ] Run `cargo test -p seagrep-core grep`.
 - [ ] Run `cargo test -p seagrep-core store`.
 - [ ] Run `cargo test -p seagrep-index search`.
 - [ ] Run `cargo test -p seagrep-index --test differential_store mixed_patterns_match_whole_document_oracle_on_giant_line`.
+- [ ] Run `cargo test -p seagrep -- --test-threads=1`; existing CLI output/JSON tests must pass unchanged.
+- [ ] Run `cargo check --locked --workspace --all-targets --all-features --offline` so the public trait migration leaves the complete workspace compiling at the Task 4 boundary.
+- [ ] Run `cargo clippy --locked --workspace --all-targets --all-features --offline`. Compare with the recorded pre-Task-4 inventory and require a strict subset: duplicate `parse_pattern` `dead_code`/`unreachable_pub` warnings are gone, no new warning appears, and only unchanged warnings in files outside Task 4 remain. Do not add an `allow` to silence new code.
 - [ ] Run `cargo fmt --all -- --check`.
-- [ ] Commit: `git add crates/core/Cargo.toml crates/core/src/codec.rs crates/core/src/grep.rs crates/core/src/lib.rs crates/core/src/store.rs crates/index/Cargo.toml crates/index/src/lib.rs crates/index/src/search.rs crates/index/tests/differential_store.rs crates/index/tests/segmented.rs && git commit -m "feat: verify mixed patterns in one pass"`.
+- [ ] Commit: `git add crates/core/Cargo.toml crates/core/src/codec.rs crates/core/src/grep.rs crates/core/src/lib.rs crates/core/src/store.rs crates/index/Cargo.toml crates/index/src/lib.rs crates/index/src/search.rs crates/index/tests/differential_store.rs crates/index/tests/segmented.rs crates/cli/src/printer.rs crates/cli/src/json.rs && git commit -m "feat: verify mixed patterns in one pass"`.
 
 ---
 
@@ -1544,8 +1765,7 @@ impl MatchSink for CountEventSink {
 
 - Modify `crates/cli/src/patterns.rs`: return one sanitized HIR per raw pattern with indexed errors.
 - Modify `crates/cli/src/main.rs`: add `--match-window`, pass HIR slices to `search_patterns`, select typed sink detail, and print pattern stats.
-- Modify `crates/cli/src/printer.rs`: typed line/window rendering and window-only binary suppression.
-- Modify `crates/cli/src/json.rs`: require full-line typed data without changing JSON wire shape.
+- Modify `crates/cli/src/printer.rs`: extend the typed standard sink with line/window rendering and window-only binary suppression; Task 4 already migrated all non-window sinks.
 
 ### Pattern transformation contracts in `patterns.rs`
 
@@ -1562,7 +1782,7 @@ pub(crate) fn build_patterns(
 ```
 
 - Input patterns are required in user order and must be non-empty; error `at least one pattern is required` otherwise.
-- Escape every raw pattern independently for `-F`; parse each escaped form once for smart-case literal inspection with the original index/raw value attached to errors; compute one smart-case decision across those HIRs; compose/parse/sanitize each final pattern independently; return one HIR per input in order.
+- Escape every raw pattern independently for `-F`; parse each escaped form once with `seagrep_core::parse_pattern` for smart-case literal inspection with the original index/raw value attached to errors; compute one smart-case decision across those HIRs; compose each final pattern, parse it with the same sole core parser, sanitize it, and return one HIR per input in order.
 - Any parse/sanitize error is wrapped exactly `invalid pattern {ONE_BASED_INDEX} {RAW_DEBUG}: {SOURCE}`.
 - Never join patterns and never stringify sanitized HIR.
 
@@ -1773,51 +1993,9 @@ impl MatchSink for StandardSink {
 
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
 }
-
-impl MatchSink for PathSink {
-    fn detail(&self) -> SearchDetail;
-
-    fn wants_hit_keys(&self) -> bool;
-
-    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
-}
-
-impl MatchSink for CountSink {
-    fn detail(&self) -> SearchDetail;
-
-    fn wants_hit_keys(&self) -> bool;
-
-    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
-}
-
-impl MatchSink for QuietSink {
-    fn detail(&self) -> SearchDetail;
-
-    fn wants_hit_keys(&self) -> bool;
-
-    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
-}
 ```
 
 - `StandardSink::detail`: `MatchWindows { max_bytes }` from `config.match_window`, else `FullLines`. `wants_hit_keys=false`. `on_doc` runs `binary_nul_offset` on `doc.data`, preserves the binary notice/heading/context state machine, renders ordered lines in default mode or ordered windows through `write_window` in window mode, and returns the existing `flow_of` result. A detail/data mismatch errors `standard sink received incompatible search data`; writer/lock errors propagate unchanged.
-- `PathSink::detail`: `Documents`; `wants_hit_keys=false`. `on_doc` ignores `doc`, locks the writer, emits colored `key` plus newline, flushes, and returns `flow_of`; existing lock/I/O errors are unchanged.
-- `CountSink::detail`: `MatchCount` when `count_matches`, otherwise `MatchingLines`; `wants_hit_keys=false`. `on_doc` requires `MatchData::Lines` or errors `count sink requires line data`; sum submatch counts for match-count mode or count `LineKind::Match` events for line-count mode, then emit `key:{count}` and flush through `flow_of`.
-- `QuietSink::detail`: `Documents`; `wants_hit_keys=false`. `on_doc` ignores key/data, stores `matched=true`, and returns `Stop` iff `self.stop`, otherwise `Continue`; no new errors. Remove all `wants_matches` and `wants_line_text` methods.
-
-### JSON contracts in `json.rs`
-
-```rust
-impl MatchSink for JsonSink {
-    fn detail(&self) -> SearchDetail;
-
-    fn wants_hit_keys(&self) -> bool;
-
-    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> anyhow::Result<SinkFlow>;
-}
-```
-
-- `detail` returns `FullLines`; `wants_hit_keys` returns false.
-- `on_doc` requires `MatchData::Lines` or errors `JSON sink requires line data`; replace only `doc.events` reads with that borrowed slice. Preserve begin/match/context/end message order, every JSON field, byte/match/line counters, buffered single-lock write, newline framing, flush, and all existing serde/I/O/poison errors; return `Continue` on success.
 
 ### Focused verification
 
@@ -1830,7 +2008,7 @@ impl MatchSink for JsonSink {
 - [ ] Run `cargo test -p seagrep printer`.
 - [ ] Run `cargo test -p seagrep -- --test-threads=1`.
 - [ ] Run `cargo fmt --all -- --check`.
-- [ ] Commit: `git add crates/cli/src/patterns.rs crates/cli/src/main.rs crates/cli/src/printer.rs crates/cli/src/json.rs && git commit -m "feat: add bounded multi-pattern output"`.
+- [ ] Commit: `git add crates/cli/src/patterns.rs crates/cli/src/main.rs crates/cli/src/printer.rs && git commit -m "feat: add bounded multi-pattern output"`.
 
 ---
 
