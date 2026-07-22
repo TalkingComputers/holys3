@@ -4,9 +4,9 @@ use super::{
 };
 use anyhow::{Context, Result};
 use seagrep_core::{
-    grep_matches, CandidateBatch, DocumentRegion, FetchedDocument, LineEvent, LineKind,
-    MatchOptions, MatchWitness, PatternCache, PatternMatch, PatternProgram, RegionProgram,
-    RegionRead, SubMatch,
+    grep_matches, has_line_match, CandidateBatch, DocumentRegion, FetchedDocument, LineEvent,
+    LineKind, MatchOptions, MatchWitness, PatternCache, PatternMatch, PatternProgram,
+    RegionProgram, RegionRead, SubMatch,
 };
 use std::io::Read;
 use std::ops::Range;
@@ -98,6 +98,23 @@ pub(super) fn sort_region_matches(
     matches
 }
 
+/// Line-oriented validity of a region match, mirroring `find_whole_matches`:
+/// matches starting past the decoded document are dropped, and an empty
+/// match at EOF counts only when the document does not end in a newline
+/// (it then belongs to the final line).
+fn region_match_is_line_valid(
+    region: &DocumentRegion,
+    relative_start: usize,
+    decoded_size: u64,
+) -> bool {
+    let start = region.start + u64::try_from(relative_start).expect("document offsets fit u64");
+    start < decoded_size
+        || (start == decoded_size
+            && region.bytes[..relative_start]
+                .last()
+                .is_some_and(|byte| *byte != b'\n'))
+}
+
 pub(super) fn find_region_matches(
     regions: &[DocumentRegion],
     decoded_size: u64,
@@ -140,14 +157,13 @@ pub(super) fn find_region_matches(
                 }
             }
             scanned = relative.start;
-            let start =
-                region.start + u64::try_from(relative.start).expect("document offsets fit u64");
-            if start >= decoded_size {
+            if !region_match_is_line_valid(region, relative.start, decoded_size) {
                 continue;
             }
             found.push(RegionMatch {
                 pattern: matched.pattern,
-                witness: start
+                witness: region.start
+                    + u64::try_from(relative.start).expect("document offsets fit u64")
                     ..region.start + u64::try_from(relative.end).expect("document offsets fit u64"),
                 line,
                 line_offset,
@@ -156,6 +172,37 @@ pub(super) fn find_region_matches(
         }
     }
     Ok(sort_region_matches(found, max_count))
+}
+
+/// Existence-only region check for `SearchDetail::Documents`: stops at the
+/// first line-valid match instead of enumerating every match.
+pub(super) fn has_region_match(
+    regions: &[DocumentRegion],
+    decoded_size: u64,
+    plans: &[PatternPlan],
+    programs: &SearchPrograms,
+    cache: &mut WorkerCache,
+) -> Result<bool> {
+    for region in regions {
+        let (program, program_cache) = get_region_program(programs, cache, region.program)?;
+        for matched in program.find_iter(program_cache, &region.bytes) {
+            let relative_start = match region.program {
+                RegionProgram::Regional => {
+                    let witness = plans[matched.pattern]
+                        .bounds
+                        .witness
+                        .as_ref()
+                        .expect("regional pattern has a finite witness");
+                    witness.find_witness(&region.bytes, matched)?.start
+                }
+                RegionProgram::Full => matched.start,
+            };
+            if region_match_is_line_valid(region, relative_start, decoded_size) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn find_whole_matches(
@@ -318,6 +365,7 @@ pub(super) fn fetch_full_lines(
     batch: &dyn CandidateBatch,
     document: usize,
     matches: &[RegionMatch],
+    decoded_size: u64,
     programs: &SearchPrograms,
     cache: &mut WorkerCache,
     options: MatchOptions,
@@ -329,7 +377,10 @@ pub(super) fn fetch_full_lines(
         .iter()
         .map(|matched| {
             if matched.witness.start == matched.witness.end {
-                matched.witness.start..matched.witness.start + 1
+                // Anchor an empty match to one byte of its line; an empty
+                // match at EOF anchors to the document's last byte.
+                let anchor = matched.witness.start.min(decoded_size.saturating_sub(1));
+                anchor..anchor + 1
             } else {
                 matched.witness.clone()
             }
@@ -563,6 +614,13 @@ pub(super) fn verify_document(
                         extra_fetched_bytes: 0,
                     }));
                 }
+                let bytes = body.into_bytes()?;
+                let matched = has_line_match(&bytes, &context.programs.whole, &mut cache.whole);
+                return Ok(matched.then_some(VerifiedDocument {
+                    data: OwnedMatchData::Documents,
+                    bytes_searched,
+                    extra_fetched_bytes: 0,
+                }));
             }
             let bytes = body.into_bytes()?;
             // FullLines defers the cap to grep_matches so matches past it
@@ -620,6 +678,20 @@ pub(super) fn verify_document(
             decoded_size,
             regions,
         } => {
+            if context.detail == SearchDetail::Documents {
+                let matched = has_region_match(
+                    &regions,
+                    decoded_size,
+                    context.plans,
+                    context.programs,
+                    cache,
+                )?;
+                return Ok(matched.then_some(VerifiedDocument {
+                    data: OwnedMatchData::Documents,
+                    bytes_searched,
+                    extra_fetched_bytes: 0,
+                }));
+            }
             let matches = find_region_matches(
                 &regions,
                 decoded_size,
@@ -645,6 +717,7 @@ pub(super) fn verify_document(
                         batch,
                         document,
                         &matches,
+                        decoded_size,
                         context.programs,
                         cache,
                         context.options,
