@@ -1,4 +1,4 @@
-use crate::eval::{bind_queries, blocks_needed, eval, Selection, TermValue};
+use crate::eval::{bind_queries, blocks_needed, eval, resolve, Selection, TermValue};
 use crate::format::SegmentTables;
 use anyhow::{Context, Result};
 use seagrep_core::{CandidateRange, DocId, SearchExtent, Strategy, CANDIDATE_BLOCK_BYTES};
@@ -49,6 +49,14 @@ pub(crate) fn visit_candidate_selections(
     fetch_blocks: impl FnOnce(&BTreeMap<u64, (u32, u64)>) -> Result<BTreeMap<u64, Vec<DocId>>>,
     visit: &mut dyn FnMut(usize, Selection) -> Result<()>,
 ) -> Result<()> {
+    if let [plan] = plans {
+        let query = resolve(plan.query, id_space, strategy, lookup)?;
+        let mut needed = BTreeMap::new();
+        blocks_needed(&query, &mut needed);
+        let blocks = fetch_blocks(&needed)?;
+        let expand_ids = |id| expand(0, id);
+        return visit(0, eval(&query, &blocks, Some(&expand_ids))?);
+    }
     let queries = plans.iter().map(|plan| plan.query).collect::<Vec<_>>();
     let bound = bind_queries(&queries, id_space, strategy, lookup)?;
     let mut needed = BTreeMap::new();

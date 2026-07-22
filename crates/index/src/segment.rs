@@ -1470,7 +1470,6 @@ impl SegmentedReader {
         visit: &mut dyn FnMut(Vec<DocAddress>) -> Result<bool>,
     ) -> Result<()> {
         crate::candidate::validate_candidate_plans(plans, limits)?;
-        let queries = plans.iter().map(|plan| plan.query).collect::<Vec<_>>();
         let source_prefix =
             key_prefix.map(|prefix| prefix.split_once("!/").map_or(prefix, |(source, _)| source));
         for (segment_id, segment) in self.segments.iter().enumerate() {
@@ -1484,9 +1483,17 @@ impl SegmentedReader {
                 }
                 Strategy::Sparse => None,
             };
-            let term_values =
-                self.classify_index_result(self.read_term_values(segment, &queries))?;
-            let lookup = |gram: &[u8]| Ok(term_values.get(gram).copied().flatten());
+            let remote_values = match &segment.map {
+                TermMap::SparseRemote { .. } => {
+                    let queries = plans.iter().map(|plan| plan.query).collect::<Vec<_>>();
+                    Some(self.classify_index_result(self.read_term_values(segment, &queries))?)
+                }
+                _ => None,
+            };
+            let lookup = |gram: &[u8]| match &remote_values {
+                Some(values) => Ok(values.get(gram).copied().flatten()),
+                None => segment.map.get(gram),
+            };
             let id_space = u32::try_from(segment.meta.block_count)?;
             let mut documents = std::collections::BTreeMap::new();
             self.classify_index_result(visit_candidate_selections(
