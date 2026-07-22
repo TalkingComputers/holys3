@@ -540,7 +540,7 @@ fn plan_capacity(
         return Some(capacity);
     }
     let remaining = scratch_limit.checked_sub(scratch_bytes)?;
-    let max_capacity = remaining.checked_div(element_bytes)?;
+    let max_capacity = capacity.checked_add(remaining.checked_div(element_bytes)?)?;
     if required > max_capacity {
         return None;
     }
@@ -554,10 +554,6 @@ fn add_capacity_bytes(
     element_bytes: usize,
     scratch_limit: usize,
 ) -> Option<()> {
-    let remaining = scratch_limit.checked_sub(*scratch_bytes)?;
-    if after.checked_mul(element_bytes)? > remaining {
-        return None;
-    }
     let growth = after.checked_sub(before)?.checked_mul(element_bytes)?;
     let next = scratch_bytes.checked_add(growth)?;
     if next > scratch_limit {
@@ -1232,7 +1228,7 @@ mod tests {
         let mut values = vec![0u8; 8];
         let value_capacity = values.capacity();
         let mut value_bytes = value_capacity;
-        let value_limit = value_bytes * 2;
+        let value_limit = value_bytes;
         assert!(reserve_vec(&mut values, 1, &mut value_bytes, value_limit).is_none());
         assert_eq!(values.capacity(), value_capacity);
         assert_eq!(value_bytes, value_capacity);
@@ -1241,7 +1237,7 @@ mod tests {
         bits.resize(bits.capacity(), false);
         let bit_capacity = bits.capacity();
         let mut bit_bytes = bit_capacity * size_of::<bool>();
-        let bit_limit = bit_bytes * 2;
+        let bit_limit = bit_bytes;
         assert!(reserve_bits(&mut bits, 1, &mut bit_bytes, bit_limit).is_none());
         assert_eq!(bits.capacity(), bit_capacity);
         assert_eq!(bit_bytes, bit_capacity * size_of::<bool>());
@@ -1250,7 +1246,7 @@ mod tests {
         queue.resize(queue.capacity(), 0u8);
         let queue_capacity = queue.capacity();
         let mut queue_bytes = queue_capacity;
-        let queue_limit = queue_bytes * 2;
+        let queue_limit = queue_bytes;
         assert!(reserve_queue(&mut queue, 1, &mut queue_bytes, queue_limit).is_none());
         assert_eq!(queue.capacity(), queue_capacity);
         assert_eq!(queue_bytes, queue_capacity);
@@ -1264,7 +1260,7 @@ mod tests {
             );
         }
         let mut index_bytes = index_capacity * PROOF_MAP_BUCKET_BYTES;
-        let index_limit = index_bytes * 2;
+        let index_limit = index_bytes;
         assert!(reserve_indices(&mut indices, 1, &mut index_bytes, index_limit).is_none());
         assert_eq!(indices.capacity(), index_capacity);
         assert_eq!(index_bytes, index_capacity * PROOF_MAP_BUCKET_BYTES);
@@ -1281,7 +1277,7 @@ mod tests {
             );
         }
         let mut scratch_bytes = initial_capacity * PROOF_MAP_BUCKET_BYTES;
-        let scratch_limit = initial_capacity * 3 * PROOF_MAP_BUCKET_BYTES;
+        let scratch_limit = (initial_capacity + 1) * PROOF_MAP_BUCKET_BYTES;
         assert!(reserve_indices(&mut indices, 1, &mut scratch_bytes, scratch_limit).is_none());
         assert_eq!(indices.capacity(), 0);
         assert_eq!(scratch_bytes, 0);
