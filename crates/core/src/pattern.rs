@@ -830,7 +830,7 @@ mod tests {
         let hirs = [parse_pattern("a").unwrap(), parse_pattern("").unwrap()];
         let program = PatternProgram::compile(&hirs, &[7, 3]).unwrap();
         let mut cache = program.create_cache();
-        let matches = program.find_iter(&mut cache, b"ba").collect::<Vec<_>>();
+        let matches = program.find_iter(&mut cache, b"xa").collect::<Vec<_>>();
 
         assert_eq!(
             matches,

@@ -514,7 +514,7 @@ mod tests {
         // Both window edges clipped, witness right-clipped, non-canonical
         // span: uncolored edge marks, one highlighted mark per clipped
         // witness edge plus one for the unknown canonical span.
-        let mut clipped = window(100, b"xxMATC");
+        let mut clipped = window(100, b"xxMXYZ");
         clipped.left_clipped = true;
         clipped.right_clipped = true;
         clipped.matches = vec![WindowMatch {
@@ -526,7 +526,7 @@ mod tests {
         }];
         assert_eq!(
             ansi_window(&clipped),
-            format!("…xx{HIGHLIGHT}MATC{RESET}{HIGHLIGHT}…{RESET}{HIGHLIGHT}…{RESET}…\n")
+            format!("…xx{HIGHLIGHT}MXYZ{RESET}{HIGHLIGHT}…{RESET}{HIGHLIGHT}…{RESET}…\n")
         );
 
         // Witness left-clipped only.
