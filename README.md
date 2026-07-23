@@ -105,6 +105,22 @@ seagrep -w -F 'foo(' s3://my-code-bucket -l
 seagrep 'req-[0-9a-f]+' s3://my-log-bucket --json | jq .
 ```
 
+Repeated `-e` patterns are planned together: one invocation runs every
+pattern through a shared segment, posting, and snapshot pass. This removes
+duplicated setup and I/O, though candidate and verification cost still grows
+with the union of the patterns. Default and `--json` output always print the
+exact complete matching lines. For giant
+structured rows (a multi-megabyte JSON line would flood the terminal),
+`--match-window BYTES` is the explicit bounded alternative: it prints at
+most BYTES of content centered on the first confirmed match per matching
+line, with `…` marking clipped edges. Because it clips content, it
+conflicts with `--json`, context flags, `--column`, counts, `--files`, and
+`--quiet`:
+
+```sh
+seagrep -e 'ECONNREFUSED' -e 'ETIMEDOUT' -e 'EPIPE' --match-window 512 s3://my-logs/prod
+```
+
 Exit codes are rg's: `0` match, `1` no match, `2` error. Patterns are
 line-oriented like rg: `^` and `$` anchor at every line, and a literal `\n` in
 a pattern is an error. To search for a pattern that collides with a subcommand
@@ -162,7 +178,12 @@ Flag summary:
 --count-matches   count individual matches           --color WHEN auto/always/never/ansi
 -m NUM            max matching lines per object      --json       rg-compatible JSON Lines
 -A/-B/-C NUM      context lines with -/-- separators --stats      candidate stats to stderr
+--match-window BYTES  bounded match-centered line preview
 ```
+
+`--stats` reports the pattern plan first — how many patterns ran and how
+many were classified exact, proof, or fallback — before the existing
+candidate, hit, and byte counters.
 
 ## Object formats
 

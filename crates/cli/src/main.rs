@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use scope::Scope;
 use seagrep_core::{BlobStore, MatchOptions, Strategy};
 use seagrep_index::{
-    search_streaming, update_index, IndexChanged, IndexMissing, IndexReader, KeyScope, MatchSink,
+    search_patterns, update_index, IndexChanged, IndexMissing, IndexReader, KeyScope, MatchSink,
     SearchStats, SegmentedReader, SourceIdentity, UpdateOptions,
 };
 use seagrep_s3::{
@@ -174,6 +174,25 @@ struct SearchArgs {
     /// Limit the number of matching lines per object.
     #[arg(short = 'm', long, value_name = "NUM")]
     max_count: Option<u64>,
+    /// Print at most BYTES of content around the first confirmed match on each matching line.
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = parse_positive_usize,
+        conflicts_with_all = [
+            "json",
+            "after_context",
+            "before_context",
+            "context",
+            "column",
+            "count",
+            "count_matches",
+            "files_with_matches",
+            "files",
+            "quiet"
+        ]
+    )]
+    match_window: Option<usize>,
     /// Print NUM lines after each match.
     #[arg(short = 'A', long, value_name = "NUM")]
     after_context: Option<usize>,
@@ -436,6 +455,14 @@ fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
     Ok(value)
 }
 
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let value = value.parse::<usize>().map_err(|error| error.to_string())?;
+    if value == 0 {
+        return Err("value must be greater than 0".to_owned());
+    }
+    Ok(value)
+}
+
 pub(crate) fn build_source_identity(source: &S3Source) -> SourceIdentity {
     SourceIdentity::S3 {
         endpoint: source.endpoint.clone(),
@@ -540,7 +567,7 @@ fn build_s3_inner(
 /// Scope filtering, stats, and undated-key notes are shared across outputs.
 #[derive(Clone, Copy)]
 struct SearchExecution<'a> {
-    pattern: &'a str,
+    hirs: &'a [regex_syntax::hir::Hir],
     scope: Option<&'a Scope>,
     options: MatchOptions,
     stats_line: bool,
@@ -602,7 +629,7 @@ fn execute_search(
                 },
             )
         },
-        execution.pattern,
+        execution.hirs,
         KeyScope {
             prefix: candidate_prefix,
             matches: key_matches,
@@ -621,7 +648,11 @@ fn execute_search(
     }
     if execution.stats_line {
         eprintln!(
-            "candidates={} total={} hits={} regional={} whole={} candidate_bytes={} decoded_bytes={}",
+            "patterns={} exact_patterns={} proof_patterns={} fallback_patterns={} candidates={} total={} hits={} regional={} whole={} candidate_bytes={} decoded_bytes={}",
+            search_stats.patterns,
+            search_stats.exact_patterns,
+            search_stats.proof_patterns,
+            search_stats.fallback_patterns,
             search_stats.candidates,
             search_stats.total_docs,
             search_stats.hit_count,
@@ -636,16 +667,16 @@ fn execute_search(
 
 fn search_with_reopen(
     mut open: impl FnMut() -> Result<SegmentedReader>,
-    pattern: &str,
+    hirs: &[regex_syntax::hir::Hir],
     scope: KeyScope<'_>,
     options: MatchOptions,
     sink: &dyn MatchSink,
 ) -> Result<SearchStats> {
     let reader = open()?;
-    match search_streaming(&reader, pattern, scope, options, sink) {
+    match search_patterns(&reader, hirs, scope, options, sink) {
         Err(error) if error.is::<IndexChanged>() => {
             let reader = open()?;
-            search_streaming(&reader, pattern, scope, options, sink)
+            search_patterns(&reader, hirs, scope, options, sink)
         }
         result => result,
     }
@@ -772,14 +803,13 @@ fn run_files(args: SearchArgs) -> Result<bool> {
 /// Returns whether anything matched (drives the exit code).
 fn run_search(args: SearchArgs) -> Result<bool> {
     let (patterns, target_raw) = split_pattern_target(args.args, args.regexp)?;
-    let pattern = patterns::build_pattern(
+    let hirs = patterns::build_patterns(
         &patterns,
         args.fixed_strings,
         args.word_regexp,
         args.ignore_case,
         args.smart_case,
-    )
-    .with_context(|| format!("invalid pattern {:?}", patterns.join("|")))?;
+    )?;
     let globs = globs::build_glob_filter(&args.glob)?;
     let scope = Scope::from_args(
         args.key_prefix,
@@ -823,7 +853,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     let concurrency = args.connect.concurrency;
     let stats_line = args.stats && !args.json;
     let execution = SearchExecution {
-        pattern: &pattern,
+        hirs: &hirs,
         scope: scope.as_ref(),
         options,
         stats_line,
@@ -872,6 +902,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
                 column: args.column,
                 context_active: options.before_context > 0 || options.after_context > 0,
                 text: args.text,
+                match_window: args.match_window,
             },
             color,
         ))
@@ -1080,6 +1111,32 @@ mod tests {
         assert!(cli.search.case_sensitive && !cli.search.ignore_case);
         // --json conflicts with -c
         assert!(Cli::try_parse_from(["seagrep", "--json", "-c", "p", "t"]).is_err());
+    }
+
+    #[test]
+    fn clap_parses_match_window_and_its_conflicts() {
+        let cli =
+            Cli::try_parse_from(["seagrep", "--match-window", "256", "needle", "s3://b"]).unwrap();
+        assert_eq!(cli.search.match_window, Some(256));
+        assert!(Cli::try_parse_from(["seagrep", "--match-window", "0", "p", "t"]).is_err());
+        for conflict in [
+            "--json",
+            "-A=1",
+            "-B=1",
+            "-C=1",
+            "--column",
+            "--count",
+            "--count-matches",
+            "--files-with-matches",
+            "--files",
+            "--quiet",
+        ] {
+            assert!(
+                Cli::try_parse_from(["seagrep", "--match-window", "256", conflict, "p", "t"])
+                    .is_err(),
+                "{conflict} must conflict with --match-window"
+            );
+        }
     }
 
     #[test]

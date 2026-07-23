@@ -2,6 +2,7 @@
 //! Index construction and snapshot-backed search readers.
 
 mod build;
+mod candidate;
 mod delta_blocks;
 mod eval;
 mod format;
@@ -13,8 +14,10 @@ mod segment;
 mod sparse_table;
 mod terms;
 
+pub use candidate::{CandidateBatchLimits, CandidatePlan};
 pub use search::{
-    search_collect, search_streaming, DocResult, KeyScope, MatchSink, NullSink, SinkFlow,
+    search_collect, search_patterns, search_streaming, DocResult, KeyScope, MatchData, MatchSink,
+    MatchWindow, NullSink, SearchDetail, SinkFlow, WindowMatch,
 };
 pub use segment::{
     update_index, CorpusFactory, IndexChanged, IndexMissing, SegmentedReader, SourceIdentity,
@@ -31,7 +34,6 @@ use build::{
 pub(crate) use build::{build_index_files, BuiltIndexFiles, DocumentCapExceeded};
 
 use anyhow::{Context, Result};
-use eval::Selection;
 use rayon::prelude::*;
 #[cfg(test)]
 use seagrep_core::pack_trigram_grams;
@@ -46,7 +48,7 @@ use std::fs::File;
 use std::io::Read;
 #[cfg(test)]
 use std::io::{BufReader, Write};
-use std::ops::{Range, RangeInclusive};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -84,6 +86,10 @@ pub struct SearchStats {
     /// Source objects the index could not decode at build time: their
     /// contents are not searchable, and results cannot include them.
     pub excluded_objects: usize,
+    pub patterns: usize,
+    pub exact_patterns: usize,
+    pub proof_patterns: usize,
+    pub fallback_patterns: usize,
 }
 
 pub trait IndexReader: DocFetcher {
@@ -100,16 +106,20 @@ pub trait IndexReader: DocFetcher {
     ) -> Result<Vec<seagrep_core::DocAddress>>;
     fn visit_candidates(
         &self,
-        q: &Query,
+        plans: &[CandidatePlan<'_>],
         key_prefix: Option<&str>,
-        bounded_len: Option<usize>,
-        batch_size: usize,
+        limits: CandidateBatchLimits,
         visit: &mut dyn FnMut(Vec<seagrep_core::DocAddress>) -> Result<bool>,
     ) -> Result<()> {
-        anyhow::ensure!(batch_size > 0, "candidate batch size must be positive");
-        let _ = bounded_len;
-        let documents = self.candidate_docs(q, key_prefix)?;
-        for chunk in documents.chunks(batch_size) {
+        candidate::validate_candidate_plans(plans, limits)?;
+        let query = Query::Or(plans.iter().map(|plan| plan.query.clone()).collect());
+        let mut documents = self.candidate_docs(&query, key_prefix)?;
+        for document in &mut documents {
+            if let Some(index) = &mut document.index {
+                index.ranges = None;
+            }
+        }
+        for chunk in documents.chunks(limits.documents) {
             if !visit(chunk.to_vec())? {
                 break;
             }
@@ -254,24 +264,6 @@ pub(crate) fn decode_posting_block(bytes: &[u8], count: u32, doc_count: u32) -> 
     } else {
         Ok(stored)
     }
-}
-
-/// Shared candidates pipeline: resolve grams against the term dict (no IO),
-/// fetch every needed posting block via `fetch_blocks`, evaluate purely.
-/// Returns local ids in `0..id_space`.
-pub(crate) fn candidates_with(
-    get: impl Fn(&[u8]) -> Result<Option<eval::TermValue>>,
-    id_space: u32,
-    strategy: Strategy,
-    q: &Query,
-    expand: Option<&dyn Fn(DocId) -> RangeInclusive<DocId>>,
-    fetch_blocks: impl FnOnce(&BTreeMap<u64, (u32, u64)>) -> Result<BTreeMap<u64, Vec<DocId>>>,
-) -> Result<Selection> {
-    let resolved = eval::resolve(q, id_space, strategy, &get)?;
-    let mut needed = BTreeMap::new();
-    eval::blocks_needed(&resolved, &mut needed);
-    let blocks = fetch_blocks(&needed)?;
-    eval::eval(&resolved, &blocks, expand)
 }
 
 pub struct LocalCorpus {
@@ -1226,6 +1218,173 @@ mod tests {
     }
 
     #[test]
+    fn batches_real_candidates_at_limits_and_stops_early() {
+        let c = MemCorpus::new(
+            vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            vec![vec![b'a'; 2], vec![b'b'; 3], vec![b'c'; 5], vec![b'd'; 1]],
+        );
+        let (store_guard, cache_guard, reader) = build_tmp(&c, Strategy::Trigram);
+        let query = Query::All;
+        let plan = CandidatePlan {
+            query: &query,
+            extent: seagrep_core::SearchExtent::Lines,
+        };
+        let collect = |limits| {
+            let mut batches = Vec::new();
+            reader
+                .visit_candidates(
+                    std::slice::from_ref(&plan),
+                    None,
+                    limits,
+                    &mut |documents| {
+                        batches.push(
+                            documents
+                                .into_iter()
+                                .map(|document| document.display_key)
+                                .collect::<Vec<_>>(),
+                        );
+                        Ok(true)
+                    },
+                )
+                .unwrap();
+            batches
+        };
+
+        assert_eq!(
+            collect(CandidateBatchLimits {
+                documents: 2,
+                decoded_bytes: 64,
+            }),
+            [
+                vec!["a".to_owned(), "b".to_owned()],
+                vec!["c".to_owned(), "d".to_owned()]
+            ]
+        );
+        assert_eq!(
+            collect(CandidateBatchLimits {
+                documents: 4,
+                decoded_bytes: 4,
+            }),
+            [
+                vec!["a".to_owned()],
+                vec!["b".to_owned()],
+                vec!["c".to_owned()],
+                vec!["d".to_owned()],
+            ]
+        );
+
+        let mut visited = Vec::new();
+        reader
+            .visit_candidates(
+                std::slice::from_ref(&plan),
+                None,
+                CandidateBatchLimits {
+                    documents: 1,
+                    decoded_bytes: 64,
+                },
+                &mut |documents| {
+                    visited.extend(documents.into_iter().map(|document| document.display_key));
+                    Ok(false)
+                },
+            )
+            .unwrap();
+        assert_eq!(visited, ["a"]);
+        drop(reader);
+        drop(cache_guard);
+        drop(store_guard);
+
+        let large = usize::try_from(pack::LARGE_DOCUMENT_BYTES).unwrap();
+        let c = MemCorpus::new(
+            vec!["a-small".into(), "m-large".into(), "z-small".into()],
+            vec![vec![b'a'], vec![b'm'; large], vec![b'z']],
+        );
+        let (store_guard, cache_guard, reader) = build_tmp(&c, Strategy::Sparse);
+        let mut batches = Vec::new();
+        reader
+            .visit_candidates(
+                std::slice::from_ref(&plan),
+                None,
+                CandidateBatchLimits {
+                    documents: 3,
+                    decoded_bytes: pack::LARGE_DOCUMENT_BYTES + 2,
+                },
+                &mut |documents| {
+                    batches.push(
+                        documents
+                            .into_iter()
+                            .map(|document| document.display_key)
+                            .collect::<Vec<_>>(),
+                    );
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            batches,
+            [
+                vec!["a-small".to_owned()],
+                vec!["m-large".to_owned()],
+                vec!["z-small".to_owned()],
+            ]
+        );
+        drop(reader);
+        drop(cache_guard);
+        drop(store_guard);
+    }
+
+    #[test]
+    fn batches_interleaved_small_candidates_by_physical_pack_blocks() {
+        let selected_bytes = 4 * 1024;
+        let mut selected = vec![b'x'; selected_bytes];
+        selected[..6].copy_from_slice(b"needle");
+        let filler = vec![b'z'; pack::PACK_BLOCK_BYTES - selected_bytes];
+        let c = MemCorpus::new(
+            vec![
+                "a-selected".into(),
+                "b-filler".into(),
+                "c-selected".into(),
+                "d-filler".into(),
+            ],
+            vec![selected.clone(), filler.clone(), selected, filler],
+        );
+        let (store_guard, cache_guard, reader) = build_tmp(&c, Strategy::Sparse);
+        let query = seagrep_query::plan("needle", Strategy::Sparse).unwrap();
+        let plan = CandidatePlan {
+            query: &query,
+            extent: seagrep_core::SearchExtent::Lines,
+        };
+        let mut batches = Vec::new();
+
+        reader
+            .visit_candidates(
+                std::slice::from_ref(&plan),
+                None,
+                CandidateBatchLimits {
+                    documents: 4,
+                    decoded_bytes: pack::PACK_BLOCK_BYTES as u64,
+                },
+                &mut |documents| {
+                    batches.push(
+                        documents
+                            .into_iter()
+                            .map(|document| document.display_key)
+                            .collect::<Vec<_>>(),
+                    );
+                    Ok(true)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            batches,
+            [vec!["a-selected".to_owned()], vec!["c-selected".to_owned()],]
+        );
+        drop(reader);
+        drop(cache_guard);
+        drop(store_guard);
+    }
+
+    #[test]
     fn search_collect_returns_verified_matches_and_stats() {
         let c = MemCorpus::new(
             vec!["x".into(), "y".into()],
@@ -1280,8 +1439,8 @@ mod tests {
     fn count_only_sink_agrees_with_collected_hits() {
         struct CountOnlySink;
         impl MatchSink for CountOnlySink {
-            fn wants_matches(&self) -> bool {
-                false
+            fn detail(&self) -> SearchDetail {
+                SearchDetail::Documents
             }
             fn wants_hit_keys(&self) -> bool {
                 false
@@ -1368,6 +1527,9 @@ mod tests {
         struct StopAfterFirst;
 
         impl MatchSink for StopAfterFirst {
+            fn detail(&self) -> SearchDetail {
+                SearchDetail::Documents
+            }
             fn on_doc(&self, _key: &str, _doc: &DocResult<'_>) -> Result<SinkFlow> {
                 Ok(SinkFlow::Stop)
             }

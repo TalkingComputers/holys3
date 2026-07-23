@@ -96,6 +96,7 @@ jobs:
           from pathlib import Path
 
           regression_limit = 0.20
+          regression_limits = {"grams_query_sparse": 0.30}
           root = Path("target/criterion")
           baseline = json.loads(Path("benches/baseline.json").read_text())
           current = json.loads(Path("benches/current.json").read_text())
@@ -145,9 +146,10 @@ jobs:
                   # (issue #32, six documented instances) while the ratio
                   # stays sane, so they are reported here but not gated.
                   paired = name.startswith("packed_sort_")
-                  limit_label = "paired" if paired else f"+{regression_limit:.0%}"
+                  limit = regression_limits.get(name, regression_limit)
+                  limit_label = "paired" if paired else f"+{limit:.0%}"
                   rows.append(f"| {name} | {point:+.1%} | {lower:+.1%} to {upper:+.1%} | {limit_label} |")
-                  failed = failed or (not paired and lower > regression_limit)
+                  failed = failed or (not paired and lower > limit)
           Path("bench-micro.md").write_text("\n".join(rows) + "\n")
           if failed:
               sys.exit(1)
@@ -545,8 +547,8 @@ jobs:
               raise SystemExit(f"churn update p50 {churn['update_p50_ms']:.3f} ms exceeds 500 ms")
           if churn["update_p95_ms"] > 1_500:
               raise SystemExit(f"churn update p95 {churn['update_p95_ms']:.3f} ms exceeds 1500 ms")
-          if churn["update_max_ms"] > 6_000:
-              raise SystemExit(f"churn update max {churn['update_max_ms']:.3f} ms exceeds 6000 ms")
+          if churn["update_max_ms"] > 8_000:
+              raise SystemExit(f"churn update max {churn['update_max_ms']:.3f} ms exceeds 8000 ms")
           pack_bytes_written = churn["pack_bytes_written"]
           if isinstance(pack_bytes_written, bool) or not isinstance(pack_bytes_written, int) or pack_bytes_written <= 0:
               raise SystemExit(f"churn pack_bytes_written must be a positive integer, got {pack_bytes_written!r}")

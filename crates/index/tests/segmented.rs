@@ -5,9 +5,10 @@
 use anyhow::Result;
 use bytes::Bytes;
 use seagrep_core::{
-    decode_body, scan_matching_docs,
+    decode_body, parse_pattern, scan_matching_docs,
     testutil::{encode, MemCorpus},
-    BlobStore, Corpus, LocalBlobStore, MatchOptions, SourceEncoding, SourceObject, Strategy,
+    BlobStore, Corpus, LocalBlobStore, MatchOptions, PatternProgram, SourceEncoding, SourceObject,
+    Strategy,
 };
 use seagrep_index::{
     search_collect, search_streaming, update_index, IndexChanged, IndexReader, KeyScope, NullSink,
@@ -375,8 +376,9 @@ fn assert_matches_oracle(
     let decoded = MemCorpus::new(keys, decoded_bodies);
     for pattern in patterns {
         let hits = search_collect(&reader, pattern)?.1.hits;
-        let re = regex::bytes::Regex::new(pattern)?;
-        let oracle = scan_matching_docs(&decoded, &re)?;
+        let hir = parse_pattern(pattern)?;
+        let program = PatternProgram::compile(std::slice::from_ref(&hir), &[0])?;
+        let oracle = scan_matching_docs(&decoded, &program)?;
         assert_eq!(hits, oracle, "{label}: pattern `{pattern}`");
     }
     Ok(())

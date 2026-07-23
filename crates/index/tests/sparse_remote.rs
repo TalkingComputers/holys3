@@ -4,7 +4,10 @@
 
 use anyhow::Result;
 use seagrep_core::{testutil::MemCorpus, BlobStore, LocalBlobStore, Strategy};
-use seagrep_index::{search_collect, update_index, SegmentedReader, SourceIdentity, UpdateOptions};
+use seagrep_index::{
+    search_collect, update_index, CandidateBatchLimits, CandidatePlan, IndexReader,
+    SegmentedReader, SourceIdentity, UpdateOptions,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -339,6 +342,198 @@ struct RangeTallyStore {
     inner: LocalBlobStore,
     pack_ranges: Arc<AtomicUsize>,
     posting_ranges: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone)]
+enum PlanRead {
+    One(String, u64, u64),
+    Many(String, Vec<(u64, u64)>),
+}
+
+struct PlanReadStore {
+    inner: LocalBlobStore,
+    reads: Arc<std::sync::Mutex<Vec<PlanRead>>>,
+}
+
+impl BlobStore for PlanReadStore {
+    fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put(name, bytes)
+    }
+
+    fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.put_file(name, path)
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name)
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        self.reads
+            .lock()
+            .unwrap()
+            .push(PlanRead::One(name.to_owned(), start, len));
+        self.inner.get_range(name, start, len)
+    }
+
+    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> Result<Vec<bytes::Bytes>> {
+        self.reads
+            .lock()
+            .unwrap()
+            .push(PlanRead::Many(name.to_owned(), ranges.to_vec()));
+        self.inner.get_ranges(name, ranges)
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        self.inner.delete(name)
+    }
+
+    fn get_versioned(&self, name: &str) -> Result<Option<(Vec<u8>, String)>> {
+        self.inner.get_versioned(name)
+    }
+
+    fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
+        self.inner.put_if(name, bytes, expected)
+    }
+}
+
+#[test]
+fn repeated_plans_fetch_unique_term_and_posting_ranges_once() -> Result<()> {
+    let env_lock_guard = env_lock();
+    let remote_min_guard = EnvGuard::new("SEAGREP_SPARSE_REMOTE_MIN");
+    let cache_max_guard = EnvGuard::new("SEAGREP_CACHE_MAX");
+    std::env::set_var("SEAGREP_SPARSE_REMOTE_MIN", "1");
+    std::env::set_var("SEAGREP_CACHE_MAX", "0");
+
+    let objects: BTreeMap<String, Vec<u8>> = (0..40)
+        .map(|index| {
+            let body = if index % 3 == 0 {
+                format!("filler document {index}\nrare needle lives here {index}\n")
+            } else {
+                format!("filler document {index}\nordinary text lives here {index}\n")
+            };
+            (format!("doc-{index:02}.log"), body.into_bytes())
+        })
+        .collect();
+    let listing = objects
+        .iter()
+        .map(|(key, body)| {
+            (
+                key.clone(),
+                format!("{:016x}", seagrep_core::hash_ngram(body)),
+                body.len() as u64,
+            )
+        })
+        .collect::<Vec<_>>();
+    let store_dir = tempfile::tempdir()?;
+    let build_cache = tempfile::tempdir()?;
+    let corpus_for = |shard: &[(String, String, u64)]| {
+        let keys = shard
+            .iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<Vec<_>>();
+        let bodies = keys.iter().map(|key| objects[key].clone()).collect();
+        MemCorpus::new(keys, bodies)
+    };
+    update_index(
+        &LocalBlobStore::new(store_dir.path()),
+        build_cache.path(),
+        &test_source(),
+        Some(Strategy::Sparse),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(corpus_for(shard))),
+    )?;
+
+    let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let read_cache = tempfile::tempdir()?;
+    let reader = SegmentedReader::open(
+        Box::new(PlanReadStore {
+            inner: LocalBlobStore::new(store_dir.path()),
+            reads: reads.clone(),
+        }),
+        read_cache.path(),
+        &test_source(),
+    )?;
+    reads.lock().unwrap().clear();
+    let query = seagrep_query::plan_hir(
+        &seagrep_core::parse_pattern("rare needle lives")?,
+        Strategy::Sparse,
+    );
+    let plans = [
+        CandidatePlan {
+            query: &query,
+            extent: seagrep_core::SearchExtent::Lines,
+        },
+        CandidatePlan {
+            query: &query,
+            extent: seagrep_core::SearchExtent::Lines,
+        },
+    ];
+    let mut keys = Vec::new();
+    reader.visit_candidates(
+        &plans,
+        None,
+        CandidateBatchLimits {
+            documents: 16_384,
+            decoded_bytes: 64 * 1024 * 1024,
+        },
+        &mut |documents| {
+            keys.extend(documents.into_iter().map(|document| document.display_key));
+            Ok(true)
+        },
+    )?;
+    assert!(!keys.is_empty());
+    let count = keys.len();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(keys.len(), count, "{keys:?}");
+
+    let reads = reads.lock().unwrap();
+    let term_reads = reads
+        .iter()
+        .filter(|read| matches!(read, PlanRead::Many(name, _) if name.ends_with("terms.fst")))
+        .count();
+    let posting_reads = reads
+        .iter()
+        .enumerate()
+        .filter_map(|(index, read)| match read {
+            PlanRead::Many(name, ranges) if name.ends_with("postings.bin") => Some((index, ranges)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(term_reads, 1, "{reads:?}");
+    assert_eq!(posting_reads.len(), 2, "{reads:?}");
+    let (posting_tail, tail_ranges) = posting_reads[0];
+    let (posting_data, data_ranges) = posting_reads[1];
+    assert_eq!(tail_ranges.len(), 1, "{reads:?}");
+    assert!(posting_tail < posting_data, "{reads:?}");
+    assert!(
+        data_ranges
+            .iter()
+            .all(|(start, len)| start + len <= tail_ranges[0].0),
+        "{reads:?}"
+    );
+    let mut physical = Vec::new();
+    for read in reads.iter() {
+        match read {
+            PlanRead::One(name, start, len) => physical.push((name.as_str(), *start, *len)),
+            PlanRead::Many(name, ranges) => physical.extend(
+                ranges
+                    .iter()
+                    .map(|&(start, len)| (name.as_str(), start, len)),
+            ),
+        }
+    }
+    let unique = physical
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(physical.len(), unique.len(), "{reads:?}");
+    drop(cache_max_guard);
+    drop(remote_min_guard);
+    drop(env_lock_guard);
+    Ok(())
 }
 
 impl RangeTallyStore {

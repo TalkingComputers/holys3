@@ -50,6 +50,7 @@ investigation to minimize fetched bytes, not query count:
 -l / -c            matching files only / count per file
 -m NUM             max matching lines per object
 -A/-B/-C NUM       context lines
+--match-window N   bounded match-centered content per matching line
 -g GLOB            include keys ('!' to exclude), repeatable
 --key-prefix P     only keys under P (prunes before any fetch)
 --key-regex RE     filter keys by regex
@@ -70,30 +71,40 @@ in a large share of documents — every candidate document is fetched and
 verified. If `-c`/`--stats` shows thousands of candidates, add a rarer
 token, an anchor, or key scoping before running the full query.
 
+Cost tracks the commonness of the pattern's 3-char substrings, not the
+whole string's rarity: on a code corpus `git push --force` is slow (every
+trigram is everywhere) while `AKIA` or `ghp_` is fast. Prefer distinctive
+anchored fragments over short common ones (`AKIA` beats `key`; `ECONNREFUSED`
+beats `error`). Stay case-sensitive unless case truly varies — `-i`
+multiplies candidates. Keep --stats visible while timing broad sweeps, then
+scope or sharpen only when the evidence calls for it.
+
 ## Turn economy (important for agents)
 
-Queries are cheap (~0.5s warm) — your thinking time between tool calls is
-not. Do not micro-step one query per call:
+Queries are cheap — your thinking time between tool calls is not. Do not
+micro-step one query per call:
 
-- **Batch**: run 3–6 related queries in one bash call (`;` or a for-loop
-  over services/prefixes) and read them together.
-- **Sweep once**: `-e 'a|b|c'` or repeated `-e` covers all variants in one
-  query — results are exhaustive, so a second phrasing of the same idea
-  returns nothing new.
+- **Sweep once, one command**: pass every variant as its own `-e` pattern
+  in a single invocation — the engine plans all the patterns together and
+  shares index, posting, and snapshot work across them. Candidate and
+  verification cost still grows with the union of the supplied patterns.
+  Results are exhaustive for that exact pattern set; different literals or
+  regexes can find additional matches.
 - **Take more per query**: a generous `-m` with `-C1` context usually
   answers the follow-up you were about to ask.
 
-A good investigation is ~4 batched calls: shape (`--files` + error census),
-localize (counts per component), read evidence (bounded excerpts with
-context), confirm (ID pivots) — not 25 single queries.
+A good investigation is ~4 calls: shape (`--files` + one multi-pattern
+sweep), localize (counts per component), read evidence (bounded excerpts
+with context), confirm (ID pivots) — not 25 single queries.
 
 ## Investigation recipe (logs/incidents)
 
 ```sh
 seagrep --files s3://b/logs | head -30                  # corpus shape
-seagrep -i -c -e 'error|exception|fatal|timeout' s3://b/logs   # where is it bad
+seagrep -e error -e exception -e fatal -e timeout \
+  --match-window 512 --stats -m 5 s3://b/logs           # one bounded sweep
 seagrep -i -m 10 --no-heading --key-prefix logs/svc-x/ 'error' s3://b/logs
-seagrep 'req-7f3e9a2c' s3://b/logs -C2                  # follow one request
+seagrep 'req-7f3e9a2c' s3://b/logs -C2                  # final narrow query: full lines + context
 seagrep 'ERROR' s3://b/logs --since 6h                  # recent only
 ```
 

@@ -8,7 +8,6 @@ use crate::sparse_table::lookup_in_block;
 use crate::sparse_table::{hex, SparseTableIndex, FOOTER_BYTES};
 use anyhow::{Context, Result};
 use seagrep_core::{hash_ngram, BlobStore};
-use seagrep_query::Query;
 use sha2::{Digest, Sha256};
 
 /// Two ranged reads: the fixed-size footer locates the block index, then the
@@ -62,18 +61,15 @@ pub(crate) fn parse_index_tail(
 /// cache, fetching all missing blocks in one ranged read. Every block —
 /// cached or fetched — is verified against the per-block hash from the
 /// trusted index before use. Absent grams are simply absent from the map.
-pub(crate) fn fetch_query_gram_values(
+pub(crate) fn fetch_gram_values(
     store: &dyn BlobStore,
     blob: &str,
     index: &SparseTableIndex,
-    q: &Query,
+    grams: &[Vec<u8>],
     cache_dir: &std::path::Path,
     seg_id: &str,
 ) -> Result<rapidhash::RapidHashMap<u64, (u64, Option<u64>)>> {
-    let mut hashes = Vec::new();
-    collect_gram_hashes(q, &mut hashes);
-    hashes.sort_unstable();
-    hashes.dedup();
+    let hashes = collect_gram_hashes(grams);
     let mut needed_blocks: Vec<usize> = hashes
         .iter()
         .filter_map(|hash| index.block_for(*hash))
@@ -150,16 +146,14 @@ pub(crate) fn fetch_query_gram_values(
     Ok(values)
 }
 
-fn collect_gram_hashes(q: &Query, out: &mut Vec<u64>) {
-    match q {
-        Query::All => {}
-        Query::Gram(gram) => out.push(hash_ngram(gram)),
-        Query::And(subs) | Query::Or(subs) => {
-            for sub in subs {
-                collect_gram_hashes(sub, out);
-            }
-        }
-    }
+fn collect_gram_hashes(grams: &[Vec<u8>]) -> Vec<u64> {
+    let mut hashes = grams
+        .iter()
+        .map(|gram| hash_ngram(gram))
+        .collect::<Vec<_>>();
+    hashes.sort_unstable();
+    hashes.dedup();
+    hashes
 }
 
 #[cfg(test)]
@@ -285,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn query_grams_resolve_with_one_ranged_read() {
+    fn gram_sets_fetch_each_sparse_block_once() {
         let (_dir, store, len, tail_hash, pairs) = fixture(20_000);
         let index = open_remote_index(&store, "terms.fst", len, &tail_hash).unwrap();
         store.get_ranges_calls.store(0, Ordering::Relaxed);
@@ -294,10 +288,21 @@ mod tests {
         // look up fixture hashes directly through a query of raw grams whose
         // hashes we recompute for expectations.
         let grams: Vec<Vec<u8>> = vec![b"hamlet".to_vec(), b"ophelia".to_vec(), b"yorick".to_vec()];
-        let q = Query::And(grams.iter().cloned().map(Query::Gram).collect());
         let cache = tempfile::tempdir().unwrap();
-        let values =
-            fetch_query_gram_values(&store, "terms.fst", &index, &q, cache.path(), "seg").unwrap();
+        let values = fetch_gram_values(
+            &store,
+            "terms.fst",
+            &index,
+            &[
+                grams[0].clone(),
+                grams[1].clone(),
+                grams[1].clone(),
+                grams[2].clone(),
+            ],
+            cache.path(),
+            "seg",
+        )
+        .unwrap();
         assert_eq!(store.get_ranges_calls.load(Ordering::Relaxed), 1);
         for gram in &grams {
             let hash = hash_ngram(gram);
@@ -337,9 +342,9 @@ mod tests {
         let mut bytes = store.get("terms.fst").unwrap().unwrap();
         bytes[64] ^= 0xff;
         store.put("terms.fst", &bytes).unwrap();
-        let q = Query::Gram(b"anything".to_vec());
+        let grams = [b"anything".to_vec()];
         let cache = tempfile::tempdir().unwrap();
-        let error = fetch_query_gram_values(&store, "terms.fst", &index, &q, cache.path(), "seg");
+        let error = fetch_gram_values(&store, "terms.fst", &index, &grams, cache.path(), "seg");
         if let Err(error) = error {
             assert!(error.to_string().contains("hash"), "{error:#}");
         } else {
