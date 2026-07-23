@@ -17,7 +17,7 @@
 //! swap segments.bin.
 
 use crate::candidate::{
-    add_candidate_selection, build_block_bases, expand_candidate_block,
+    add_candidate_selection, build_block_bases, candidate_documents, expand_candidate_block,
     get_block_document as block_document, visit_candidate_selections,
 };
 #[cfg(test)]
@@ -1495,6 +1495,7 @@ impl SegmentedReader {
                 None => segment.map.get(gram),
             };
             let id_space = u32::try_from(segment.meta.block_count)?;
+            let mut single_selection = None;
             let mut documents = std::collections::BTreeMap::new();
             self.classify_index_result(visit_candidate_selections(
                 plans,
@@ -1512,6 +1513,10 @@ impl SegmentedReader {
                 },
                 |needed| self.read_posting_blocks(segment, needed, id_space),
                 &mut |plan, selection| {
+                    if plans.len() == 1 {
+                        single_selection = Some(selection);
+                        return Ok(());
+                    }
                     add_candidate_selection(
                         &mut documents,
                         selection,
@@ -1522,6 +1527,16 @@ impl SegmentedReader {
                     )
                 },
             ))?;
+            let documents = match single_selection {
+                Some(selection) => candidate_documents(
+                    selection,
+                    plans[0].extent,
+                    self.strategy,
+                    segment.meta.doc_count,
+                    block_bases,
+                )?,
+                None => documents.into_iter().collect(),
+            };
             let live = documents
                 .into_iter()
                 .filter(|(id, _)| segment.dead.documents.binary_search(id).is_err());
@@ -1531,16 +1546,21 @@ impl SegmentedReader {
             let mut batch = Vec::with_capacity(capacity);
             let mut batch_bytes = 0u64;
             let mut batch_blocks = std::collections::BTreeSet::new();
+            let bounds_decoded = limits.decoded_bytes != u64::MAX;
             for (id, ranges) in live {
                 let document = &tables.documents[usize::try_from(id)?];
-                let pack_blocks = block_span(
-                    crate::pack::PackSlice {
-                        first_block: document.first_block,
-                        block_offset: document.block_offset,
-                    },
-                    document.decoded_size,
-                    &tables.blocks,
-                )?;
+                let pack_blocks = if bounds_decoded {
+                    block_span(
+                        crate::pack::PackSlice {
+                            first_block: document.first_block,
+                            block_offset: document.block_offset,
+                        },
+                        document.decoded_size,
+                        &tables.blocks,
+                    )?
+                } else {
+                    0..0
+                };
                 let document_bytes = pack_blocks.clone().try_fold(0u64, |total, block_id| {
                     total
                         .checked_add(u64::from(tables.blocks[block_id].decoded_len))
@@ -1554,8 +1574,9 @@ impl SegmentedReader {
                             .checked_add(u64::from(tables.blocks[block_id].decoded_len))
                             .context("candidate batch physical bytes overflow")
                     })?;
-                let isolated = document.decoded_size >= crate::pack::LARGE_DOCUMENT_BYTES
-                    || document_bytes > limits.decoded_bytes;
+                let isolated = bounds_decoded
+                    && (document.decoded_size >= crate::pack::LARGE_DOCUMENT_BYTES
+                        || document_bytes > limits.decoded_bytes);
                 let exceeds = !batch.is_empty()
                     && (batch.len() >= limits.documents
                         || added_bytes > limits.decoded_bytes - batch_bytes);
@@ -1615,7 +1636,7 @@ impl SegmentedReader {
             key_prefix,
             CandidateBatchLimits {
                 documents: 16_384,
-                decoded_bytes: 64 * 1024 * 1024,
+                decoded_bytes: u64::MAX,
             },
             &mut |batch| {
                 documents.extend(batch);

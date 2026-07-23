@@ -195,6 +195,47 @@ fn merge_candidate_ranges(current: &mut Vec<CandidateRange>, incoming: Vec<Candi
     *current = merged;
 }
 
+pub(crate) fn candidate_documents(
+    selection: Selection,
+    extent: SearchExtent,
+    strategy: Strategy,
+    document_count: u32,
+    block_bases: Option<&[u32]>,
+) -> Result<Vec<(u32, Option<Vec<CandidateRange>>)>> {
+    let Selection::Ids(ids) = selection else {
+        return Ok((0..document_count)
+            .map(|document| (document, None))
+            .collect());
+    };
+    if strategy == Strategy::Sparse {
+        return ids
+            .into_iter()
+            .map(|document| {
+                anyhow::ensure!(
+                    document < document_count,
+                    "candidate document {document} is outside 0..{document_count}"
+                );
+                Ok((document, None))
+            })
+            .collect();
+    }
+    let bases = block_bases.context("trigram candidate block bases are missing")?;
+    if extent == SearchExtent::Document {
+        let total = bases.last().copied().unwrap_or(0);
+        let mut documents = Vec::with_capacity(ids.len());
+        for id in ids {
+            anyhow::ensure!(id < total, "candidate block {id} is outside 0..{total}");
+            documents.push((u32::try_from(get_block_document(id, bases))?, None));
+        }
+        documents.dedup_by_key(|(document, _)| *document);
+        return Ok(documents);
+    }
+    Ok(group_candidate_blocks(ids, bases, extent)?
+        .into_iter()
+        .map(|(document, ranges)| (document, Some(ranges)))
+        .collect())
+}
+
 pub(crate) fn add_candidate_selection(
     documents: &mut BTreeMap<u32, Option<Vec<CandidateRange>>>,
     selection: Selection,
@@ -203,32 +244,13 @@ pub(crate) fn add_candidate_selection(
     document_count: u32,
     block_bases: Option<&[u32]>,
 ) -> Result<()> {
-    let Selection::Ids(ids) = selection else {
-        for document in 0..document_count {
+    for (document, ranges) in
+        candidate_documents(selection, extent, strategy, document_count, block_bases)?
+    {
+        let Some(ranges) = ranges else {
             documents.insert(document, None);
-        }
-        return Ok(());
-    };
-    if strategy == Strategy::Sparse {
-        for document in ids {
-            anyhow::ensure!(
-                document < document_count,
-                "candidate document {document} is outside 0..{document_count}"
-            );
-            documents.insert(document, None);
-        }
-        return Ok(());
-    }
-    let bases = block_bases.context("trigram candidate block bases are missing")?;
-    if extent == SearchExtent::Document {
-        let total = bases.last().copied().unwrap_or(0);
-        for id in ids {
-            anyhow::ensure!(id < total, "candidate block {id} is outside 0..{total}");
-            documents.insert(u32::try_from(get_block_document(id, bases))?, None);
-        }
-        return Ok(());
-    }
-    for (document, ranges) in group_candidate_blocks(ids, bases, extent)? {
+            continue;
+        };
         if let Some(current) = documents
             .entry(document)
             .or_insert_with(|| Some(Vec::new()))
