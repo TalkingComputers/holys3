@@ -651,3 +651,60 @@ fn mixed_patterns_match_whole_document_oracle_on_giant_line() -> anyhow::Result<
     assert!(windows[0].matches[0].right_clipped);
     Ok(())
 }
+
+#[test]
+fn max_count_stops_after_first_verified_candidate_range() -> anyhow::Result<()> {
+    const BLOCK: usize = CANDIDATE_BLOCK_BYTES;
+    let mut body = vec![b'x'; 40 * BLOCK];
+    body[17..23].copy_from_slice(b"NEEDLE");
+    for block in [16, 32] {
+        let start = block * BLOCK + 17;
+        body[start..start + 15].copy_from_slice(b"NEE EED EDL DLE");
+    }
+
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let reader = open_indexed(
+        store_dir.path(),
+        cache_dir.path(),
+        vec!["giant.log".into()],
+        vec![body],
+    )?;
+    let whole = WholeReader { reader: &reader };
+    let hir = parse_pattern("NEEDLE")?;
+    let production = CaptureSink {
+        detail: SearchDetail::MatchWindows { max_bytes: 64 },
+        documents: Mutex::new(Vec::new()),
+    };
+    let oracle = CaptureSink {
+        detail: SearchDetail::MatchWindows { max_bytes: 64 },
+        documents: Mutex::new(Vec::new()),
+    };
+    let options = MatchOptions {
+        max_count: Some(1),
+        ..MatchOptions::default()
+    };
+    let stats = search_patterns(
+        &reader,
+        std::slice::from_ref(&hir),
+        KeyScope::default(),
+        options,
+        &production,
+    )?;
+    search_patterns(
+        &whole,
+        std::slice::from_ref(&hir),
+        KeyScope::default(),
+        options,
+        &oracle,
+    )?;
+
+    assert_eq!(
+        production.documents.into_inner().unwrap(),
+        oracle.documents.into_inner().unwrap()
+    );
+    assert!(stats.candidate_bytes < 5 * BLOCK);
+    assert_eq!(stats.regional_docs, 1);
+    assert_eq!(stats.decoded_bytes, 40 * BLOCK);
+    Ok(())
+}

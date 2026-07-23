@@ -140,6 +140,26 @@ pub trait CandidateBatch: Sync {
         consume: &mut dyn FnMut(usize, FetchedDocument) -> AnyhowResult<()>,
     ) -> AnyhowResult<()>;
 
+    fn fetch_until(
+        &self,
+        consume: &mut dyn FnMut(usize, FetchedDocument) -> AnyhowResult<bool>,
+    ) -> AnyhowResult<()> {
+        self.fetch_initial(&mut |index, body| consume(index, body).map(|_| ()))
+    }
+
+    fn can_fetch_documents(&self) -> bool {
+        false
+    }
+
+    fn fetch_document_until(
+        &self,
+        document: usize,
+        consume: &mut dyn FnMut(FetchedDocument) -> AnyhowResult<bool>,
+    ) -> AnyhowResult<()> {
+        std::hint::black_box((document, consume));
+        anyhow::bail!("candidate batch cannot fetch documents independently")
+    }
+
     fn fetch_regions(
         &self,
         document: usize,

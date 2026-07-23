@@ -3,10 +3,10 @@
 
 use crate::{CandidateBatchLimits, CandidatePlan, IndexReader, SearchStats};
 use anyhow::{Context, Result};
-use rayon::iter::{ParallelBridge, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 use seagrep_core::{DocAddress, DocFetcher, FetchedDocument, LineEvent, MatchOptions};
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 mod plan;
@@ -16,6 +16,7 @@ use plan::*;
 use verify::*;
 
 const SEARCH_CANDIDATE_BATCH: usize = 16_384;
+const INCREMENTAL_CANDIDATE_BATCH: usize = 8;
 const FILE_MATCH_CHUNK: usize = 1024 * 1024;
 const FILE_MATCH_OVERLAP_MAX: usize = 1024 * 1024;
 
@@ -148,14 +149,17 @@ fn search_batch(
     let whole_docs = AtomicUsize::new(0);
     let decoded_bytes = AtomicUsize::new(0);
     let hit_count = AtomicUsize::new(0);
+    let recorded = (0..documents.len())
+        .map(|_| AtomicBool::new(false))
+        .collect::<Vec<_>>();
     let hits: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let wants_hit_keys = sink.wants_hit_keys();
     let documents_ref = documents;
-    let verify = |cache: &mut WorkerCache, idx: usize, body: FetchedDocument| -> Result<()> {
+    let verify = |cache: &mut WorkerCache, idx: usize, body: FetchedDocument| -> Result<bool> {
         let key = &documents_ref[idx].display_key;
         let started = std::time::Instant::now();
         let Some(verified) = verify_document(batch.as_ref(), idx, body, context, cache)? else {
-            return Ok(());
+            return Ok(false);
         };
         bytes_fetched.fetch_add(verified.extra_fetched_bytes, Ordering::Relaxed);
         hit_count.fetch_add(1, Ordering::Relaxed);
@@ -175,14 +179,17 @@ fn search_batch(
         if sink.on_doc(key, &doc)? == SinkFlow::Stop {
             return Err(anyhow::Error::new(StopEarly));
         }
-        Ok(())
+        Ok(true)
     };
     let verify_caught = |cache: &mut WorkerCache, idx: usize, body: FetchedDocument| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify(cache, idx, body)))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")))
     };
-    let record_fetch = |body: &FetchedDocument| -> Result<()> {
+    let record_fetch = |idx: usize, body: &FetchedDocument| -> Result<()> {
         bytes_fetched.fetch_add(usize::try_from(body.fetched_size())?, Ordering::Relaxed);
+        if recorded[idx].swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
         decoded_bytes.fetch_add(usize::try_from(body.decoded_size())?, Ordering::Relaxed);
         match body {
             FetchedDocument::Whole(_) => {
@@ -194,41 +201,67 @@ fn search_batch(
         }
         Ok(())
     };
-    let (feed_result, verify_result) = if jobs == 1 {
-        let mut cache = WorkerCache::create(context.programs);
-        let mut verified = Ok(());
-        let feed = batch.fetch_initial(&mut |idx, body| {
-            record_fetch(&body)?;
-            match verify_caught(&mut cache, idx, body) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    verified = Err(error);
-                    Err(anyhow::Error::new(StopEarly))
+    let (feed_result, verify_result) =
+        if context.options.max_count == Some(1) && batch.can_fetch_documents() && jobs > 1 {
+            let verified = (0..documents.len()).into_par_iter().try_for_each_init(
+                || WorkerCache::create(context.programs),
+                |cache, idx| {
+                    batch.fetch_document_until(idx, &mut |body| {
+                        record_fetch(idx, &body)?;
+                        verify_caught(cache, idx, body)
+                    })
+                },
+            );
+            (Ok(()), verified)
+        } else if context.options.max_count == Some(1) {
+            let mut cache = WorkerCache::create(context.programs);
+            let mut verified = Ok(());
+            let feed = batch.fetch_until(&mut |idx, body| {
+                record_fetch(idx, &body)?;
+                match verify_caught(&mut cache, idx, body) {
+                    Ok(matched) => Ok(matched),
+                    Err(error) => {
+                        verified = Err(error);
+                        Err(anyhow::Error::new(StopEarly))
+                    }
                 }
-            }
-        });
-        (feed, verified)
-    } else {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, FetchedDocument)>(jobs * 2);
-        std::thread::scope(|scope| {
-            let consumer = scope.spawn(|| {
-                rx.into_iter().par_bridge().try_for_each_init(
-                    || WorkerCache::create(context.programs),
-                    |cache, (idx, body)| verify_caught(cache, idx, body),
-                )
             });
-            let feed = batch.fetch_initial(&mut |idx, body| {
-                record_fetch(&body)?;
-                tx.send((idx, body))
-                    .map_err(|_| anyhow::Error::new(StopEarly))
-            });
-            drop(tx);
-            let verified = consumer
-                .join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")));
             (feed, verified)
-        })
-    };
+        } else if jobs == 1 {
+            let mut cache = WorkerCache::create(context.programs);
+            let mut verified = Ok(());
+            let feed = batch.fetch_initial(&mut |idx, body| {
+                record_fetch(idx, &body)?;
+                match verify_caught(&mut cache, idx, body) {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        verified = Err(error);
+                        Err(anyhow::Error::new(StopEarly))
+                    }
+                }
+            });
+            (feed, verified)
+        } else {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, FetchedDocument)>(jobs * 2);
+            std::thread::scope(|scope| {
+                let consumer = scope.spawn(|| {
+                    rx.into_iter().par_bridge().try_for_each_init(
+                        || WorkerCache::create(context.programs),
+                        |cache, (idx, body)| verify_caught(cache, idx, body).map(|_| ()),
+                    )
+                });
+                let feed = batch.fetch_initial(&mut |idx, body| {
+                    record_fetch(idx, &body)?;
+                    tx.send((idx, body))
+                        .map_err(|_| anyhow::Error::new(StopEarly))
+                });
+                drop(tx);
+                let verified = consumer
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")));
+                (feed, verified)
+            })
+        };
     let stopped = match verify_result {
         Err(err) if err.is::<StopEarly>() => {
             if let Err(err) = feed_result {
@@ -318,13 +351,21 @@ pub fn search_patterns(
     let mut regional_docs = 0usize;
     let mut whole_docs = 0usize;
     let mut decoded_bytes = 0usize;
-    let visited = reader.visit_candidates(
-        &candidate_plans,
-        scope.prefix,
+    let candidate_limits = if options.max_count == Some(1) {
+        CandidateBatchLimits {
+            documents: INCREMENTAL_CANDIDATE_BATCH,
+            decoded_bytes: u64::MAX,
+        }
+    } else {
         CandidateBatchLimits {
             documents: SEARCH_CANDIDATE_BATCH,
             decoded_bytes: 64 * 1024 * 1024,
-        },
+        }
+    };
+    let visited = reader.visit_candidates(
+        &candidate_plans,
+        scope.prefix,
+        candidate_limits,
         &mut |mut documents| {
             documents.retain(|document| scope.admits(&document.display_key));
             candidates = candidates

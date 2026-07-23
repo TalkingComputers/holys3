@@ -2225,6 +2225,131 @@ impl CandidateBatch for SegmentedCandidateBatch<'_> {
         Ok(())
     }
 
+    fn fetch_until(
+        &self,
+        consume: &mut dyn FnMut(usize, FetchedDocument) -> Result<bool>,
+    ) -> Result<()> {
+        for document in 0..self.documents.len() {
+            self.fetch_document_until(document, &mut |body| consume(document, body))?;
+        }
+        Ok(())
+    }
+
+    fn can_fetch_documents(&self) -> bool {
+        true
+    }
+
+    fn fetch_document_until(
+        &self,
+        document: usize,
+        consume: &mut dyn FnMut(FetchedDocument) -> Result<bool>,
+    ) -> Result<()> {
+        let block_bytes = seagrep_core::CANDIDATE_BLOCK_BYTES as u64;
+        let address = self.documents.get(document).with_context(|| {
+            format!(
+                "candidate document {document} is outside a batch of {}",
+                self.documents.len()
+            )
+        })?;
+        let indexed = address
+            .index
+            .as_ref()
+            .context("candidate has no index snapshot address")?;
+        let segment_id = usize::try_from(indexed.segment)?;
+        let batch = self
+            .segments
+            .get(&segment_id)
+            .context("candidate segment is out of bounds")?;
+        let entry = batch
+            .tables
+            .documents
+            .get(usize::try_from(indexed.document)?)
+            .context("candidate document is out of bounds")?;
+        anyhow::ensure!(
+            entry.display_key == address.display_key,
+            "candidate display key differs from its index entry"
+        );
+        let Some(ranges) = indexed.ranges.as_deref() else {
+            if entry.decoded_size > 0 {
+                let whole = 0..entry.decoded_size;
+                let body =
+                    self.fetch_regions(document, std::slice::from_ref(&whole), RegionRead::Bytes)?;
+                consume(body)?;
+                return Ok(());
+            }
+            let slice = crate::pack::PackSlice {
+                first_block: entry.first_block,
+                block_offset: entry.block_offset,
+            };
+            let note_written = |bytes| self.reader.note_range_written(bytes);
+            let pack_cache = crate::pack::PackBlockCache {
+                cache_dir: &self.reader.cache_dir,
+                seg_id: &batch.segment.meta.seg_id,
+                note_written: &note_written,
+            };
+            let cache = self.reader.range_cache().then_some(&pack_cache);
+            let mut fetched = None;
+            self.reader
+                .classify_index_result(batch.pack.fetch_documents(
+                    cache,
+                    &[crate::pack::PackRequest {
+                        index: document,
+                        slice,
+                        decoded_size: 0,
+                    }],
+                    &mut |_, body| {
+                        fetched = Some(FetchedDocument::Whole(body));
+                        Ok(())
+                    },
+                ))?;
+            consume(fetched.context("candidate fetch returned no document")?)?;
+            return Ok(());
+        };
+        if !has_complete_block_newlines(entry.decoded_size, &entry.block_newlines) {
+            let whole = 0..entry.decoded_size;
+            let body =
+                self.fetch_regions(document, std::slice::from_ref(&whole), RegionRead::Bytes)?;
+            consume(body)?;
+            return Ok(());
+        }
+        for range in ranges {
+            let start = u64::from(range.blocks.start)
+                .checked_mul(block_bytes)
+                .context("candidate block byte offset overflows")?;
+            let end = u64::from(range.blocks.end)
+                .checked_mul(block_bytes)
+                .context("candidate block byte offset overflows")?
+                .min(entry.decoded_size);
+            anyhow::ensure!(start < end, "candidate block range is outside the document");
+            let (bytes, read) = match range.extent {
+                SearchExtent::Bytes { span } => {
+                    let overlap = u64::try_from(span.saturating_sub(1))?;
+                    (
+                        start.saturating_sub(overlap)
+                            ..end.saturating_add(overlap).min(entry.decoded_size),
+                        RegionRead::Bytes,
+                    )
+                }
+                SearchExtent::Lines => (
+                    start..end,
+                    RegionRead::Lines {
+                        before_context: 0,
+                        after_context: 0,
+                    },
+                ),
+                SearchExtent::Document => {
+                    anyhow::bail!("document extent cannot appear inside candidate ranges")
+                }
+            };
+            let body = self.fetch_regions(document, std::slice::from_ref(&bytes), read)?;
+            let is_whole = matches!(body, FetchedDocument::Whole(_));
+            if consume(body)? || is_whole {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn fetch_regions(
         &self,
         document: usize,
