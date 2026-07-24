@@ -24,7 +24,7 @@ flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 zstd = "0.13.3"
 bzip2 = "0.6.1"
 snap = "1.1.1"
-lz4_flex = "0.13.1"
+lz4_flex = "0.14.0"
 liblzma = "0.4.6"
 bytes.workspace = true
 blake3.workspace = true
@@ -32,7 +32,7 @@ parquet = { version = "59.1.0", default-features = false, features = ["arrow", "
 arrow-json = "59.1.0"
 arrow-schema = "59.1.0"
 apache-avro = { version = "0.21.0", features = ["snappy", "zstandard", "bzip", "xz"] }
-num-bigint = "0.4.6"
+num-bigint = "0.5.1"
 serde_json.workspace = true
 # chrono-tz is load-bearing: without it, arrow rejects named timezones
 # ("UTC" — the pyarrow/pandas/Spark default) and every parquet file carrying
