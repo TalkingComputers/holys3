@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="seagrep" width="380">
+</p>
+
 # seagrep
 
 [![CI](https://github.com/TalkingComputers/seagrep/actions/workflows/ci.yml/badge.svg)](https://github.com/TalkingComputers/seagrep/actions/workflows/ci.yml)
